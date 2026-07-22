@@ -1,0 +1,17 @@
+# 编译产物
+*.exe
+*.lib
+*.exp
+*.obj
+*.o
+
+# 中间文件
+*.cudafe1.cpp
+*.ptx
+
+# IDE
+.vs/
+.vscode/
+
+# 临时文件
+*.tmp
