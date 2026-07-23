@@ -4,7 +4,7 @@
 #define N 32
 #define BLOCK_SIZE 8
 
-__constant__ float d_CP_const[16 * 3];
+__constant__ float d_CP_const[16 * 4];
 
 __global__ void eval_surface(float* d_V, int n) {
 
@@ -30,39 +30,45 @@ __global__ void eval_surface(float* d_V, int n) {
 
     __syncthreads();
 
-    d_V[idx * 3 + 0] = 0.0; d_V[idx * 3 + 1] = 0.0; d_V[idx * 3 + 2] = 0.0;
+    float s[4] = {0.0};
+    float w;
 
     for(int ii = 0; ii <= 3; ii++){
         for(int jj = 0; jj <= 3; jj++){
-            d_V[idx * 3 + 0] += s_Bu[threadIdx.y][ii] * s_Bv[threadIdx.x][jj] * d_CP_const[(ii * 4 + jj)*3 + 0];
-            d_V[idx * 3 + 1] += s_Bu[threadIdx.y][ii] * s_Bv[threadIdx.x][jj] * d_CP_const[(ii * 4 + jj)*3 + 1];
-            d_V[idx * 3 + 2] += s_Bu[threadIdx.y][ii] * s_Bv[threadIdx.x][jj] * d_CP_const[(ii * 4 + jj)*3 + 2];
+            w = s_Bu[threadIdx.y][ii] * s_Bv[threadIdx.x][jj];
+            for(int k = 0; k < 4; k++){
+                s[k] += w * d_CP_const[(ii * 4 + jj)*4 + k];
+            }
         }
+    }
+
+    for(int k = 0; k < 3; k++){
+        d_V[idx * 3 + k] = s[k] / s[3];
     }
 
 }
 
 int main() {
-    float CP[16 * 3] = {
-        0.0,  0.0,   0.0,
-        0.33, 0.0,   0.5,
-        0.67, 0.0,   0.5,
-        1.0,  0.0,   0.0,
+    float CP[16 * 4] = {
+        0.0,  0.0,   0.0,   1.0,
+        0.33, 0.0,   0.5,   1.0,
+        0.67, 0.0,   0.5,   1.0,
+        1.0,  0.0,   0.0,   1.0,
 
-        0.0,  0.33,  0.5,
-        0.33, 0.33,  1.0,
-        0.67, 0.33,  1.0,
-        1.0,  0.33,  0.5,
+        0.0,  0.33,  0.5,   1.0,
+        0.33, 0.33,  1.0,   2.0,
+        0.67, 0.33,  1.0,   2.0,
+        1.0,  0.33,  0.5,   1.0,
 
-        0.0,  0.67,  0.5,
-        0.33, 0.67,  1.0,
-        0.67, 0.67,  1.0,
-        1.0,  0.67,  0.5,
+        0.0,  0.67,  0.5,   1.0,
+        0.33, 0.67,  1.0,   2.0,
+        0.67, 0.67,  1.0,   2.0,
+        1.0,  0.67,  0.5,   1.0,
 
-        0.0,  1.0,   0.0,
-        0.33, 1.0,   0.5,
-        0.67, 1.0,   0.5,
-        1.0,  1.0,   0.0
+        0.0,  1.0,   0.0,   1.0,
+        0.33, 1.0,   0.5,   1.0,
+        0.67, 1.0,   0.5,   1.0,
+        1.0,  1.0,   0.0,   1.0
     };
 
     FILE* f = fopen("output.obj", "w"); 
@@ -71,7 +77,7 @@ int main() {
 
     cudaMalloc(&d_V, N * N * 3 * sizeof(float));
 
-    cudaMemcpyToSymbol(d_CP_const, CP, 16 * 3 * sizeof(float));
+    cudaMemcpyToSymbol(d_CP_const, CP, 16 * 4 * sizeof(float));
 
     dim3 threadsPerBlock(BLOCK_SIZE, BLOCK_SIZE);
     dim3 numBlocks(N / BLOCK_SIZE, N / BLOCK_SIZE);
