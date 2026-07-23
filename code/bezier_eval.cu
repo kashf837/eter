@@ -2,32 +2,39 @@
 #include <math.h>
 
 #define N 32
-#define THREADS_PER_BLOCK 256
+#define BLOCK_SIZE 8
 
 __global__ void eval_surface(float* d_CP, float* d_V, int n) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= n * n) return;
 
-    int i = idx / n;
-    int j = idx % n;
+    int i = blockIdx.y * BLOCK_SIZE + threadIdx.y;
+    int j = blockIdx.x * BLOCK_SIZE + threadIdx.x;
+
     float u = (float)i / (n - 1);
     float v = (float)j / (n - 1);
 
-    int binom[4] = {1, 3, 3, 1};
-    float B_u[4], B_v[4];
+    int idx = i * N + j;
 
-    for(int k = 0; k <= 3; k++){
-        B_u[k] = binom[k] * pow(u, k) * pow(1 - u, 3 - k);
-        B_v[k] = binom[k] * pow(v, k) * pow(1 - v, 3 - k);
+    int binom[4] = {1, 3, 3, 1};
+    __shared__ float s_Bu[BLOCK_SIZE][4]; 
+    __shared__ float s_Bv[BLOCK_SIZE][4];
+
+    if(threadIdx.x < 4) {
+        s_Bu[threadIdx.y][threadIdx.x] = binom[threadIdx.x] * pow(u, threadIdx.x) * pow(1 - u, 3 - threadIdx.x);
     }
+
+    if(threadIdx.y < 4) {
+        s_Bv[threadIdx.x][threadIdx.y] = binom[threadIdx.y] * pow(v, threadIdx.y) * pow(1 - v, 3 - threadIdx.y);
+    }
+
+    __syncthreads();
 
     d_V[idx * 3 + 0] = 0.0; d_V[idx * 3 + 1] = 0.0; d_V[idx * 3 + 2] = 0.0;
 
     for(int ii = 0; ii <= 3; ii++){
         for(int jj = 0; jj <= 3; jj++){
-            d_V[idx * 3 + 0] += B_u[ii] * B_v[jj] * d_CP[(ii * 4 + jj)*3 + 0];
-            d_V[idx * 3 + 1] += B_u[ii] * B_v[jj] * d_CP[(ii * 4 + jj)*3 + 1];
-            d_V[idx * 3 + 2] += B_u[ii] * B_v[jj] * d_CP[(ii * 4 + jj)*3 + 2];
+            d_V[idx * 3 + 0] += s_Bu[threadIdx.y][ii] * s_Bv[threadIdx.x][jj] * d_CP[(ii * 4 + jj)*3 + 0];
+            d_V[idx * 3 + 1] += s_Bu[threadIdx.y][ii] * s_Bv[threadIdx.x][jj] * d_CP[(ii * 4 + jj)*3 + 1];
+            d_V[idx * 3 + 2] += s_Bu[threadIdx.y][ii] * s_Bv[threadIdx.x][jj] * d_CP[(ii * 4 + jj)*3 + 2];
         }
     }
 
@@ -65,8 +72,9 @@ int main() {
 
     cudaMemcpy(d_CP, CP, 16 * 3 * sizeof(float), cudaMemcpyHostToDevice);
 
-    int numBlocks = (N * N + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
-    eval_surface<<<numBlocks, THREADS_PER_BLOCK>>>(d_CP, d_V, N);
+    dim3 threadsPerBlock(BLOCK_SIZE, BLOCK_SIZE);
+    dim3 numBlocks(N / BLOCK_SIZE, N / BLOCK_SIZE);
+    eval_surface<<<numBlocks, threadsPerBlock>>>(d_CP, d_V, N);
 
     cudaMemcpy(V, d_V, N * N * 3 *sizeof(float), cudaMemcpyDeviceToHost);
 
