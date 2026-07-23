@@ -4,6 +4,7 @@
 *.exp
 *.obj
 *.o
+build/
 
 # 中间文件
 *.cudafe1.cpp
