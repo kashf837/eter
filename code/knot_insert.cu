@@ -14,22 +14,22 @@ int multiplicity(float* U, int m, float u) {
     return cnt;
 }
 
-void knot_insert(float** U, int* m, float*** P, int* n, int p,
+void knot_insert(float** U, int* m, float*** P, int* n, int p, int dim,
                     float u_bar, int k) {
     int m_old = *m, n_old = *n;
     int first = k - p + 1;
     int last  = k;
 
-    // save old knot vector, needed for alpha computation
+    // save old knot vector
     float U_old_snap[20];
     for (int i = 0; i <= m_old; i++) U_old_snap[i] = (*U)[i];
 
-    // save P[first-1] through P[last] (p+1 old values)
-    float saved[10][2];
+    // save P[first-1] through P[last] (p+1 old values, each has dim floats)
+    float saved[10][8];  // max dim=4, p+1 <= 8
     for (int i = first - 1; i <= last; i++) {
         int si = i - (first - 1);
-        saved[si][0] = (*P)[i][0];
-        saved[si][1] = (*P)[i][1];
+        for (int d = 0; d < dim; d++)
+            saved[si][d] = (*P)[i][d];
     }
 
     // expand knot vector
@@ -42,30 +42,34 @@ void knot_insert(float** U, int* m, float*** P, int* n, int p,
     // expand control point array
     (*n)++;
     *P = (float**)realloc(*P, (*n + 1) * sizeof(float*));
-    (*P)[*n] = (float*)malloc(2 * sizeof(float));
+    (*P)[*n] = (float*)malloc(dim * sizeof(float));
 
     // shift right: indices after 'last' move by 1
     for (int i = n_old; i > last; i--) {
-        (*P)[i + 1][0] = (*P)[i][0];
-        (*P)[i + 1][1] = (*P)[i][1];
+        for (int d = 0; d < dim; d++)
+            (*P)[i + 1][d] = (*P)[i][d];
     }
 
-    // compute Q[first..last+1] backwards to avoid overwrite
+    // compute Q[first..last+1] backwards
     for (int i = last + 1; i >= first; i--) {
         float alpha;
-        if (i <= k - p)
-            { (*P)[i][0] = (*P)[i][0]; (*P)[i][1] = (*P)[i][1]; continue; }
-        else if (i >= k + 1)
-            { (*P)[i][0] = (*P)[i - 1][0]; (*P)[i][1] = (*P)[i - 1][1]; continue; }
-        else
+        if (i <= k - p) {
+            // alpha=1, Q=P (already in place, nothing to do)
+            continue;
+        } else if (i >= k + 1) {
+            // alpha=0, Q[i] = P[i-1]
+            for (int d = 0; d < dim; d++)
+                (*P)[i][d] = (*P)[i - 1][d];
+            continue;
+        } else {
             alpha = (u_bar - U_old_snap[i]) / (U_old_snap[i + p] - U_old_snap[i]);
+        }
 
-        // i is in the middle range, read old P[i] and P[i-1] from saved
         int si_cur  = i     - (first - 1);
         int si_prev = i - 1 - (first - 1);
 
-        (*P)[i][0] = alpha * saved[si_cur][0] + (1.0f - alpha) * saved[si_prev][0];
-        (*P)[i][1] = alpha * saved[si_cur][1] + (1.0f - alpha) * saved[si_prev][1];
+        for (int d = 0; d < dim; d++)
+            (*P)[i][d] = alpha * saved[si_cur][d] + (1.0f - alpha) * saved[si_prev][d];
     }
 }
 
@@ -75,18 +79,19 @@ void free_cp(float** P, int n) {
 }
 
 int main() {
-    int p = 2, m = 6, n = 3;
+    int p = 2, dim = 2;
+    int m = 6, n = 3;
 
     float* U = (float*)malloc((m + 1) * sizeof(float));
     float U_init[] = {0,0,0,1,2,2,2};
     for (int i = 0; i <= m; i++) U[i] = U_init[i];
 
     float** P = (float**)malloc((n + 1) * sizeof(float*));
-    for (int i = 0; i <= n; i++) P[i] = (float*)malloc(2 * sizeof(float));
     float P_init[4][2] = {{0,0}, {1,2}, {2,-1}, {3,0}};
     for (int i = 0; i <= n; i++) {
-        P[i][0] = P_init[i][0];
-        P[i][1] = P_init[i][1];
+        P[i] = (float*)malloc(dim * sizeof(float));
+        for (int d = 0; d < dim; d++)
+            P[i][d] = P_init[i][d];
     }
 
     float u_target = 1.0;
@@ -96,14 +101,18 @@ int main() {
         if (s >= p + 1) break;
 
         int k = find_span(U, m, u_target);
-        knot_insert(&U, &m, &P, &n, p, u_target, k);
+        knot_insert(&U, &m, &P, &n, p, dim, u_target, k);
     }
 
     printf("\nKnots: ");
     for (int i = 0; i <= m; i++) printf("%.1f ", U[i]);
     printf("\nCPs:\n");
-    for (int i = 0; i <= n; i++)
-        printf("  Q%d = (%.3f, %.3f)\n", i, P[i][0], P[i][1]);
+    for (int i = 0; i <= n; i++) {
+        printf("  Q%d = (", i);
+        for (int d = 0; d < dim; d++)
+            printf("%.3f%s", P[i][d], d < dim - 1 ? ", " : "");
+        printf(")\n");
+    }
 
     free(U); free_cp(P, n);
     return 0;
