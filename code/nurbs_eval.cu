@@ -65,9 +65,10 @@ static void free_surf(NurbsSurf* s) {
 
 // ========== Main ==========
 
-int main() {
+int main(int argc, char* argv[]) {
+    if (argc < 2) { printf("Usage: nurbs_eval.exe <surf_file>\n"); return 1; }
     // 1. Load
-    NurbsSurf* s = read_surf("data/test.surf");
+    NurbsSurf* s = read_surf(argv[1]);
     if (!s) return 1;
     printf("Loaded: p=(%d,%d)  CPs=%dx%d\n", s->p_u, s->p_v, s->n_u+1, s->n_v+1);
 
