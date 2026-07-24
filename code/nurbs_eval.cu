@@ -2,6 +2,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include "knot_insert.h"
+#include "bezier_eval.h"
+
+#define N 32
 
 // ========== File I/O ==========
 
@@ -12,11 +15,8 @@ static int next_line(FILE* f, char* buf, int size) {
 }
 
 typedef struct {
-    int p_u, p_v;
-    int n_u, n_v;
-    int m_u, m_v;
-    float* U;
-    float* V;
+    int p_u, p_v, n_u, n_v, m_u, m_v;
+    float* U, *V;
     CPGrid Ps;
 } NurbsSurf;
 
@@ -66,12 +66,12 @@ static void free_surf(NurbsSurf* s) {
 // ========== Main ==========
 
 int main() {
+    // 1. Load
     NurbsSurf* s = read_surf("data/test.surf");
     if (!s) return 1;
+    printf("Loaded: p=(%d,%d)  CPs=%dx%d\n", s->p_u, s->p_v, s->n_u+1, s->n_v+1);
 
-    printf("Before: p=(%d,%d) CPs=%dx%d\n", s->p_u, s->p_v, s->n_u+1, s->n_v+1);
-
-    // Knot insertion in u-direction
+    // 2. Knot insertion in u and v
     for (int i = s->p_u + 1; i <= s->m_u - s->p_u - 1; i++) {
         float u = s->U[i];
         while (mult_of(s->U, s->m_u, u) < s->p_u + 1) {
@@ -80,8 +80,6 @@ int main() {
                                s->p_u, 4, u, k);
         }
     }
-
-    // Knot insertion in v-direction
     for (int i = s->p_v + 1; i <= s->m_v - s->p_v - 1; i++) {
         float v = s->V[i];
         while (mult_of(s->V, s->m_v, v) < s->p_v + 1) {
@@ -90,12 +88,52 @@ int main() {
                                s->p_v, 4, v, k);
         }
     }
+    printf("After KI: CPs=%dx%d\n", s->n_u+1, s->n_v+1);
 
-    printf("After: CPs=%dx%d\n", s->n_u+1, s->n_v+1);
-    printf("U: "); for (int i = 0; i <= s->m_u; i++) printf("%.1f ", s->U[i]);
-    printf("\nV: "); for (int i = 0; i <= s->m_v; i++) printf("%.1f ", s->V[i]);
-    printf("\n");
+    // 3. Extract Bezier patches, evaluate each on GPU, write OBJ
+    int ru = s->p_u + 1;  // rows per patch
+    int rv = s->p_v + 1;  // cols per patch
+    int np_u = (s->n_u + 1) / ru;  // number of patches in u
+    int np_v = (s->n_v + 1) / rv;  // number of patches in v
 
+    float* V   = (float*)malloc(N * N * 3 * sizeof(float));
+    float* CP  = (float*)malloc(ru * rv * 4 * sizeof(float));
+
+    FILE* obj = fopen("build/nurbs_output.obj", "w");
+    int vert_offset = 0;
+
+    for (int pi = 0; pi < np_u; pi++) {
+        for (int pj = 0; pj < np_v; pj++) {
+            // Flatten this patch's CPs
+            for (int i = 0; i < ru; i++)
+                for (int j = 0; j < rv; j++)
+                    memcpy(&CP[(i * rv + j) * 4],
+                           s->Ps[pi * ru + i][pj * rv + j],
+                           4 * sizeof(float));
+
+            // GPU eval
+            eval_bezier_patch(CP, s->p_u, s->p_v, V, N);
+
+            // Write vertices
+            for (int vi = 0; vi < N * N; vi++)
+                fprintf(obj, "v %f %f %f\n", V[vi*3+0], V[vi*3+1], V[vi*3+2]);
+
+            // Write faces with vertex offset
+            for (int i = 0; i < N - 1; i++)
+                for (int j = 0; j < N - 1; j++) {
+                    int a = vert_offset + i * N + j + 1, b = a + 1;
+                    int c = vert_offset + (i + 1) * N + j + 1, d = c + 1;
+                    fprintf(obj, "f %d %d %d\n", a, b, c);
+                    fprintf(obj, "f %d %d %d\n", b, d, c);
+                }
+
+            vert_offset += N * N;
+        }
+    }
+
+    fclose(obj);
+    free(V); free(CP);
     free_surf(s);
+    printf("Done: %d patches -> build/nurbs_output.obj\n", np_u * np_v);
     return 0;
 }
