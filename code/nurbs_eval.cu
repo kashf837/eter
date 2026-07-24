@@ -94,8 +94,9 @@ int main(int argc, char* argv[]) {
     // 3. Extract Bezier patches, evaluate each on GPU, write OBJ
     int ru = s->p_u + 1;  // rows per patch
     int rv = s->p_v + 1;  // cols per patch
-    int np_u = (s->n_u + 1) / ru;  // number of patches in u
-    int np_v = (s->n_v + 1) / rv;  // number of patches in v
+    // number of Bezier patches: (CPs_per_dir - CPs_per_patch) / CPs_per_patch + 1
+    int np_u = (s->n_u + 1 - ru) / ru + 1;
+    int np_v = (s->n_v + 1 - rv) / rv + 1;
 
     float* V   = (float*)malloc(N * N * 3 * sizeof(float));
     float* CP  = (float*)malloc(ru * rv * 4 * sizeof(float));

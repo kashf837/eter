@@ -16,8 +16,8 @@ def parse_step(path):
         etype = m.group(2)
         body = m.group(3)
         entities[eid] = (etype, body)
-        if etype == 'B_SPLINE_SURFACE_WITH_KNOTS':
-            surface_id = eid
+        if etype == 'B_SPLINE_SURFACE_WITH_KNOTS' and surface_id is None:
+            surface_id = eid  # take the first one
 
     return entities, surface_id
 
@@ -136,11 +136,14 @@ def main():
 
     entities, sid = parse_step(infile)
     if sid is None:
-        print("No B_SPLINE_SURFACE_WITH_KNOTS found in file")
+        print("No B_SPLINE_SURFACE_WITH_KNOTS found")
         return
 
-    p_u, p_v, n_u, n_v, U, V, cp_grid = parse_surface(entities, sid)
-    write_surf(outfile, p_u, p_v, n_u, n_v, U, V, cp_grid)
+    try:
+        p_u, p_v, n_u, n_v, U, V, cp_grid = parse_surface(entities, sid)
+        write_surf(outfile, p_u, p_v, n_u, n_v, U, V, cp_grid)
+    except Exception as e:
+        print(f"Parse failed: {e}")
 
 
 if __name__ == '__main__':
