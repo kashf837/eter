@@ -91,10 +91,31 @@ int main(int argc, char* argv[]) {
     }
     printf("After KI: CPs=%dx%d\n", s->n_u+1, s->n_v+1);
 
+    // Pad degenerate directions so each patch has enough CPs
+    int ru = s->p_u + 1, rv = s->p_v + 1;
+    while (s->n_u + 1 < ru) {
+        // duplicate last row
+        s->n_u++; s->m_u++;
+        s->Ps = (CPGrid)realloc(s->Ps, (s->n_u + 1) * sizeof(CPArray));
+        s->Ps[s->n_u] = new_cparray(s->n_v, 4);
+        s->U = (float*)realloc(s->U, (s->m_u + 1) * sizeof(float));
+        s->U[s->m_u] = s->U[s->m_u - 1];
+        for (int j = 0; j <= s->n_v; j++)
+            memcpy(s->Ps[s->n_u][j], s->Ps[s->n_u - 1][j], 4 * sizeof(float));
+    }
+    while (s->n_v + 1 < rv) {
+        s->n_v++; s->m_v++;
+        for (int i = 0; i <= s->n_u; i++) {
+            s->Ps[i] = (CPArray)realloc(s->Ps[i], (s->n_v + 1) * sizeof(CP));
+            s->Ps[i][s->n_v] = new_cp(4);
+            memcpy(s->Ps[i][s->n_v], s->Ps[i][s->n_v - 1], 4 * sizeof(float));
+        }
+        s->V = (float*)realloc(s->V, (s->m_v + 1) * sizeof(float));
+        s->V[s->m_v] = s->V[s->m_v - 1];
+    }
+    printf("After pad: CPs=%dx%d\n", s->n_u+1, s->n_v+1);
+
     // 3. Extract Bezier patches, evaluate each on GPU, write OBJ
-    int ru = s->p_u + 1;  // rows per patch
-    int rv = s->p_v + 1;  // cols per patch
-    // number of Bezier patches: (CPs_per_dir - CPs_per_patch) / CPs_per_patch + 1
     int np_u = (s->n_u + 1 - ru) / ru + 1;
     int np_v = (s->n_v + 1 - rv) / rv + 1;
 
