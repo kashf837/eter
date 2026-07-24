@@ -3,17 +3,25 @@
 
 import sys, math, argparse
 
+def make_knot_vector(n_cp, p):
+    """Clamped knot vector for n_cp CPs (index, so n_cp+1 CPs) and degree p."""
+    internal = n_cp - p
+    knots = [0.0] * (p + 1)
+    for i in range(1, internal + 1):
+        knots.append(float(i) / (internal + 1))
+    knots.extend([1.0] * (p + 1))
+    return knots
+
 def write_surf(path, p_u, p_v, cp_grid, weights=None):
     """Write .surf file.
     cp_grid: 2D list of (x,y,z) or (x,y,z,w) tuples, shape (n_u+1) x (n_v+1)
     weights: optional 2D list of weights; if None, all w=1
     """
-    n_u = len(cp_grid) - 1      # rows of CPs
-    n_v = len(cp_grid[0]) - 1   # cols of CPs
+    n_u = len(cp_grid) - 1
+    n_v = len(cp_grid[0]) - 1
 
-    # Bezier knot vectors (no internal knots)
-    U = [0.0] * (p_u + 1) + [1.0] * (p_u + 1)
-    V = [0.0] * (p_v + 1) + [1.0] * (p_v + 1)
+    U = make_knot_vector(n_u, p_u)
+    V = make_knot_vector(n_v, p_v)
 
     with open(path, 'w') as f:
         f.write(f"# Generated surface\n")
@@ -26,18 +34,6 @@ def write_surf(path, p_u, p_v, cp_grid, weights=None):
                 w = weights[i][j] if weights else 1.0
                 f.write(f"{x:.6f} {y:.6f} {z:.6f} {w:.6f}\n")
     print(f"Wrote {path}: {n_u+1}x{n_v+1} CPs, order {p_u}x{p_v}")
-
-
-def make_knot_vector(n_cp, p):
-    """Create a clamped knot vector for n_cp control points and degree p."""
-    m = n_cp + p + 1
-    n_knots = m + 1
-    U = [0.0] * (p + 1)
-    internal = n_cp - p
-    for i in range(1, internal):
-        U.append(float(i) / internal)
-    U.extend([1.0] * (p + 1))
-    return U
 
 
 # ========== Shape generators ==========
