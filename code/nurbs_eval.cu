@@ -63,14 +63,14 @@ static void free_surf(NurbsSurf* s) {
     free(s);
 }
 
-// ========== Main ==========
-
-int main(int argc, char* argv[]) {
-    if (argc < 2) { printf("Usage: nurbs_eval.exe <surf_file>\n"); return 1; }
-    // 1. Load
-    NurbsSurf* s = read_surf(argv[1]);
-    if (!s) return 1;
-    printf("Loaded: p=(%d,%d)  CPs=%dx%d\n", s->p_u, s->p_v, s->n_u+1, s->n_v+1);
+// ========== Process one surface, write into open OBJ file ==========
+static int process_surf(const char* path, FILE* obj, int* voff) {
+    NurbsSurf* s = read_surf(path);
+    if (!s) return 0;
+    if (s->p_u < 0 || s->p_v < 0 || s->n_u < 0 || s->n_v < 0) {
+        printf("  SKIP (invalid)\n"); free_surf(s); return 0;
+    }
+    printf("  p=(%d,%d) CPs=%dx%d", s->p_u, s->p_v, s->n_u+1, s->n_v+1);
 
     // 2. Knot insertion in u and v
     for (int i = s->p_u + 1; i <= s->m_u - s->p_u - 1; i++) {
@@ -122,9 +122,6 @@ int main(int argc, char* argv[]) {
     float* V   = (float*)malloc(N * N * 3 * sizeof(float));
     float* CP  = (float*)malloc(ru * rv * 4 * sizeof(float));
 
-    FILE* obj = fopen("build/nurbs_output.obj", "w");
-    int vert_offset = 0;
-
     for (int pi = 0; pi < np_u; pi++) {
         for (int pj = 0; pj < np_v; pj++) {
             // Flatten this patch's CPs
@@ -144,19 +141,69 @@ int main(int argc, char* argv[]) {
             // Write faces with vertex offset
             for (int i = 0; i < N - 1; i++)
                 for (int j = 0; j < N - 1; j++) {
-                    int a = vert_offset + i * N + j + 1, b = a + 1;
-                    int c = vert_offset + (i + 1) * N + j + 1, d = c + 1;
+                    int off = *voff;
+                    int a = off + i * N + j + 1, b = a + 1;
+                    int c = off + (i + 1) * N + j + 1, d = c + 1;
                     fprintf(obj, "f %d %d %d\n", a, b, c);
                     fprintf(obj, "f %d %d %d\n", b, d, c);
                 }
 
-            vert_offset += N * N;
+            *voff += N * N;
+        }
+    }
+
+    int total = np_u * np_v;
+    free(V); free(CP);
+    free_surf(s);
+    printf(" -> %d patches\n", total);
+    return total;
+}
+
+// ========== Main ==========
+
+int main(int argc, char* argv[]) {
+    if (argc < 2) {
+        printf("Usage: nurbs_eval.exe <surf1.surf> [surf2.surf ...]\n");
+        printf("       nurbs_eval.exe --batch <dir> <output.obj>\n");
+        return 1;
+    }
+
+    FILE* obj;
+    int vert_offset = 0;
+    int total_patches = 0, total_surfs = 0;
+
+    if (strcmp(argv[1], "--batch") == 0) {
+        // Batch mode: read all .surf from directory
+        if (argc < 4) { printf("Usage: nurbs_eval.exe --batch <dir> <out.obj>\n"); return 1; }
+        obj = fopen(argv[3], "w");
+        printf("Batch from %s -> %s\n", argv[2], argv[3]);
+        // Use system call to list files, read output
+        char cmd[512];
+        snprintf(cmd, 512, "dir /b \"%s\\*.surf\" 2>nul", argv[2]);
+        FILE* fp = _popen(cmd, "r");
+        if (!fp) { printf("Cannot list directory\n"); return 1; }
+        char path[512];
+        while (fgets(path, 512, fp)) {
+            path[strcspn(path, "\n")] = 0;
+            if (strlen(path) == 0) continue;
+            char full[512];
+            snprintf(full, 512, "%s/%s", argv[2], path);
+            printf("[%d]", total_surfs);
+            int p = process_surf(full, obj, &vert_offset);
+            if (p > 0) { total_patches += p; total_surfs++; }
+        }
+        _pclose(fp);
+    } else {
+        obj = fopen("build/nurbs_output.obj", "w");
+        for (int i = 1; i < argc; i++) {
+            printf("[%d]", total_surfs);
+            int p = process_surf(argv[i], obj, &vert_offset);
+            if (p > 0) { total_patches += p; total_surfs++; }
         }
     }
 
     fclose(obj);
-    free(V); free(CP);
-    free_surf(s);
-    printf("Done: %d patches -> build/nurbs_output.obj\n", np_u * np_v);
+    printf("\nDone: %d surfaces, %d patches, %d verts -> OBJ\n",
+           total_surfs, total_patches, vert_offset);
     return 0;
 }

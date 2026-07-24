@@ -17,5 +17,8 @@ build/
 # Python
 __pycache__/
 
+# 生成数据
+data/
+
 # 临时文件
 *.tmp
