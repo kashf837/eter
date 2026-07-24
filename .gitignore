@@ -14,5 +14,8 @@ build/
 .vs/
 .vscode/
 
+# Python
+__pycache__/
+
 # 临时文件
 *.tmp

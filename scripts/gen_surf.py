@@ -10,15 +10,10 @@ def write_surf(path, p_u, p_v, cp_grid, weights=None):
     """
     n_u = len(cp_grid) - 1      # rows of CPs
     n_v = len(cp_grid[0]) - 1   # cols of CPs
-    m_u = n_u + p_u + 1
-    m_v = n_v + p_v + 1
 
-    # default knot vectors: Bezier-like (no internal knots)
+    # Bezier knot vectors (no internal knots)
     U = [0.0] * (p_u + 1) + [1.0] * (p_u + 1)
     V = [0.0] * (p_v + 1) + [1.0] * (p_v + 1)
-    # extend to correct length
-    U = [0.0] * (p_u + 1) + list(range(1, m_u - 2 * p_u)) + [m_u - 2 * p_u] * (p_u + 1)
-    V = [0.0] * (p_v + 1) + list(range(1, m_v - 2 * p_v)) + [m_v - 2 * p_v] * (p_v + 1)
 
     with open(path, 'w') as f:
         f.write(f"# Generated surface\n")
