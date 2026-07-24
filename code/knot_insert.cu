@@ -247,8 +247,8 @@ static void print_cp_grid(CPGrid g, int nr, int nc, int dim) {
 // ========== Main (curve + surface demos) ==========
 
 static void demo_curve(void) {
-    printf("=== Curve Knot Insertion ===\n");
-    int p = 2, dim = 2;
+    printf("=== NURBS Curve ===\n");
+    int p = 2, dim = 4;
 
     int m = 6, n = 3;
     float* U = (float*)malloc((m + 1) * sizeof(float));
@@ -256,7 +256,10 @@ static void demo_curve(void) {
     memcpy(U, U_init, (m + 1) * sizeof(float));
 
     CPArray P = new_cparray(n, dim);
-    float init[4][2] = {{0,0}, {1,2}, {2,-1}, {3,0}};
+    // (x, y, 0, w) — 2D NURBS curve in z=0 plane
+    float init[4][4] = {
+        {0,0, 0,1}, {2,4, 0,2}, {4,-2, 0,2}, {6,0, 0,1}
+    };
     for (int i = 0; i <= n; i++)
         memcpy(P[i], init[i], dim * sizeof(float));
 
@@ -267,15 +270,15 @@ static void demo_curve(void) {
     }
 
     printf("Knots: "); for (int i = 0; i <= m; i++) printf("%.1f ", U[i]);
-    printf("\n%d CPs:\n", n + 1);
+    printf("\n%d CPs (x y z w):\n", n + 1);
     print_cp_array(P, n, dim);
 
     free_cparray(P, n); free(U);
 }
 
 static void demo_surface(void) {
-    printf("\n=== Surface Knot Insertion ===\n");
-    int p = 2, dim = 2;
+    printf("\n=== NURBS Surface ===\n");
+    int p = 2, dim = 4;
 
     int m_u = 6, m_v = 6, n_u = 3, n_v = 3;
     float* U = (float*)malloc((m_u + 1) * sizeof(float));
@@ -289,9 +292,11 @@ static void demo_surface(void) {
         for (int j = 0; j <= n_v; j++) {
             Ps[i][j][0] = (float)i + (float)j * 0.5f;
             Ps[i][j][1] = (float)i - (float)j;
+            Ps[i][j][2] = 0.0f;
+            Ps[i][j][3] = ((i == 1 || i == 2) && (j == 1 || j == 2)) ? 2.0f : 1.0f;
         }
 
-    printf("Before: %dx%d  U: ", n_u + 1, n_v + 1);
+    printf("Before: %dx%d  dim=%d  U: ", n_u + 1, n_v + 1, dim);
     for (int i = 0; i <= m_u; i++) printf("%.1f ", U[i]);
     printf("\n");
 
