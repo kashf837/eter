@@ -56,18 +56,22 @@ __global__ void eval_surface(
     d_V[idx * 3 + 2] = Sw[2] * inv;
 }
 
-void eval_bezier_patch(float* CP, int order_u, int order_v,
-                       float* V_out, int N) {
-    int cols   = order_v + 1;
+// GPU-accelerated Bezier surface evaluation.
+//   bp:  BezierPatch with flat CP array (x, y, z, w per point)
+//   V_out: output vertex buffer, N*N*3 floats
+//   N:  sampling grid resolution (N x N vertices)
+void eval_bezier_patch(BezierPatch* bp, float* V_out, int N) {
+    int order_u = bp->p_u, order_v = bp->p_v;
+    int cols   = order_v + 1;                       // control points per row
     int num_cp = (order_u + 1) * cols;
 
-    // binomial coefficients
+    // precompute binomial coefficients for Bernstein basis
     int* binom_u = (int*)malloc((order_u + 1) * sizeof(int));
     int* binom_v = (int*)malloc((order_v + 1) * sizeof(int));
     compute_binom(order_u, binom_u);
     compute_binom(order_v, binom_v);
 
-    // GPU memory
+    // allocate GPU memory: control points, output vertices, binom tables
     float *d_CP, *d_V;
     int   *d_binom_u, *d_binom_v;
     cudaMalloc(&d_CP,      num_cp * 4 * sizeof(float));
@@ -75,17 +79,21 @@ void eval_bezier_patch(float* CP, int order_u, int order_v,
     cudaMalloc(&d_binom_u, (order_u + 1) * sizeof(int));
     cudaMalloc(&d_binom_v, (order_v + 1) * sizeof(int));
 
-    cudaMemcpy(d_CP, CP, num_cp * 4 * sizeof(float), cudaMemcpyHostToDevice);
+    // copy data to GPU
+    cudaMemcpy(d_CP, bp->CP, num_cp * 4 * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(d_binom_u, binom_u, (order_u + 1) * sizeof(int), cudaMemcpyHostToDevice);
     cudaMemcpy(d_binom_v, binom_v, (order_v + 1) * sizeof(int), cudaMemcpyHostToDevice);
 
+    // launch kernel: BLOCK_SIZE x BLOCK_SIZE threads per block
     dim3 block(BLOCK_SIZE, BLOCK_SIZE);
     dim3 grid(N / BLOCK_SIZE, N / BLOCK_SIZE);
     eval_surface<<<grid, block>>>(d_CP, d_V, N, order_u, order_v, cols,
                                    d_binom_u, d_binom_v);
 
+    // copy results back to CPU
     cudaMemcpy(V_out, d_V, N * N * 3 * sizeof(float), cudaMemcpyDeviceToHost);
 
+    // cleanup
     cudaFree(d_CP); cudaFree(d_V);
     cudaFree(d_binom_u); cudaFree(d_binom_v);
     free(binom_u); free(binom_v);
@@ -109,17 +117,23 @@ int main(int argc, char* argv[]) {
     next_line(f, line, 256);
     sscanf(line, "%d %d", &order_u, &order_v);
 
+    BezierPatch bp;
+    bp.p_u = order_u; bp.p_v = order_v;
+    bp.n_u = order_u; bp.n_v = order_v;
     int num_cp = (order_u + 1) * (order_v + 1);
-    float* CP = (float*)malloc(num_cp * 4 * sizeof(float));
+    bp.CP = (float*)malloc(num_cp * 4 * sizeof(float));
     for (int i = 0; i < num_cp; i++) {
         next_line(f, line, 256);
-        sscanf(line, "%f %f %f %f", &CP[i*4+0], &CP[i*4+1], &CP[i*4+2], &CP[i*4+3]);
+        sscanf(line, "%f %f %f %f",
+            &bp.CP[i*4+0], &bp.CP[i*4+1], &bp.CP[i*4+2], &bp.CP[i*4+3]);
     }
     fclose(f);
 
     int N = 32;
     float* V = (float*)malloc(N * N * 3 * sizeof(float));
-    eval_bezier_patch(CP, order_u, order_v, V, N);
+    eval_bezier_patch(&bp, V, N);
+
+    free(bp.CP);
 
     FILE* out = fopen("build/output.obj", "w");
     for (int i = 0; i < N * N; i++)
@@ -133,7 +147,7 @@ int main(int argc, char* argv[]) {
         }
     fclose(out);
 
-    free(CP); free(V);
+    free(V);
     printf("Done: %d CPs, %d verts -> build/output.obj\n", num_cp, N * N);
     return 0;
 }

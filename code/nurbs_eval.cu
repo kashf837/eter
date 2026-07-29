@@ -14,12 +14,6 @@ static int next_line(FILE* f, char* buf, int size) {
     return 0;
 }
 
-typedef struct {
-    int p_u, p_v, n_u, n_v, m_u, m_v;
-    float* U, *V;
-    CPGrid Ps;
-} NurbsSurf;
-
 static NurbsSurf* read_surf(const char* path) {
     FILE* f = fopen(path, "r");
     if (!f) { printf("Cannot open %s\n", path); return NULL; }
@@ -92,24 +86,28 @@ static int process_surf(const char* path, FILE* obj, int* voff) {
     printf("After KI: CPs=%dx%d\n", s->n_u+1, s->n_v+1);
 
     // 3. Extract Bezier patches, evaluate each on GPU, write OBJ
-    int ru = s->p_u + 1, rv = s->p_v + 1;
-    int np_u = (s->n_u + 1 - ru) / ru + 1;
-    int np_v = (s->n_v + 1 - rv) / rv + 1;
+    // Each patch is ru x rv control points, flattened into bp.CP
+    int ru = s->p_u + 1, rv = s->p_v + 1;                // rows/cols per patch
+    int np_u = (s->n_u + 1 - ru) / ru + 1;               // number of patches in u
+    int np_v = (s->n_v + 1 - rv) / rv + 1;               // number of patches in v
 
-    float* V   = (float*)malloc(N * N * 3 * sizeof(float));
-    float* CP  = (float*)malloc(ru * rv * 4 * sizeof(float));
+    float* V = (float*)malloc(N * N * 3 * sizeof(float)); // GPU output buffer
+    BezierPatch bp;
+    bp.p_u = s->p_u; bp.p_v = s->p_v;
+    bp.n_u = ru - 1; bp.n_v = rv - 1;                     // CP counts per patch
+    bp.CP  = (float*)malloc(ru * rv * 4 * sizeof(float));  // flat CP storage
 
     for (int pi = 0; pi < np_u; pi++) {
         for (int pj = 0; pj < np_v; pj++) {
-            // Flatten this patch's CPs
+            // Flatten this patch from the grid into bp.CP
             for (int i = 0; i < ru; i++)
                 for (int j = 0; j < rv; j++)
-                    memcpy(&CP[(i * rv + j) * 4],
+                    memcpy(&bp.CP[(i * rv + j) * 4],
                            s->Ps[pi * ru + i][pj * rv + j],
                            4 * sizeof(float));
 
             // GPU eval
-            eval_bezier_patch(CP, s->p_u, s->p_v, V, N);
+            eval_bezier_patch(&bp, V, N);
 
             // Write vertices
             for (int vi = 0; vi < N * N; vi++)
@@ -130,7 +128,7 @@ static int process_surf(const char* path, FILE* obj, int* voff) {
     }
 
     int total = np_u * np_v;
-    free(V); free(CP);
+    free(V); free(bp.CP);
     free_surf(s);
     printf(" -> %d patches\n", total);
     return total;

@@ -41,6 +41,22 @@ static void free_cpgrid(CPGrid g, int nr, int nc) {
 int find_span(float* U, int m, float u);
 int mult_of(float* U, int m, float u);
 
+// ========== Surface types ==========
+
+typedef struct {
+    int p_u, p_v;         // degree in u, v
+    int n_u, n_v;         // CP count minus 1 in u, v (= p_u, p_v for a Bezier patch)
+    int m_u, m_v;         // knot count minus 1 (= n + p + 1)
+    float* U, *V;         // knot vectors
+    CPGrid Ps;            // control point grid [n_u+1][n_v+1]
+} NurbsSurf;
+
+typedef struct {
+    int p_u, p_v;         // degree
+    int n_u, n_v;         // CP count minus 1
+    float* CP;            // flat array: (n_u+1)*(n_v+1)*4 floats
+} BezierPatch;
+
 // ========== Knot insertion (curve + surface) ==========
 void knot_insert_curve(float** U, int* m, CPArray* P, int* n,
                        int p, int dim, float u_bar, int k);
