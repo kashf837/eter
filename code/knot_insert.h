@@ -59,22 +59,8 @@ typedef struct {
 } BezierPatch;
 
 // ========== Surface knot insertion ==========
-// Shared implementation, called by the two wrappers below
-void surf_insert_along(KnotVector* K, int* m_k, CPGrid* Ps,
-                        int* n_along, int n_across,
-                        int p, int dim, float x, int k, int dir);
-
-// Thin wrappers: u-direction (dir=0) and v-direction (dir=1)
-static inline void knot_insert_surf_u(KnotVector* U, int* m_u, CPGrid* Ps,
-                                       int* n_u, int n_v,
-                                       int p_u, int dim, float u_bar, int k) {
-    surf_insert_along(U, m_u, Ps, n_u, n_v, p_u, dim, u_bar, k, 0);
-}
-
-static inline void knot_insert_surf_v(KnotVector* V, int* m_v, CPGrid* Ps,
-                                       int n_u, int* n_v,
-                                       int p_v, int dim, float v_bar, int k) {
-    surf_insert_along(V, m_v, Ps, n_v, n_u, p_v, dim, v_bar, k, 1);
-}
+// dir=0: insert into U (affects rows), dir=1: insert into V (affects columns)
+// x = knot value to insert; finds k automatically
+void knot_insert_surf(NurbsSurf* s, int dir, float x);
 
 #endif

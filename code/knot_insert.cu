@@ -32,9 +32,27 @@ static void precompute_alpha(float* alpha, float* K_old, int n_old,
     }
 }
 
-// ========== Surface knot insertion (shared implementation) ==========
+// ========== Surface knot insertion ==========
 
-void surf_insert_along(KnotVector* K, int* m_k, CPGrid* Ps,
+// forward declaration
+static void surf_insert_along(KnotVector* K, int* m_k, CPGrid* Ps,
+                               int* n_along, int n_across,
+                               int p, int dim, float x, int k, int dir);
+
+void knot_insert_surf(NurbsSurf* s, int dir, float x) {
+    KnotVector* K  = (dir == 0) ? &s->U  : &s->V;
+    int* m_k       = (dir == 0) ? &s->m_u : &s->m_v;
+    int* n_along   = (dir == 0) ? &s->n_u : &s->n_v;
+    int  n_across  = (dir == 0) ?  s->n_v :  s->n_u;
+    int  p         = (dir == 0) ?  s->p_u :  s->p_v;
+
+    int k = find_span(*K, *m_k, x);
+    surf_insert_along(K, m_k, &s->Ps, n_along, n_across, p, 4, x, k, dir);
+}
+
+// ========== Internal implementation ==========
+
+static void surf_insert_along(KnotVector* K, int* m_k, CPGrid* Ps,
                         int* n_along, int n_across,
                         int p, int dim, float x, int k, int dir) {
     int old_m = *m_k, old_n = *n_along;

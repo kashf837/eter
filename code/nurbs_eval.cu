@@ -69,19 +69,13 @@ static int process_surf(const char* path, FILE* obj, int* voff) {
     // 2. Knot insertion in u and v
     for (int i = s->p_u + 1; i <= s->m_u - s->p_u - 1; i++) {
         float u = s->U[i];
-        while (mult_of(s->U, s->m_u, u) < s->p_u + 1) {
-            int k = find_span(s->U, s->m_u, u);
-            knot_insert_surf_u(&s->U, &s->m_u, &s->Ps, &s->n_u, s->n_v,
-                               s->p_u, 4, u, k);
-        }
+        while (mult_of(s->U, s->m_u, u) < s->p_u + 1)
+            knot_insert_surf(s, 0, u);
     }
     for (int i = s->p_v + 1; i <= s->m_v - s->p_v - 1; i++) {
         float v = s->V[i];
-        while (mult_of(s->V, s->m_v, v) < s->p_v + 1) {
-            int k = find_span(s->V, s->m_v, v);
-            knot_insert_surf_v(&s->V, &s->m_v, &s->Ps, s->n_u, &s->n_v,
-                               s->p_v, 4, v, k);
-        }
+        while (mult_of(s->V, s->m_v, v) < s->p_v + 1)
+            knot_insert_surf(s, 1, v);
     }
     printf("After KI: CPs=%dx%d\n", s->n_u+1, s->n_v+1);
 
