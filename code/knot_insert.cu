@@ -50,6 +50,45 @@ void knot_insert_surf(NurbsSurf* s, int dir, float x) {
     surf_insert_along(K, m_k, &s->Ps, n_along, n_across, p, 4, x, k, dir);
 }
 
+// ========== Internal helpers ==========
+
+// Process one 1D slice of the control grid.
+// dir=0: t is column, rows 0..old_n are the varying index
+// dir=1: t is row,    cols 0..old_n are the varying index
+static void process_slice(CPGrid* Ps, int t, int old_n, int first, int last,
+                           float* alpha, int dim, int dir) {
+    float saved[10][8];
+    for (int v = first - 1; v <= last; v++)
+        for (int d = 0; d < dim; d++) {
+            float* cp = (dir == 0) ? &(*Ps)[v][t][d] : &(*Ps)[t][v][d];
+            saved[v - (first - 1)][d] = *cp;
+        }
+
+    for (int v = old_n; v > last; v--)
+        for (int d = 0; d < dim; d++) {
+            float* dst = (dir == 0) ? &(*Ps)[v + 1][t][d] : &(*Ps)[t][v + 1][d];
+            float* src = (dir == 0) ? &(*Ps)[v][t][d]     : &(*Ps)[t][v][d];
+            *dst = *src;
+        }
+
+    for (int v = last + 1; v >= first; v--) {
+        if (alpha[v] == 1.0f) continue;
+        if (alpha[v] == 0.0f) {
+            for (int d = 0; d < dim; d++) {
+                float* dst = (dir == 0) ? &(*Ps)[v][t][d] : &(*Ps)[t][v][d];
+                float* src = (dir == 0) ? &(*Ps)[v - 1][t][d] : &(*Ps)[t][v - 1][d];
+                *dst = *src;
+            }
+            continue;
+        }
+        int sc = v - (first - 1), sp = v - 1 - (first - 1);
+        for (int d = 0; d < dim; d++) {
+            float* dst = (dir == 0) ? &(*Ps)[v][t][d] : &(*Ps)[t][v][d];
+            *dst = alpha[v] * saved[sc][d] + (1.0f - alpha[v]) * saved[sp][d];
+        }
+    }
+}
+
 // ========== Internal implementation ==========
 
 static void surf_insert_along(KnotVector* K, int* m_k, CPGrid* Ps,
@@ -80,49 +119,6 @@ static void surf_insert_along(KnotVector* K, int* m_k, CPGrid* Ps,
         }
     }
 
-    for (int t = 0; t <= n_across; t++) {
-        float saved[10][8];
-
-        if (dir == 0) {
-            // slice = column t
-            for (int i = first - 1; i <= last; i++)
-                for (int d = 0; d < dim; d++)
-                    saved[i - (first - 1)][d] = (*Ps)[i][t][d];
-            for (int i = old_n; i > last; i--)
-                for (int d = 0; d < dim; d++)
-                    (*Ps)[i + 1][t][d] = (*Ps)[i][t][d];
-            for (int i = last + 1; i >= first; i--) {
-                if (alpha[i] == 1.0f) continue;
-                if (alpha[i] == 0.0f) {
-                    for (int d = 0; d < dim; d++)
-                        (*Ps)[i][t][d] = (*Ps)[i - 1][t][d];
-                    continue;
-                }
-                int sc = i - (first - 1), sp = i - 1 - (first - 1);
-                for (int d = 0; d < dim; d++)
-                    (*Ps)[i][t][d] = alpha[i] * saved[sc][d]
-                                   + (1.0f - alpha[i]) * saved[sp][d];
-            }
-        } else {
-            // slice = row t
-            for (int j = first - 1; j <= last; j++)
-                for (int d = 0; d < dim; d++)
-                    saved[j - (first - 1)][d] = (*Ps)[t][j][d];
-            for (int j = old_n; j > last; j--)
-                for (int d = 0; d < dim; d++)
-                    (*Ps)[t][j + 1][d] = (*Ps)[t][j][d];
-            for (int j = last + 1; j >= first; j--) {
-                if (alpha[j] == 1.0f) continue;
-                if (alpha[j] == 0.0f) {
-                    for (int d = 0; d < dim; d++)
-                        (*Ps)[t][j][d] = (*Ps)[t][j - 1][d];
-                    continue;
-                }
-                int sc = j - (first - 1), sp = j - 1 - (first - 1);
-                for (int d = 0; d < dim; d++)
-                    (*Ps)[t][j][d] = alpha[j] * saved[sc][d]
-                                   + (1.0f - alpha[j]) * saved[sp][d];
-            }
-        }
-    }
+    for (int t = 0; t <= n_across; t++)
+        process_slice(Ps, t, old_n, first, last, alpha, dim, dir);
 }
