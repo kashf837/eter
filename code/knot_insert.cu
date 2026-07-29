@@ -15,6 +15,18 @@ int mult_of(KnotVector U, int m, float u) {
     return cnt;
 }
 
+static void expand_grid(CPGrid* Ps, int nr, int nc, int dim, int dir) {
+    if (dir == 0) {
+        *Ps = (CPGrid)realloc(*Ps, (nr + 1) * sizeof(CPArray));
+        (*Ps)[nr] = new_cparray(nc, dim);
+    } else {
+        for (int r = 0; r <= nc; r++) {
+            (*Ps)[r] = (CPArray)realloc((*Ps)[r], (nr + 1) * sizeof(CP));
+            (*Ps)[r][nr] = new_cp(dim);
+        }
+    }
+}
+
 static void expand_knot(KnotVector* K, int* m, int k, float x) {
     int old = *m;
     (*m)++;
@@ -95,17 +107,7 @@ static void surf_insert_along(KnotVector* K, int* m_k, CPGrid* Ps,
     expand_knot(K, m_k, k, x);
 
     (*n_along)++;
-    if (dir == 0) {
-        // u-direction: add one row
-        *Ps = (CPGrid)realloc(*Ps, (*n_along + 1) * sizeof(CPArray));
-        (*Ps)[*n_along] = new_cparray(n_across, dim);
-    } else {
-        // v-direction: add one column to every row
-        for (int r = 0; r <= n_across; r++) {
-            (*Ps)[r] = (CPArray)realloc((*Ps)[r], (*n_along + 1) * sizeof(CP));
-            (*Ps)[r][*n_along] = new_cp(dim);
-        }
-    }
+    expand_grid(Ps, *n_along, n_across, dim, dir);
 
     for (int t = 0; t <= n_across; t++)
         process_slice(Ps, t, old_n, first, last, alpha, dim, dir);
