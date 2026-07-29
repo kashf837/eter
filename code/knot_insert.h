@@ -10,7 +10,7 @@ typedef float*  CP;        // single control point: dim floats
 typedef CP*     CPArray;   // 1D array of control points
 typedef CPArray* CPGrid;   // 2D grid (rows x cols) of control points
 
-// ========== Memory ==========
+// ========== Memory helpers ==========
 static CP new_cp(int dim) {
     return (float*)malloc(dim * sizeof(float));
 }
@@ -45,7 +45,7 @@ int mult_of(float* U, int m, float u);
 
 typedef struct {
     int p_u, p_v;         // degree in u, v
-    int n_u, n_v;         // CP count minus 1 in u, v (= p_u, p_v for a Bezier patch)
+    int n_u, n_v;         // CP count minus 1 in u, v
     int m_u, m_v;         // knot count minus 1 (= n + p + 1)
     float* U, *V;         // knot vectors
     CPGrid Ps;            // control point grid [n_u+1][n_v+1]
@@ -57,14 +57,23 @@ typedef struct {
     float* CP;            // flat array: (n_u+1)*(n_v+1)*4 floats
 } BezierPatch;
 
-// ========== Knot insertion (curve + surface) ==========
-void knot_insert_curve(float** U, int* m, CPArray* P, int* n,
-                       int p, int dim, float u_bar, int k);
+// ========== Surface knot insertion ==========
+// Shared implementation, called by the two wrappers below
+void surf_insert_along(float** K, int* m_k, CPGrid* Ps,
+                        int* n_along, int n_across,
+                        int p, int dim, float x, int k, int dir);
 
-void knot_insert_surf_u(float** U, int* m_u, CPGrid* Ps, int* n_u, int n_v,
-                         int p_u, int dim, float u_bar, int k);
+// Thin wrappers: u-direction (dir=0) and v-direction (dir=1)
+static inline void knot_insert_surf_u(float** U, int* m_u, CPGrid* Ps,
+                                       int* n_u, int n_v,
+                                       int p_u, int dim, float u_bar, int k) {
+    surf_insert_along(U, m_u, Ps, n_u, n_v, p_u, dim, u_bar, k, 0);
+}
 
-void knot_insert_surf_v(float** V, int* m_v, CPGrid* Ps, int n_u, int* n_v,
-                         int p_v, int dim, float v_bar, int k);
+static inline void knot_insert_surf_v(float** V, int* m_v, CPGrid* Ps,
+                                       int n_u, int* n_v,
+                                       int p_v, int dim, float v_bar, int k) {
+    surf_insert_along(V, m_v, Ps, n_v, n_u, p_v, dim, v_bar, k, 1);
+}
 
 #endif
