@@ -2,20 +2,20 @@
 
 // ========== Knot vector helpers ==========
 
-int find_span(float* U, int m, float u) {
+int find_span(KnotVector U, int m, float u) {
     for (int i = 0; i < m; i++)
         if (u >= U[i] && u < U[i + 1]) return i;
     return -1;
 }
 
-int mult_of(float* U, int m, float u) {
+int mult_of(KnotVector U, int m, float u) {
     int cnt = 0;
     for (int i = 0; i <= m; i++)
         if (U[i] == u) cnt++;
     return cnt;
 }
 
-static void expand_knot(float** K, int* m, int k, float x) {
+static void expand_knot(KnotVector* K, int* m, int k, float x) {
     int old = *m;
     (*m)++;
     *K = (float*)realloc(*K, (*m + 1) * sizeof(float));
@@ -34,7 +34,7 @@ static void precompute_alpha(float* alpha, float* K_old, int n_old,
 
 // ========== Surface knot insertion (shared implementation) ==========
 
-void surf_insert_along(float** K, int* m_k, CPGrid* Ps,
+void surf_insert_along(KnotVector* K, int* m_k, CPGrid* Ps,
                         int* n_along, int n_across,
                         int p, int dim, float x, int k, int dir) {
     int old_m = *m_k, old_n = *n_along;
