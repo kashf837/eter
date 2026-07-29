@@ -57,27 +57,22 @@ void knot_insert_surf(NurbsSurf* s, int dir, float x) {
 // dir=1: t is row,    cols 0..old_n are the varying index
 static void process_slice(CPGrid* Ps, int t, int old_n, int first, int last,
                            float* alpha, int dim, int dir) {
-    // save P_{first-1} through P_{last+1} — covers all possible alpha reads
+    // save all old CPs in this slice: P_0 .. P_{old_n}
     float saved[12][8];
-    for (int v = first - 1; v <= last + 1; v++)
+    for (int v = 0; v <= old_n; v++)
         for (int d = 0; d < dim; d++) {
             float* cp = (dir == 0) ? &(*Ps)[v][t][d] : &(*Ps)[t][v][d];
-            saved[v - (first - 1)][d] = *cp;
+            saved[v][d] = *cp;
         }
 
-    for (int v = old_n; v > last; v--)
-        for (int d = 0; d < dim; d++) {
-            float* dst = (dir == 0) ? &(*Ps)[v + 1][t][d] : &(*Ps)[t][v + 1][d];
-            float* src = (dir == 0) ? &(*Ps)[v][t][d]     : &(*Ps)[t][v][d];
-            *dst = *src;
-        }
-
-    // unified formula: Q_v = alpha[v] * P_v + (1-alpha[v]) * P_{v-1}
-    for (int v = last + 1; v >= first; v--) {
-        int sc = v - (first - 1), sp = v - 1 - (first - 1);
+    // write all new CPs: Q_v = alpha[v] * P_v + (1-alpha[v]) * P_{v-1}
+    // alpha[0]=1 (clamp P_{-1}→P_0 harmless), alpha[old_n+1]=0 (clamp P_{old_n+1}→P_{old_n} harmless)
+    for (int v = 0; v <= old_n + 1; v++) {
+        int pi  = (v <= old_n) ? v : old_n;      // P_i, clamp high end
+        int pi1 = (v - 1 >= 0) ? v - 1 : 0;      // P_{i-1}, clamp low end
         for (int d = 0; d < dim; d++) {
             float* dst = (dir == 0) ? &(*Ps)[v][t][d] : &(*Ps)[t][v][d];
-            *dst = alpha[v] * saved[sc][d] + (1.0f - alpha[v]) * saved[sp][d];
+            *dst = alpha[v] * saved[pi][d] + (1.0f - alpha[v]) * saved[pi1][d];
         }
     }
 }
