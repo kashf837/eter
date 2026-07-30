@@ -4,6 +4,7 @@
 #include "knot_insert.h"
 #include "bezier_eval.h"
 #include "adaptive_tess.h"
+#include "render.h"
 
 // ========== File I/O ==========
 
@@ -57,6 +58,8 @@ static void free_surf(NurbsSurf* s) {
 }
 
 // ========== Process one surface, write into open OBJ file ==========
+static DepthBuffer* g_db = NULL;   // set by --render mode
+
 static int process_surf(const char* path, FILE* obj, int* voff) {
     NurbsSurf* s = read_surf(path);
     if (!s) return 0;
@@ -87,7 +90,7 @@ static int process_surf(const char* path, FILE* obj, int* voff) {
     BezierPatch bp;
     bp.p_u = s->p_u; bp.p_v = s->p_v;
     bp.CP  = (float*)malloc(ru * rv * 4 * sizeof(float));
-    float* V = NULL;  // allocate per patch (size varies)
+    float* V = NULL, *d_V = NULL;  // CPU + GPU vertex buffers
     int V_cap = 0;
 
     for (int pi = 0; pi < np_u; pi++) {
@@ -106,28 +109,36 @@ static int process_surf(const char* path, FILE* obj, int* voff) {
             adapt_tess_factors(&tu, &tv);
             // GPU eval with dynamic resolution
             int nV = tu * tv;
-            if (nV > V_cap) { free(V); V = (float*)malloc(nV * 3 * sizeof(float)); V_cap = nV; }
+            if (nV > V_cap) {
+                free(V); cudaFree(d_V);
+                V = (float*)malloc(nV * 3 * sizeof(float));
+                cudaMalloc(&d_V, nV * 3 * sizeof(float));
+                V_cap = nV;
+            }
             eval_bezier_patch(&bp, V, tu, tv);
 
-            // Write vertices
-            for (int vi = 0; vi < nV; vi++)
-                fprintf(obj, "v %f %f %f\n", V[vi*3+0], V[vi*3+1], V[vi*3+2]);
-
-            // Write faces with vertex offset
-            int off = *voff;
-            for (int i = 0; i < tu - 1; i++)
-                for (int j = 0; j < tv - 1; j++) {
-                    int a = off + i * tv + j + 1, b = a + 1;
-                    int c = off + (i + 1) * tv + j + 1, d = c + 1;
-                    fprintf(obj, "f %d %d %d\n", a, b, c);
-                    fprintf(obj, "f %d %d %d\n", b, d, c);
-                }
-            *voff += nV;
+            if (g_db) {
+                // Render mode: rasterize to depth buffer
+                cudaMemcpy(d_V, V, nV * 3 * sizeof(float), cudaMemcpyHostToDevice);
+                rasterize_patch(d_V, tu, tv, g_db);
+            } else {
+                // OBJ mode: write vertices and faces
+                for (int vi = 0; vi < nV; vi++)
+                    fprintf(obj, "v %f %f %f\n", V[vi*3+0], V[vi*3+1], V[vi*3+2]);
+                int off = *voff;
+                for (int i = 0; i < tu - 1; i++)
+                    for (int j = 0; j < tv - 1; j++) {
+                        int a = off + i * tv + j + 1, b = a + 1;
+                        int c = off + (i + 1) * tv + j + 1, d = c + 1;
+                        fprintf(obj, "f %d %d %d\n", a, b, c);
+                        fprintf(obj, "f %d %d %d\n", b, d, c);
+                    }
+            }
         }
     }
 
     int total = np_u * np_v;
-    free(V); free(bp.CP);
+    free(V); cudaFree(d_V); free(bp.CP);
     free_surf(s);
     printf(" -> %d patches\n", total);
     return total;
@@ -145,6 +156,23 @@ int main(int argc, char* argv[]) {
     FILE* obj;
     int vert_offset = 0;
     int total_patches = 0, total_surfs = 0;
+
+    if (strcmp(argv[1], "--render") == 0) {
+        DepthBuffer* db = create_depth_buffer(SCR_W, SCR_H);
+        g_db = db;
+        obj = NULL;
+        for (int i = 2; i < argc; i++) {
+            printf("[%d]", total_surfs);
+            int p = process_surf(argv[i], obj, &vert_offset);
+            if (p > 0) { total_patches += p; total_surfs++; }
+        }
+        cudaDeviceSynchronize();
+        write_ppm("build/render.ppm", db);
+        free_depth_buffer(db);
+        printf("\nDone: %d surfaces, %d patches -> build/render.ppm\n",
+               total_surfs, total_patches);
+        return 0;
+    }
 
     if (strcmp(argv[1], "--batch") == 0) {
         // Batch mode: read all .surf from directory
