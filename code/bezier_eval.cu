@@ -13,16 +13,17 @@ void compute_binom(int order, int* binom) {
 }
 
 __global__ void eval_surface(
-    float* d_CP, float* d_V, int n,
+    float* d_CP, float* d_V, int nu, int nv,
     int order_u, int order_v, int cols,
     int* d_binom_u, int* d_binom_v
 ) {
     int i  = blockIdx.y * BLOCK_SIZE + threadIdx.y;
     int j  = blockIdx.x * BLOCK_SIZE + threadIdx.x;
-    int idx = i * n + j;
+    if (i >= nu || j >= nv) return;
+    int idx = i * nv + j;
 
-    float u = (float)i / (n - 1);
-    float v = (float)j / (n - 1);
+    float u = (float)i / (nu - 1);
+    float v = (float)j / (nv - 1);
 
     __shared__ float s_Bu[BLOCK_SIZE][MAX_ORDER + 1];
     __shared__ float s_Bv[BLOCK_SIZE][MAX_ORDER + 1];
@@ -60,40 +61,36 @@ __global__ void eval_surface(
 //   bp:  BezierPatch with flat CP array (x, y, z, w per point)
 //   V_out: output vertex buffer, N*N*3 floats
 //   N:  sampling grid resolution (N x N vertices)
-void eval_bezier_patch(BezierPatch* bp, float* V_out, int N) {
+void eval_bezier_patch(BezierPatch* bp, float* V_out, int nu, int nv) {
     int order_u = bp->p_u, order_v = bp->p_v;
-    int cols   = order_v + 1;                       // control points per row
+    int cols   = order_v + 1;
     int num_cp = (order_u + 1) * cols;
+    int total  = nu * nv;
 
-    // precompute binomial coefficients for Bernstein basis
     int* binom_u = (int*)malloc((order_u + 1) * sizeof(int));
     int* binom_v = (int*)malloc((order_v + 1) * sizeof(int));
     compute_binom(order_u, binom_u);
     compute_binom(order_v, binom_v);
 
-    // allocate GPU memory: control points, output vertices, binom tables
     float *d_CP, *d_V;
     int   *d_binom_u, *d_binom_v;
     cudaMalloc(&d_CP,      num_cp * 4 * sizeof(float));
-    cudaMalloc(&d_V,       N * N * 3 * sizeof(float));
+    cudaMalloc(&d_V,       total * 3 * sizeof(float));
     cudaMalloc(&d_binom_u, (order_u + 1) * sizeof(int));
     cudaMalloc(&d_binom_v, (order_v + 1) * sizeof(int));
 
-    // copy data to GPU
     cudaMemcpy(d_CP, bp->CP, num_cp * 4 * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(d_binom_u, binom_u, (order_u + 1) * sizeof(int), cudaMemcpyHostToDevice);
     cudaMemcpy(d_binom_v, binom_v, (order_v + 1) * sizeof(int), cudaMemcpyHostToDevice);
 
-    // launch kernel: BLOCK_SIZE x BLOCK_SIZE threads per block
     dim3 block(BLOCK_SIZE, BLOCK_SIZE);
-    dim3 grid(N / BLOCK_SIZE, N / BLOCK_SIZE);
-    eval_surface<<<grid, block>>>(d_CP, d_V, N, order_u, order_v, cols,
+    dim3 grid((nv + BLOCK_SIZE - 1) / BLOCK_SIZE,
+              (nu + BLOCK_SIZE - 1) / BLOCK_SIZE);
+    eval_surface<<<grid, block>>>(d_CP, d_V, nu, nv, order_u, order_v, cols,
                                    d_binom_u, d_binom_v);
 
-    // copy results back to CPU
-    cudaMemcpy(V_out, d_V, N * N * 3 * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(V_out, d_V, total * 3 * sizeof(float), cudaMemcpyDeviceToHost);
 
-    // cleanup
     cudaFree(d_CP); cudaFree(d_V);
     cudaFree(d_binom_u); cudaFree(d_binom_v);
     free(binom_u); free(binom_v);

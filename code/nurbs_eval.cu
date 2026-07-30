@@ -4,7 +4,14 @@
 #include "knot_insert.h"
 #include "bezier_eval.h"
 
-#define N 32
+// ========== Scale tess factors to (7p+1)x(7q+1) for meshlets ==========
+
+static void adapt_tess_factors(int* tu, int* tv) {
+    int p = (*tu + 6) / 7;  if (p < 1) p = 1;
+    int q = (*tv + 6) / 7;  if (q < 1) q = 1;
+    *tu = 7 * p + 1;
+    *tv = 7 * q + 1;
+}
 
 // ========== File I/O ==========
 
@@ -175,8 +182,6 @@ static float compute_epsilon(BezierPatch* bp) {
     float ey = (z_min * tau_y) / (B * (1.0f + yz_max) + tau_y);
     float eps = (ex < ey) ? ex : ey;
 
-    printf(">>> EPSILON = %.6f (z_min=%.2f xz=%.2f yz=%.2f) <<<\n",
-           eps, z_min, xz_max, yz_max);
     return eps;
 }
 
@@ -208,10 +213,11 @@ static int process_surf(const char* path, FILE* obj, int* voff) {
     int np_u = (s->n_u + 1 - ru) / ru + 1;               // number of patches in u
     int np_v = (s->n_v + 1 - rv) / rv + 1;               // number of patches in v
 
-    float* V = (float*)malloc(N * N * 3 * sizeof(float)); // GPU output buffer
     BezierPatch bp;
     bp.p_u = s->p_u; bp.p_v = s->p_v;
-    bp.CP  = (float*)malloc(ru * rv * 4 * sizeof(float));  // flat CP storage
+    bp.CP  = (float*)malloc(ru * rv * 4 * sizeof(float));
+    float* V = NULL;  // allocate per patch (size varies)
+    int V_cap = 0;
 
     for (int pi = 0; pi < np_u; pi++) {
         for (int pj = 0; pj < np_v; pj++) {
@@ -222,30 +228,30 @@ static int process_surf(const char* path, FILE* obj, int* voff) {
                            s->Ps[pi * ru + i][pj * rv + j],
                            4 * sizeof(float));
 
-            // §4: compute epsilon and tessellation factors for this patch
+            // §4: compute epsilon and tessellation factors
             float eps = compute_epsilon(&bp);
             int tu = 0, tv = 0;
             compute_tess_factors(&bp, eps, &tu, &tv);
-            printf("    tu=%d tv=%d  ", tu, tv);
-
-            // GPU eval (still using fixed N for now — will switch to tu,tv later)
-            eval_bezier_patch(&bp, V, N);
+            adapt_tess_factors(&tu, &tv);
+            // GPU eval with dynamic resolution
+            int nV = tu * tv;
+            if (nV > V_cap) { free(V); V = (float*)malloc(nV * 3 * sizeof(float)); V_cap = nV; }
+            eval_bezier_patch(&bp, V, tu, tv);
 
             // Write vertices
-            for (int vi = 0; vi < N * N; vi++)
+            for (int vi = 0; vi < nV; vi++)
                 fprintf(obj, "v %f %f %f\n", V[vi*3+0], V[vi*3+1], V[vi*3+2]);
 
             // Write faces with vertex offset
-            for (int i = 0; i < N - 1; i++)
-                for (int j = 0; j < N - 1; j++) {
-                    int off = *voff;
-                    int a = off + i * N + j + 1, b = a + 1;
-                    int c = off + (i + 1) * N + j + 1, d = c + 1;
+            int off = *voff;
+            for (int i = 0; i < tu - 1; i++)
+                for (int j = 0; j < tv - 1; j++) {
+                    int a = off + i * tv + j + 1, b = a + 1;
+                    int c = off + (i + 1) * tv + j + 1, d = c + 1;
                     fprintf(obj, "f %d %d %d\n", a, b, c);
                     fprintf(obj, "f %d %d %d\n", b, d, c);
                 }
-
-            *voff += N * N;
+            *voff += nV;
         }
     }
 
