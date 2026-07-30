@@ -1,23 +1,15 @@
 #include "adaptive_tess.h"
+#include "render.h"
 #include <math.h>
 #include <stdio.h>
-
-// ========== Hardcoded camera (replace with proper camera model later) ==========
-
-#define CAM_FOV_Y  60.0f
-#define CAM_WIDTH  1920
-#define CAM_HEIGHT 1080
-#define CAM_POS_X  0.5f
-#define CAM_POS_Y  0.5f
-#define CAM_POS_Z -2.0f
 
 // ========== §4.1: Screen error → object-space epsilon ==========
 
 float compute_epsilon(BezierPatch* bp) {
-    float B = 1.0f / tanf((CAM_FOV_Y * 3.14159265f / 180.0f) * 0.5f);
-    float A = B * (float)CAM_WIDTH / (float)CAM_HEIGHT;
-    float tau_x = 1.0f / (float)CAM_WIDTH;
-    float tau_y = 1.0f / (float)CAM_HEIGHT;
+    float B = 1.0f / tanf((FOV_Y * 3.14159265f / 180.0f) * 0.5f);
+    float A = B * (float)SCR_W / (float)SCR_H;
+    float tau_x = 1.0f / (float)SCR_W;
+    float tau_y = 1.0f / (float)SCR_H;
 
     float z_min = 1e30f, xz_max = 0.0f, yz_max = 0.0f;
     int rows = bp->p_u + 1, cols = bp->p_v + 1;
@@ -30,9 +22,9 @@ float compute_epsilon(BezierPatch* bp) {
             float w  = bp->CP[(i * cols + j) * 4 + 3];
 
             float x = xw / w, y = yw / w, z = zw / w;
-            float cx = x - CAM_POS_X;
-            float cy = y - CAM_POS_Y;
-            float cz = z - CAM_POS_Z;
+            float cx = x - CAM_X;
+            float cy = y - CAM_Y;
+            float cz = z - CAM_Z;
             if (cz < 0.01f) cz = 0.01f;
 
             if (cz < z_min) z_min = cz;
