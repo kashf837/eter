@@ -104,14 +104,22 @@ void free_depth_buffer(DepthBuffer* db) {
     free(db);
 }
 
-void rasterize_patch(float* d_V, int tu, int tv, DepthBuffer* db) {
-    float B = 1.0f / tanf((FOV_Y * 3.14159265f / 180.0f) * 0.5f);
-    float A = B * (float)SCR_W / (float)SCR_H;
-    float cx = CAM_X, cy = CAM_Y, cz = CAM_Z;
+static float g_A, g_B, g_cx, g_cy, g_cz;
+static int   g_inited = 0;
 
+static void init_proj(void) {
+    if (g_inited) return;
+    g_B  = 1.0f / tanf((FOV_Y * 3.14159265f / 180.0f) * 0.5f);
+    g_A  = g_B * (float)SCR_W / (float)SCR_H;
+    g_cx = CAM_X; g_cy = CAM_Y; g_cz = CAM_Z;
+    g_inited = 1;
+}
+
+void rasterize_patch(float* d_V, int tu, int tv, DepthBuffer* db) {
+    init_proj();
     int nq = (tu - 1) * (tv - 1);
     int th = 256, blk = (nq + th - 1) / th;
-    rasterize_patch_kernel<<<blk, th>>>(d_V, tu, tv, db->d_depth, A, B, cx, cy, cz);
+    rasterize_patch_kernel<<<blk, th>>>(d_V, tu, tv, db->d_depth, g_A, g_B, g_cx, g_cy, g_cz);
 }
 
 void write_ppm(const char* path, DepthBuffer* db) {

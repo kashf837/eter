@@ -57,10 +57,6 @@ __global__ void eval_surface(
     d_V[idx * 3 + 2] = Sw[2] * inv;
 }
 
-// GPU-accelerated Bezier surface evaluation.
-//   bp:  BezierPatch with flat CP array (x, y, z, w per point)
-//   V_out: output vertex buffer, N*N*3 floats
-//   N:  sampling grid resolution (N x N vertices)
 void eval_bezier_patch(BezierPatch* bp, float* V_out, int nu, int nv) {
     int order_u = bp->p_u, order_v = bp->p_v;
     int cols   = order_v + 1;

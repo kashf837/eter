@@ -1,9 +1,7 @@
 #ifndef KNOT_INSERT_H
 #define KNOT_INSERT_H
 
-#include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 
 // ========== Type aliases ==========
 typedef float*  CP;          // single control point:  dim floats

@@ -204,7 +204,7 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    fclose(obj);
+    if (obj) fclose(obj);
     printf("\nDone: %d surfaces, %d patches, %d verts -> OBJ\n",
            total_surfs, total_patches, vert_offset);
     return 0;

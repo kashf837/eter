@@ -1,4 +1,5 @@
 #include "knot_insert.h"
+#include <string.h>
 
 // ========== Knot vector helpers ==========
 
