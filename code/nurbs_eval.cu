@@ -57,6 +57,73 @@ static void free_surf(NurbsSurf* s) {
     free(s);
 }
 
+//  ε → tu, tv ==========
+
+// Compute Δu, Δv from ε using 2nd-difference formula on 4D homogeneous CPs.
+static void compute_tess_factors(BezierPatch* bp, float eps, int* tu, int* tv) {
+    int m = bp->p_u + 1,  n = bp->p_v + 1;
+    int cols = n;
+
+    float min_w = 1e30f, max_norm = 0.0f;
+    for (int i = 0; i < m; i++)
+        for (int j = 0; j < n; j++) {
+            float w = bp->CP[(i * cols + j) * 4 + 3];
+            if (w < min_w) min_w = w;
+            float x = bp->CP[(i * cols + j) * 4 + 0] / w;
+            float y = bp->CP[(i * cols + j) * 4 + 1] / w;
+            float z = bp->CP[(i * cols + j) * 4 + 2] / w;
+            float nd = sqrtf(x*x + y*y + z*z);
+            if (nd > max_norm) max_norm = nd;
+        }
+    float r_star = max_norm;
+
+    // u direction: 2nd difference along rows
+    float max_D2u = 0.0f, max_D2w_u = 0.0f;
+    for (int i = 0; i <= m - 3; i++)
+        for (int j = 0; j < n; j++) {
+            float* p0 = &bp->CP[( i      * cols + j) * 4];
+            float* p1 = &bp->CP[((i + 1) * cols + j) * 4];
+            float* p2 = &bp->CP[((i + 2) * cols + j) * 4];
+            float sum2 = 0.0f;
+            for (int d = 0; d < 4; d++) {
+                float d2 = p2[d] - 2.0f * p1[d] + p0[d];
+                sum2 += d2 * d2;
+            }
+            float nd = sqrtf(sum2);
+            if (nd > max_D2u) max_D2u = nd;
+            float d2w = p2[3] - 2.0f * p1[3] + p0[3];
+            float aw = fabsf(d2w);
+            if (aw > max_D2w_u) max_D2w_u = aw;
+        }
+    float denom_u = m*(m-1)*max_D2u + (r_star - eps)*m*(m-1)*max_D2w_u;
+    float delta_u = sqrtf(8.0f * eps * min_w / denom_u);
+    if (delta_u < 1e-10f) delta_u = 1e-10f;
+    *tu = (int)ceilf(1.0f / delta_u);
+
+    // v direction: 2nd difference along columns
+    float max_D2v = 0.0f, max_D2w_v = 0.0f;
+    for (int i = 0; i < m; i++)
+        for (int j = 0; j <= n - 3; j++) {
+            float* p0 = &bp->CP[(i * cols +  j     ) * 4];
+            float* p1 = &bp->CP[(i * cols + (j + 1)) * 4];
+            float* p2 = &bp->CP[(i * cols + (j + 2)) * 4];
+            float sum2 = 0.0f;
+            for (int d = 0; d < 4; d++) {
+                float d2 = p2[d] - 2.0f * p1[d] + p0[d];
+                sum2 += d2 * d2;
+            }
+            float nd = sqrtf(sum2);
+            if (nd > max_D2v) max_D2v = nd;
+            float d2w = p2[3] - 2.0f * p1[3] + p0[3];
+            float aw = fabsf(d2w);
+            if (aw > max_D2w_v) max_D2w_v = aw;
+        }
+    float denom_v = n*(n-1)*max_D2v + (r_star - eps)*n*(n-1)*max_D2w_v;
+    float delta_v = sqrtf(8.0f * eps * min_w / denom_v);
+    if (delta_v < 1e-10f) delta_v = 1e-10f;
+    *tv = (int)ceilf(1.0f / delta_v);
+}
+
 // ========== Screen error → object-space error ==========
 
 // Camera model (hardcoded for now — replace with proper camera later)
@@ -76,7 +143,7 @@ static float compute_epsilon(BezierPatch* bp) {
 
     // compute patch bounding box in camera space
     float z_min = 1e30f, xz_max = 0.0f, yz_max = 0.0f;
-    int rows = bp->n_u + 1, cols = bp->n_v + 1;
+    int rows = bp->p_u + 1, cols = bp->p_v + 1;
 
     for (int i = 0; i < rows; i++) {
         for (int j = 0; j < cols; j++) {
@@ -144,7 +211,6 @@ static int process_surf(const char* path, FILE* obj, int* voff) {
     float* V = (float*)malloc(N * N * 3 * sizeof(float)); // GPU output buffer
     BezierPatch bp;
     bp.p_u = s->p_u; bp.p_v = s->p_v;
-    bp.n_u = ru - 1; bp.n_v = rv - 1;                     // CP counts per patch
     bp.CP  = (float*)malloc(ru * rv * 4 * sizeof(float));  // flat CP storage
 
     for (int pi = 0; pi < np_u; pi++) {
@@ -156,10 +222,13 @@ static int process_surf(const char* path, FILE* obj, int* voff) {
                            s->Ps[pi * ru + i][pj * rv + j],
                            4 * sizeof(float));
 
-            // §4: compute epsilon for this patch (temporary — replaces fixed N later)
+            // §4: compute epsilon and tessellation factors for this patch
             float eps = compute_epsilon(&bp);
+            int tu = 0, tv = 0;
+            compute_tess_factors(&bp, eps, &tu, &tv);
+            printf("    tu=%d tv=%d  ", tu, tv);
 
-            // GPU eval
+            // GPU eval (still using fixed N for now — will switch to tu,tv later)
             eval_bezier_patch(&bp, V, N);
 
             // Write vertices

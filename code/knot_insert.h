@@ -53,9 +53,8 @@ typedef struct {
 } NurbsSurf;
 
 typedef struct {
-    int p_u, p_v;           // degree
-    int n_u, n_v;           // CP count minus 1
-    float* CP;              // flat array: (n_u+1)*(n_v+1)*4 floats
+    int p_u, p_v;           // degree (= CP count minus 1 for Bezier)
+    float* CP;              // flat array: (p_u+1)*(p_v+1)*4 floats
 } BezierPatch;
 
 // ========== Surface knot insertion ==========
