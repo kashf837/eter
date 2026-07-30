@@ -57,6 +57,62 @@ static void free_surf(NurbsSurf* s) {
     free(s);
 }
 
+// ========== Screen error → object-space error ==========
+
+// Camera model (hardcoded for now — replace with proper camera later)
+#define CAM_FOV_Y  60.0f                         // vertical FOV in degrees
+#define CAM_WIDTH  1920                          // screen resolution
+#define CAM_HEIGHT 1080
+#define CAM_POS_X  0.5f                          // camera position (world space)
+#define CAM_POS_Y  0.5f
+#define CAM_POS_Z  -2.0f                         // camera looking down +Z
+
+static float compute_epsilon(BezierPatch* bp) {
+    // projection matrix coefficients
+    float B = 1.0f / tanf((CAM_FOV_Y * 3.14159265f / 180.0f) * 0.5f);  // B = cot(fov_y/2)
+    float A = B * (float)CAM_WIDTH / (float)CAM_HEIGHT;                // A = B * aspect
+    float tau_x = 1.0f / (float)CAM_WIDTH;                             // half-pixel in clip space
+    float tau_y = 1.0f / (float)CAM_HEIGHT;
+
+    // compute patch bounding box in camera space
+    float z_min = 1e30f, xz_max = 0.0f, yz_max = 0.0f;
+    int rows = bp->n_u + 1, cols = bp->n_v + 1;
+
+    for (int i = 0; i < rows; i++) {
+        for (int j = 0; j < cols; j++) {
+            float xw = bp->CP[(i * cols + j) * 4 + 0];
+            float yw = bp->CP[(i * cols + j) * 4 + 1];
+            float zw = bp->CP[(i * cols + j) * 4 + 2];
+            float w  = bp->CP[(i * cols + j) * 4 + 3];
+
+            // perspective division to get 3D position
+            float x = xw / w, y = yw / w, z = zw / w;
+
+            // transform to camera space (camera at CAM_POS looking +Z)
+            float cx = x - CAM_POS_X;
+            float cy = y - CAM_POS_Y;
+            float cz = z - CAM_POS_Z;           // depth = distance along view direction
+
+            if (cz < 0.01f) cz = 0.01f;          // clamp to avoid division by zero
+
+            if (cz < z_min) z_min = cz;
+            float axz = fabsf(cx / cz);
+            float ayz = fabsf(cy / cz);
+            if (axz > xz_max) xz_max = axz;
+            if (ayz > yz_max) yz_max = ayz;
+        }
+    }
+
+    // equation from §4.1
+    float ex = (z_min * tau_x) / (A * (1.0f + xz_max) + tau_x);
+    float ey = (z_min * tau_y) / (B * (1.0f + yz_max) + tau_y);
+    float eps = (ex < ey) ? ex : ey;
+
+    printf(">>> EPSILON = %.6f (z_min=%.2f xz=%.2f yz=%.2f) <<<\n",
+           eps, z_min, xz_max, yz_max);
+    return eps;
+}
+
 // ========== Process one surface, write into open OBJ file ==========
 static int process_surf(const char* path, FILE* obj, int* voff) {
     NurbsSurf* s = read_surf(path);
@@ -64,7 +120,7 @@ static int process_surf(const char* path, FILE* obj, int* voff) {
     if (s->p_u < 0 || s->p_v < 0 || s->n_u < 0 || s->n_v < 0) {
         printf("  SKIP (invalid)\n"); free_surf(s); return 0;
     }
-    printf("  p=(%d,%d) CPs=%dx%d", s->p_u, s->p_v, s->n_u+1, s->n_v+1);
+    printf("  p=(%d,%d) CPs=%dx%d\n", s->p_u, s->p_v, s->n_u+1, s->n_v+1);
 
     // 2. Knot insertion in u and v
     for (int i = s->p_u + 1; i <= s->m_u - s->p_u - 1; i++) {
@@ -99,6 +155,9 @@ static int process_surf(const char* path, FILE* obj, int* voff) {
                     memcpy(&bp.CP[(i * rv + j) * 4],
                            s->Ps[pi * ru + i][pj * rv + j],
                            4 * sizeof(float));
+
+            // §4: compute epsilon for this patch (temporary — replaces fixed N later)
+            float eps = compute_epsilon(&bp);
 
             // GPU eval
             eval_bezier_patch(&bp, V, N);

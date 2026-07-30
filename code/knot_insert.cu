@@ -70,7 +70,7 @@ void knot_insert_surf(NurbsSurf* s, int dir, float x) {
 static void process_slice(CPGrid* Ps, int t, int old_n, int first, int last,
                            float* alpha, int dim, int dir) {
     // save all old CPs in this slice: P_0 .. P_{old_n}
-    float saved[12][8];
+    float saved[64][8];
     for (int v = 0; v <= old_n; v++)
         for (int d = 0; d < dim; d++) {
             float* cp = (dir == 0) ? &(*Ps)[v][t][d] : &(*Ps)[t][v][d];
