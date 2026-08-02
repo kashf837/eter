@@ -25,3 +25,8 @@ data/
 
 # 外部依赖
 external/
+
+# nvpro_core2 模板构建产物
+_bin/
+_downloaded_resources/
+**/nvpro_core2/
