@@ -22,3 +22,6 @@ data/
 
 # 临时文件
 *.tmp
+
+# 外部依赖
+external/

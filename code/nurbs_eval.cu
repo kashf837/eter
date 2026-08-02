@@ -133,6 +133,7 @@ static int process_surf(const char* path, FILE* obj, int* voff) {
                         fprintf(obj, "f %d %d %d\n", a, b, c);
                         fprintf(obj, "f %d %d %d\n", b, d, c);
                     }
+                *voff += nV;
             }
         }
     }

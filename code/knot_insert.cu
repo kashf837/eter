@@ -99,10 +99,10 @@ static void surf_insert_along(KnotVector* K, int* m_k, CPGrid* Ps,
     int first = k - p + 1;
     int last  = k;
 
-    float K_old[20];
+    float* K_old = (float*)malloc((old_m + 1) * sizeof(float));
     memcpy(K_old, *K, (old_m + 1) * sizeof(float));
 
-    float alpha[20];
+    float* alpha = (float*)malloc((old_n + p + 2) * sizeof(float));
     precompute_alpha(alpha, K_old, old_n, p, x, k);
 
     expand_knot(K, m_k, k, x);
@@ -112,4 +112,7 @@ static void surf_insert_along(KnotVector* K, int* m_k, CPGrid* Ps,
 
     for (int t = 0; t <= n_across; t++)
         process_slice(Ps, t, old_n, first, last, alpha, dim, dir);
+
+    free(K_old);
+    free(alpha);
 }
