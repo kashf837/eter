@@ -134,3 +134,58 @@ int nurbs_to_texture(float* cpu_data, int W, int H, const char* surf_path)
     free_surf(s);
     return 0;
 }
+
+// ---- Wireframe: evaluate all patches at coarse grid, return x,y positions ----
+
+float* nurbs_wireframe(const char* surf_path, int res,
+                       int* np_u_out, int* np_v_out)
+{
+    NurbsSurf* s = read_surf(surf_path);
+    if (!s) return NULL;
+
+    // KI
+    for (int i = s->p_u + 1; i <= s->m_u - s->p_u - 1; i++) {
+        float u = s->U[i];
+        while (mult_of(s->U, s->m_u, u) < s->p_u + 1)
+            knot_insert_surf(s, 0, u);
+    }
+    for (int i = s->p_v + 1; i <= s->m_v - s->p_v - 1; i++) {
+        float v = s->V[i];
+        while (mult_of(s->V, s->m_v, v) < s->p_v + 1)
+            knot_insert_surf(s, 1, v);
+    }
+
+    int ru = s->p_u + 1, rv = s->p_v + 1;
+    int np_u = (s->n_u + 1) / ru;
+    int np_v = (s->n_v + 1) / rv;
+    *np_u_out = np_u; *np_v_out = np_v;
+
+    float* verts = (float*)malloc(np_u * np_v * res * res * 2 * sizeof(float));
+    BezierPatch bp;
+    bp.p_u = s->p_u; bp.p_v = s->p_v;
+    bp.CP = (float*)malloc(ru * rv * 4 * sizeof(float));
+
+    for (int pi = 0; pi < np_u; pi++) {
+        for (int pj = 0; pj < np_v; pj++) {
+            for (int i = 0; i < ru; i++)
+                for (int j = 0; j < rv; j++)
+                    memcpy(&bp.CP[(i * rv + j) * 4],
+                           s->Ps[pi * ru + i][pj * rv + j], 4 * sizeof(float));
+
+            float* V = (float*)malloc(res * res * 3 * sizeof(float));
+            eval_bezier_patch(&bp, V, res, res);
+
+            float* dst = verts + (pi * np_v + pj) * res * res * 2;
+            for (int y = 0; y < res; y++)
+                for (int x = 0; x < res; x++) {
+                    dst[(y * res + x) * 2 + 0] = V[(x * res + y) * 3 + 0]; // x
+                    dst[(y * res + x) * 2 + 1] = V[(x * res + y) * 3 + 1]; // y
+                }
+            free(V);
+        }
+    }
+
+    free(bp.CP);
+    free_surf(s);
+    return verts;
+}

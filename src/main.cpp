@@ -17,10 +17,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-// This example demonstrates a minimal Vulkan application using the NVIDIA
-// Vulkan utility libraries. It creates a window displaying a single colored
-// pixel that animates through the HSV color space.
-
+// ETER — NURBS real-time rendering (WIP)
 #define VMA_IMPLEMENTATION
 
 #include <vector>
@@ -95,6 +92,41 @@ public:
     int ok = nurbs_to_texture(imageData.data(), W, H, "data/test.surf");
     if (ok != 0) { LOGE("NURBS pipeline failed\n"); return; }
 
+    // Wireframe overlay: get coarse vertex grid, draw lines on image
+    {
+        int np_u, np_v, res = 8;  // 8×8 vertices per patch
+        float* verts = nurbs_wireframe("data/test.surf", res, &np_u, &np_v);
+        if (verts) {
+            auto px = [&](float x){ return (int)(x * (W - 1) + 0.5f); };
+            auto py = [&](float y){ return (int)(y * (H - 1) + 0.5f); };
+            auto draw_line = [&](int x1,int y1,int x2,int y2){
+                int dx=abs(x2-x1),dy=-abs(y2-y1),sx=x1<x2?1:-1,sy=y1<y2?1:-1,e=dx+dy;
+                while(1){
+                    if(x1>=0&&x1<W&&y1>=0&&y1<H){ int i=(y1*W+x1)*4; imageData[i]=1;imageData[i+1]=1;imageData[i+2]=1;imageData[i+3]=1; }
+                    if(x1==x2&&y1==y2)break; int e2=2*e;
+                    if(e2>=dy){e+=dy;x1+=sx;} if(e2<=dx){e+=dx;y1+=sy;}
+                }
+            };
+            for (int pi = 0; pi < np_u; pi++)
+                for (int pj = 0; pj < np_v; pj++) {
+                    float* v = verts + (pi * np_v + pj) * res * res * 2;
+                    for (int y = 0; y < res; y++)
+                        for (int x = 0; x < res; x++) {
+                            int xi = px(v[(y * res + x) * 2 + 0]);
+                            int yi = py(v[(y * res + x) * 2 + 1]);
+                            if (x + 1 < res) { int nx=px(v[(y*res+x+1)*2+0]),ny=py(v[(y*res+x+1)*2+1]); draw_line(xi,yi,nx,ny); }
+                            if (y + 1 < res) { int nx=px(v[((y+1)*res+x)*2+0]),ny=py(v[((y+1)*res+x)*2+1]); draw_line(xi,yi,nx,ny); }
+                            // Diagonal: split each quad into 2 triangles
+                            if (x + 1 < res && y + 1 < res) {
+                                int nx=px(v[((y+1)*res+x+1)*2+0]),ny=py(v[((y+1)*res+x+1)*2+1]);
+                                draw_line(xi,yi,nx,ny);
+                            }
+                        }
+                }
+            free(verts);
+        }
+    }
+
     VkImageViewCreateInfo viewInfo = DEFAULT_VkImageViewCreateInfo;
     viewInfo.components            = {.a = VK_COMPONENT_SWIZZLE_ONE};
     NVVK_CHECK(m_alloc.createImage(m_viewportImage, imageInfo, viewInfo));
@@ -136,7 +168,7 @@ public:
   void onUIRender() override
   {
     ImGui::Begin("Settings");
-    ImGui::Text("NURBS Bezier patch — 3x3 CPs");
+    ImGui::Text("NURBS heatmap + wireframe");
     ImGui::TextDisabled("%d FPS / %.3fms", static_cast<int>(ImGui::GetIO().Framerate), 1000.F / ImGui::GetIO().Framerate);
 
     // Add window information
