@@ -1,7 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "nurbs_tex.h"
+#include "nurbs.h"
 #include "knot_insert.h"
 #include "bezier_eval.h"
 
@@ -52,7 +52,7 @@ static void free_surf(NurbsSurf* s) {
     free(s);
 }
 
-int launch_nurbs_texture(float* cpu_data, int W, int H, const char* surf_path)
+int nurbs_to_texture(float* cpu_data, int W, int H, const char* surf_path)
 {
     // 1. Load .surf
     NurbsSurf* s = read_surf(surf_path);

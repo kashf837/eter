@@ -26,7 +26,7 @@
 #include <vector>
 #include <backends/imgui_impl_vulkan.h>
 
-#include "nurbs_tex.h"  // NURBS surface → texture
+#include "nurbs.h"  // NURBS pipeline: load → KI → GPU eval → texture
 #include <nvapp/application.hpp>
 #include <nvapp/elem_profiler.hpp>
 #include <nvapp/elem_logger.hpp>
@@ -92,7 +92,7 @@ public:
     // Full NURBS pipeline: load .surf → KI → Bezier eval → heatmap
     int W = 256, H = 256;
     std::vector<float> imageData(W * H * 4);
-    int ok = launch_nurbs_texture(imageData.data(), W, H, "data/test.surf");
+    int ok = nurbs_to_texture(imageData.data(), W, H, "data/test.surf");
     if (ok != 0) { LOGE("NURBS pipeline failed\n"); return; }
 
     VkImageViewCreateInfo viewInfo = DEFAULT_VkImageViewCreateInfo;
