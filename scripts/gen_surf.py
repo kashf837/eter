@@ -72,6 +72,40 @@ def gen_dome(p_u=2, p_v=2, n_u=3, n_v=3):
         grid.append(row)
     return grid, None
 
+def gen_ripple(p_u=2, p_v=2, n_u=5, n_v=5):
+    """Concentric water ripples, decaying with distance from center."""
+    import math
+    grid = []
+    for i in range(n_u + 1):
+        row = []
+        for j in range(n_v + 1):
+            x = float(i) / n_u
+            y = float(j) / n_v
+            r = math.sqrt((x - 0.5)**2 + (y - 0.5)**2)
+            z = 0.25 * math.sin(r * 15.0) * math.exp(-r * 2.5)
+            row.append((x, y, z))
+        grid.append(row)
+    return grid, None
+
+def gen_bumps(p_u=2, p_v=2, n_u=5, n_v=5):
+    """Three overlapping Gaussian bumps at random-ish positions."""
+    import math
+    bumps = [(0.3, 0.3, 0.08), (0.7, 0.6, 0.06), (0.5, 0.2, 0.07)]
+    grid = []
+    for i in range(n_u + 1):
+        row = []
+        for j in range(n_v + 1):
+            x = float(i) / n_u
+            y = float(j) / n_v
+            z = 0.0
+            for bx, by, bw in bumps:
+                r2 = ((x - bx)**2 + (y - by)**2) / (bw * bw)
+                z += math.exp(-r2)
+            z = (z - 0.3) * 1.2  # normalize
+            row.append((x, y, z))
+        grid.append(row)
+    return grid, None
+
 def gen_saddle(p_u=2, p_v=2, n_u=3, n_v=3):
     """A saddle surface z = (x-0.5)*(y-0.5)."""
     grid = []
@@ -136,6 +170,8 @@ SHAPES = {
     'flat':     gen_flat,
     'bulge':    gen_bulge,
     'dome':     gen_dome,
+    'ripple':   gen_ripple,
+    'bumps':    gen_bumps,
     'saddle':   gen_saddle,
     'wave':     gen_wave,
     'sphere':   gen_sphere,
