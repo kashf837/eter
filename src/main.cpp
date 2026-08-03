@@ -14,7 +14,6 @@
 #include <nvapp/elem_profiler.hpp>
 #include <nvapp/elem_logger.hpp>
 #include <nvapp/elem_default_menu.hpp>
-#include <nvapp/elem_default_title.hpp>
 #include <nvapp/elem_camera.hpp>
 #include <nvutils/logger.hpp>
 #include <nvvk/check_error.hpp>
@@ -45,7 +44,7 @@ static std::vector<char> readFile(const std::string& fn) {
 struct MVP { glm::mat4 model, view, proj; };
 
 // ============================================================
-// Main rendering element — implements IAppElement
+// NURBSRenderer — implements IAppElement, renders NURBS surface as 3D mesh
 // ============================================================
 // The nvpro_core2 framework uses a "plugin" architecture:
 //   Application owns the window + main loop.
@@ -55,11 +54,11 @@ struct MVP { glm::mat4 model, view, proj; };
 //     onDetach()  — once at shutdown: destroy GPU resources
 //     onUIRender()— every frame: draw ImGui panels
 
-class SampleElement : public nvapp::IAppElement
+class NURBSRenderer : public nvapp::IAppElement
 {
 public:
   struct Info { nvutils::ProfilerManager* profilerManager{}; nvutils::ParameterRegistry* parameterRegistry{}; };
-  SampleElement(const Info& info) : m_info(info) {
+  NURBSRenderer(const Info& info) : m_info(info) {
     // Register command-line parameter: --surf <path> or -s <path>
     m_info.parameterRegistry->add({"surf"}, &m_surfPath);
   }
@@ -570,8 +569,8 @@ int main(int argc, char** argv)
   nvutils::ParameterParser   parameterParser;
 
   // Create our rendering element
-  SampleElement::Info info = {&profilerManager, &parameterRegistry};
-  auto sampleElement = std::make_shared<SampleElement>(info);
+  NURBSRenderer::Info info = {&profilerManager, &parameterRegistry};
+  auto nurbsRenderer = std::make_shared<NURBSRenderer>(info);
 
   // Logger element (shown by default in bottom panel)
   auto elementLogger = std::make_shared<nvapp::ElementLogger>(true);
@@ -616,15 +615,14 @@ int main(int argc, char** argv)
   nvapp::Application app;
   app.init(appInfo);
 
-  // Camera: must be added BEFORE sampleElement so its matrices update before onRender
-  app.addElement(std::make_shared<nvapp::ElementCamera>(sampleElement->getCamera()));
+  // Camera: must be added BEFORE nurbsRenderer so its matrices update before onRender
+  app.addElement(std::make_shared<nvapp::ElementCamera>(nurbsRenderer->getCamera()));
 
   // Initialize camera position
-  sampleElement->getCamera()->setWindowSize({256, 256});
-  sampleElement->getCamera()->setLookat({0.5f, 0.3f, 1.8f}, {0.5f, 0.5f, 0.16f}, {0, 1, 0});
+  nurbsRenderer->getCamera()->setWindowSize({256, 256});
+  nurbsRenderer->getCamera()->setLookat({0.5f, 0.3f, 1.8f}, {0.5f, 0.5f, 0.16f}, {0, 1, 0});
 
-  app.addElement(sampleElement);
-  app.addElement(std::make_shared<nvapp::ElementDefaultWindowTitle>());
+  app.addElement(nurbsRenderer);
   app.addElement(std::make_shared<nvapp::ElementProfiler>(&profilerManager));
   app.addElement(elementLogger);
 
