@@ -1,28 +1,33 @@
 cmake_minimum_required(VERSION 3.22)
-project(eter LANGUAGES CXX CUDA)
+project(eter LANGUAGES C CXX CUDA)
 
-# C++20，跟 nvpro_core2 保持一致
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CUDA_STANDARD 20)
+set(CMAKE_CUDA_ARCHITECTURES 89)
+add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>)
 
-# ============================================================
-# 主程序：nurbs_eval
-# ============================================================
-add_executable(nurbs_eval
-  code/nurbs_eval.cu
-  code/knot_insert.cu
-  code/bezier_eval.cu
-  code/adaptive_tess.cu
-  code/render.cu
+# ---- nvpro_core2 ----
+option(NVPRO2_ENABLE_nvgl "" OFF)
+option(NVPRO2_ENABLE_nvgpu_monitor "" OFF)
+option(NVPRO2_ENABLE_nvslang "" OFF)
+option(NVPRO2_ENABLE_nvvkglsl "" OFF)
+option(NVPRO2_ENABLE_nvvkgltf "" OFF)
+option(NVPRO2_ENABLE_nvshaders_host "" OFF)
+
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
+find_package(NvproCore2 REQUIRED)
+
+# ---- Source files ----
+add_executable(eter
+  src/main.cpp
+  src/nurbs_tex.cu
+  src/knot_insert.cu
+  src/bezier_eval.cu
+  src/adaptive_tess.cu
+  src/render.cu
 )
 
-# ============================================================
-# 编译选项
-# ============================================================
-# 压制编码警告（你之前 build.ps1 里也有这个）
-target_compile_options(nurbs_eval PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/wd4819>)
-
-# 输出到 build/ 根目录
-set_target_properties(nurbs_eval PROPERTIES
-  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
-)
+# ---- Link ----
+target_link_libraries(eter PRIVATE nvpro2::nvapp)
+add_project_definitions(eter)
+copy_to_runtime_and_install(eter AUTO)

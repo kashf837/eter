@@ -89,21 +89,11 @@ public:
     imageInfo.format            = VK_FORMAT_R32G32B32A32_SFLOAT;
     imageInfo.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
 
-    // 3x3 (p=2) Bezier patch — pillow shape: corners z=0, center z=1
-    TestPatch patch;
-    patch.p_u = 2; patch.p_v = 2;
-    // CPs: 3x3 grid, row-major, each = {x, y, z, w=1}
-    float cps[] = {
-        0.0f,0.0f,0.0f,1.0f,  0.5f,0.0f,0.0f,1.0f,  1.0f,0.0f,0.0f,1.0f,
-        0.0f,0.5f,0.0f,1.0f,  0.5f,0.5f,1.0f,1.0f,  1.0f,0.5f,0.0f,1.0f,
-        0.0f,1.0f,0.0f,1.0f,  0.5f,1.0f,0.0f,1.0f,  1.0f,1.0f,0.0f,1.0f,
-    };
-    memcpy(patch.CP, cps, sizeof(cps));
-
-    // CUDA evaluates Bezier surface at 256x256 points, maps xyz→RGBA
+    // Full NURBS pipeline: load .surf → KI → Bezier eval → heatmap
     int W = 256, H = 256;
     std::vector<float> imageData(W * H * 4);
-    launch_nurbs_texture(imageData.data(), W, H, &patch);
+    int ok = launch_nurbs_texture(imageData.data(), W, H, "../data/test.surf");
+    if (ok != 0) { LOGE("NURBS pipeline failed\n"); return; }
 
     VkImageViewCreateInfo viewInfo = DEFAULT_VkImageViewCreateInfo;
     viewInfo.components            = {.a = VK_COMPONENT_SWIZZLE_ONE};
