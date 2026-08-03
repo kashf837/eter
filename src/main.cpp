@@ -101,7 +101,6 @@ public:
     m_profilerGpuTimer.init(m_profilerTimeline, dev,
         app->getPhysicalDevice(), app->getQueue(0).familyIndex, true);
 
-    LOGI("Initialization complete\n");
   }
 
   // ============================================================
@@ -355,7 +354,6 @@ private:
     // Load compiled SPIR-V binaries
     auto vCode = readFile("shaders/spv/mesh.vert.spv");
     auto fCode = readFile("shaders/spv/mesh.frag.spv");
-    LOGI("Shader sizes: vert=%zu frag=%zu\n", vCode.size(), fCode.size());
     if (vCode.empty() || fCode.empty()) { LOGE("Shader load failed\n"); return; }
 
     // Create temporary shader modules (destroyed after pipeline creation)
