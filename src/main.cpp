@@ -21,14 +21,18 @@
 #define VMA_IMPLEMENTATION
 
 #include <vector>
+#include <fstream>
+#include <glm/glm.hpp>
+#include <glm/gtc/matrix_transform.hpp>
 #include <backends/imgui_impl_vulkan.h>
 
-#include "nurbs.h"  // NURBS pipeline: load → KI → GPU eval → texture
+#include "nurbs.h"
 #include <nvapp/application.hpp>
 #include <nvapp/elem_profiler.hpp>
 #include <nvapp/elem_logger.hpp>
 #include <nvapp/elem_default_menu.hpp>
 #include <nvapp/elem_default_title.hpp>
+#include <nvapp/elem_camera.hpp>
 #include <nvutils/logger.hpp>
 #include <nvvk/check_error.hpp>
 #include <nvvk/context.hpp>
@@ -40,123 +44,245 @@
 #include <nvvk/profiler_vk.hpp>
 #include <nvutils/parameter_parser.hpp>
 
+static std::vector<char> readFile(const std::string& fn) {
+    std::ifstream f(fn, std::ios::ate | std::ios::binary);
+    if (!f) return {};
+    size_t sz = f.tellg(); std::vector<char> buf(sz);
+    f.seekg(0); f.read(buf.data(), sz);
+    return buf;
+}
+
+struct MVP { glm::mat4 model, view, proj; };
+
 class SampleElement : public nvapp::IAppElement
 {
 public:
-  struct Info
-  {
-    nvutils::ProfilerManager*   profilerManager{};
-    nvutils::ParameterRegistry* parameterRegistry{};
-  };
+  struct Info { nvutils::ProfilerManager* profilerManager{}; nvutils::ParameterRegistry* parameterRegistry{}; };
+  SampleElement(const Info& info) : m_info(info) { }
+  auto getCamera() { return m_camera; }
 
-
-  SampleElement(const Info& info)
-      : m_info(info)
-  { }
-
-  ~SampleElement() override = default;
+  std::shared_ptr<nvutils::CameraManipulator> m_camera = std::make_shared<nvutils::CameraManipulator>();
 
   void onAttach(nvapp::Application* app) override
   {
-    m_app                                = app;
-    VmaAllocatorCreateInfo allocatorInfo = {
-        .flags          = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT,
-        .physicalDevice = app->getPhysicalDevice(),
-        .device         = app->getDevice(),
-        .instance       = app->getInstance(),
-    };
+    m_app = app;
+    m_camera->setWindowSize({m_imgW, m_imgH});
+    m_camera->setLookat({0.5f, 0.3f, 1.8f}, {0.5f, 0.5f, 0.16f}, {0, 1, 0});
 
-    // Initialize core components
-    NVVK_CHECK(m_alloc.init(allocatorInfo));
+    VmaAllocatorCreateInfo ai = {};
+    ai.flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT;
+    ai.physicalDevice = app->getPhysicalDevice();
+    ai.device = app->getDevice();
+    ai.instance = app->getInstance();
+    NVVK_CHECK(m_alloc.init(ai));
     m_samplerPool.init(app->getDevice());
     m_stagingUploader.init(&m_alloc, true);
+    VkDevice dev = app->getDevice();
 
-#if 0
-    // VMA might report memory leaks for example:
-    // "UNFREED ALLOCATION; Offset: 1158736; Size: 16; UserData: 0000000000000000; Name: allocID: 45; Type: BUFFER; Usage: 131107"
-    // Then look for the leak name: "allocID: 45" and feed that ID to the following function.
-    m_alloc.setLeakID(45);
-    // You should get a breakpoint at the creation of the resource that was leaked.
-#endif
-
-    // Create a 256x256 texture with gradient pattern
-    VkCommandBuffer   cmd       = m_app->createTempCmdBuffer();
-    VkImageCreateInfo imageInfo = DEFAULT_VkImageCreateInfo;
-    imageInfo.extent            = {256, 256, 1};
-    imageInfo.format            = VK_FORMAT_R32G32B32A32_SFLOAT;
-    imageInfo.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-
-    // Full NURBS pipeline: load .surf → KI → Bezier eval → heatmap
-    int W = 256, H = 256;
-    std::vector<float> imageData(W * H * 4);
-    int ok = nurbs_to_texture(imageData.data(), W, H, "data/test.surf");
-    if (ok != 0) { LOGE("NURBS pipeline failed\n"); return; }
-
-    // Wireframe overlay: get coarse vertex grid, draw lines on image
+    LOGI("onAttach start\n");
+    // ---- 1. Viewport image (for ImGui display) ----
     {
-        int np_u, np_v, res = 8;  // 8×8 vertices per patch
-        float* verts = nurbs_wireframe("data/test.surf", res, &np_u, &np_v);
-        if (verts) {
-            auto px = [&](float x){ return (int)(x * (W - 1) + 0.5f); };
-            auto py = [&](float y){ return (int)(y * (H - 1) + 0.5f); };
-            auto draw_line = [&](int x1,int y1,int x2,int y2){
-                int dx=abs(x2-x1),dy=-abs(y2-y1),sx=x1<x2?1:-1,sy=y1<y2?1:-1,e=dx+dy;
-                while(1){
-                    if(x1>=0&&x1<W&&y1>=0&&y1<H){ int i=(y1*W+x1)*4; imageData[i]=1;imageData[i+1]=1;imageData[i+2]=1;imageData[i+3]=1; }
-                    if(x1==x2&&y1==y2)break; int e2=2*e;
-                    if(e2>=dy){e+=dy;x1+=sx;} if(e2<=dx){e+=dx;y1+=sy;}
-                }
-            };
-            for (int pi = 0; pi < np_u; pi++)
-                for (int pj = 0; pj < np_v; pj++) {
-                    float* v = verts + (pi * np_v + pj) * res * res * 2;
-                    for (int y = 0; y < res; y++)
-                        for (int x = 0; x < res; x++) {
-                            int xi = px(v[(y * res + x) * 2 + 0]);
-                            int yi = py(v[(y * res + x) * 2 + 1]);
-                            if (x + 1 < res) { int nx=px(v[(y*res+x+1)*2+0]),ny=py(v[(y*res+x+1)*2+1]); draw_line(xi,yi,nx,ny); }
-                            if (y + 1 < res) { int nx=px(v[((y+1)*res+x)*2+0]),ny=py(v[((y+1)*res+x)*2+1]); draw_line(xi,yi,nx,ny); }
-                            // Diagonal: split each quad into 2 triangles
-                            if (x + 1 < res && y + 1 < res) {
-                                int nx=px(v[((y+1)*res+x+1)*2+0]),ny=py(v[((y+1)*res+x+1)*2+1]);
-                                draw_line(xi,yi,nx,ny);
-                            }
-                        }
-                }
-            free(verts);
-        }
+        VkImageCreateInfo ii = DEFAULT_VkImageCreateInfo;
+        ii.extent = {256,256,1}; ii.format = VK_FORMAT_R32G32B32A32_SFLOAT;
+        ii.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        VkImageViewCreateInfo vi = DEFAULT_VkImageViewCreateInfo;
+        vi.components = {.a = VK_COMPONENT_SWIZZLE_ONE};
+        NVVK_CHECK(m_alloc.createImage(m_viewportImage, ii, vi));
+        NVVK_CHECK(m_samplerPool.acquireSampler(m_viewportImage.descriptor.sampler));
     }
 
-    VkImageViewCreateInfo viewInfo = DEFAULT_VkImageViewCreateInfo;
-    viewInfo.components            = {.a = VK_COMPONENT_SWIZZLE_ONE};
-    NVVK_CHECK(m_alloc.createImage(m_viewportImage, imageInfo, viewInfo));
-    NVVK_CHECK(m_samplerPool.acquireSampler(m_viewportImage.descriptor.sampler));
+    // ---- 2. Render target (R8G8B8A8, supports color attachment) ----
+    {
+        VkImageCreateInfo ii = DEFAULT_VkImageCreateInfo;
+        ii.extent = {256,256,1}; ii.format = VK_FORMAT_R8G8B8A8_UNORM;
+        ii.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        VkImageViewCreateInfo vi = DEFAULT_VkImageViewCreateInfo;
+        NVVK_CHECK(m_alloc.createImage(m_renderTarget, ii, vi));
+    }
 
-    NVVK_DBG_NAME(m_viewportImage.image);
-    NVVK_DBG_NAME(m_viewportImage.descriptor.imageView);
-    NVVK_DBG_NAME(m_viewportImage.descriptor.sampler);
+    // ---- 2b. Depth image ----
+    {
+        VkImageCreateInfo ii = DEFAULT_VkImageCreateInfo;
+        ii.extent = {256,256,1}; ii.format = VK_FORMAT_D32_SFLOAT;
+        ii.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+        VkImageViewCreateInfo vi = DEFAULT_VkImageViewCreateInfo;
+        vi.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+        NVVK_CHECK(m_alloc.createImage(m_depthImage, ii, vi));
+    }
 
-    // upload image data to GPU
-    NVVK_CHECK(m_stagingUploader.appendImage(m_viewportImage, std::span<float>(imageData.data(), imageData.size()),
-                                             VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL));
-    m_stagingUploader.cmdUploadAppended(cmd);
-    m_app->submitAndWaitTempCmdBuffer(cmd);
-    m_stagingUploader.releaseStaging();
+    // ---- 3. Shaders & pipeline ----
+    auto vCode = readFile("shaders/spv/mesh.vert.spv");
+    auto fCode = readFile("shaders/spv/mesh.frag.spv");
+    LOGI("Shader sizes: vert=%zu frag=%zu\n", vCode.size(), fCode.size());
+    if (vCode.empty()||fCode.empty()) { LOGE("Shader load failed\n"); return; }
 
-    // Add image to ImGui, for display
-    m_imguiImage = ImGui_ImplVulkan_AddTexture(m_viewportImage.descriptor.sampler, m_viewportImage.descriptor.imageView,
-                                               VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    VkShaderModuleCreateInfo sm = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    sm.codeSize=vCode.size(); sm.pCode=(const uint32_t*)vCode.data();
+    VkShaderModule vs; vkCreateShaderModule(dev,&sm,nullptr,&vs);
+    sm.codeSize=fCode.size(); sm.pCode=(const uint32_t*)fCode.data();
+    VkShaderModule fs; vkCreateShaderModule(dev,&sm,nullptr,&fs);
 
-    // Init profiler with a single queue
+    // Descriptor set layout (UBO at set=0 binding=0)
+    VkDescriptorSetLayoutBinding dslb = {0,VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,1,VK_SHADER_STAGE_VERTEX_BIT};
+    VkDescriptorSetLayoutCreateInfo dslCI = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    dslCI.bindingCount=1; dslCI.pBindings=&dslb;
+    NVVK_CHECK(vkCreateDescriptorSetLayout(dev,&dslCI,nullptr,&m_dsLayout));
+
+    // Pipeline layout
+    VkPipelineLayoutCreateInfo plCI = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    plCI.setLayoutCount=1; plCI.pSetLayouts=&m_dsLayout;
+    NVVK_CHECK(vkCreatePipelineLayout(dev,&plCI,nullptr,&m_pipelineLayout));
+
+    // Vertex input
+    VkVertexInputBindingDescription vib = {0,3*sizeof(float),VK_VERTEX_INPUT_RATE_VERTEX};
+    VkVertexInputAttributeDescription via = {0,0,VK_FORMAT_R32G32B32_SFLOAT,0};
+    VkPipelineVertexInputStateCreateInfo vi = {VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    vi.vertexBindingDescriptionCount=1; vi.pVertexBindingDescriptions=&vib;
+    vi.vertexAttributeDescriptionCount=1; vi.pVertexAttributeDescriptions=&via;
+
+    VkPipelineInputAssemblyStateCreateInfo ia = {VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+    ia.topology=VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    VkPipelineViewportStateCreateInfo vp = {VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO}; vp.viewportCount=1; vp.scissorCount=1;
+    VkPipelineRasterizationStateCreateInfo rs = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO}; rs.lineWidth=1.f;
+    VkPipelineMultisampleStateCreateInfo ms = {VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO}; ms.rasterizationSamples=VK_SAMPLE_COUNT_1_BIT;
+    VkPipelineColorBlendAttachmentState cba = {}; cba.colorWriteMask=0xF;
+    VkPipelineColorBlendStateCreateInfo cb = {VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO}; cb.attachmentCount=1; cb.pAttachments=&cba;
+    VkPipelineDepthStencilStateCreateInfo dss = {VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+    dss.depthTestEnable=VK_TRUE; dss.depthWriteEnable=VK_TRUE;
+    dss.depthCompareOp=VK_COMPARE_OP_LESS_OR_EQUAL;
+    VkDynamicState dyn[]={VK_DYNAMIC_STATE_VIEWPORT,VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo ds = {VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO}; ds.dynamicStateCount=2; ds.pDynamicStates=dyn;
+    VkPipelineShaderStageCreateInfo ss[]={
+        {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,0,0,VK_SHADER_STAGE_VERTEX_BIT,vs,"main"},
+        {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,0,0,VK_SHADER_STAGE_FRAGMENT_BIT,fs,"main"},
+    };
+    VkFormat cf = VK_FORMAT_R8G8B8A8_UNORM;
+    VkFormat df = VK_FORMAT_D32_SFLOAT;
+    VkPipelineRenderingCreateInfo pr = {VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+    pr.colorAttachmentCount=1; pr.pColorAttachmentFormats=&cf;
+    pr.depthAttachmentFormat=df;
+    VkGraphicsPipelineCreateInfo pi = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO}; pi.pNext=&pr;
+    pi.stageCount=2; pi.pStages=ss; pi.pVertexInputState=&vi; pi.pInputAssemblyState=&ia;
+    pi.pViewportState=&vp; pi.pRasterizationState=&rs; pi.pMultisampleState=&ms;
+    pi.pColorBlendState=&cb; pi.pDepthStencilState=&dss;
+    pi.pDynamicState=&ds; pi.layout=m_pipelineLayout;
+    NVVK_CHECK(vkCreateGraphicsPipelines(dev,VK_NULL_HANDLE,1,&pi,nullptr,&m_pipeline));
+    LOGI("Pipeline created\n");
+    vkDestroyShaderModule(dev,vs,nullptr); vkDestroyShaderModule(dev,fs,nullptr);
+
+    // ---- 4. Descriptor pool & set ----
+    LOGI("Creating descriptor pool...\n");
+    VkDescriptorPoolSize dps = {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,1};
+    VkDescriptorPoolCreateInfo dpCI = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO}; dpCI.maxSets=1; dpCI.poolSizeCount=1; dpCI.pPoolSizes=&dps;
+    NVVK_CHECK(vkCreateDescriptorPool(dev,&dpCI,nullptr,&m_dsPool));
+    VkDescriptorSetAllocateInfo dsa = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO}; dsa.descriptorPool=m_dsPool; dsa.descriptorSetCount=1; dsa.pSetLayouts=&m_dsLayout;
+    NVVK_CHECK(vkAllocateDescriptorSets(dev,&dsa,&m_ds));
+    LOGI("Descriptor done\n");
+
+    // ---- 5. Uniform buffer (MVP) — host-visible for per-frame camera updates ----
+    {
+        VkBufferCreateInfo bci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        bci.size = sizeof(MVP); bci.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
+        VmaAllocationCreateInfo aci = {};
+        aci.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+        aci.usage = VMA_MEMORY_USAGE_AUTO;
+        VmaAllocationInfo ai;
+        vmaCreateBuffer((VmaAllocator)m_alloc, &bci, &aci, &m_ubo.buffer, &m_ubo.allocation, &ai);
+        m_ubo.mapping = (uint8_t*)ai.pMappedData;
+        m_ubo.bufferSize = sizeof(MVP);
+        // Init with identity
+        MVP mvp;
+        mvp.model = glm::mat4(1.f);
+        mvp.view  = glm::lookAt(glm::vec3(1.2f,1.5f,2.f), glm::vec3(0.5f,0.5f,0.16f), glm::vec3(0,1,0));
+        mvp.proj  = glm::perspective(glm::radians(60.f), 1.f, 0.1f, 10.f);
+        mvp.proj[1][1] *= -1.f;
+        memcpy(m_ubo.mapping, &mvp, sizeof(MVP));
+    }
+    VkDescriptorBufferInfo dbi = {m_ubo.buffer,0,sizeof(MVP)};
+    VkWriteDescriptorSet wds = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}; wds.dstSet=m_ds; wds.dstBinding=0; wds.descriptorCount=1; wds.descriptorType=VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER; wds.pBufferInfo=&dbi;
+    vkUpdateDescriptorSets(dev,1,&wds,0,nullptr);
+    LOGI("UBO done\n");
+
+    // ---- 6. NURBS vertex & index buffers ----
+    {
+        int np_u, np_v, res = 12;
+        float* verts = nurbs_wireframe("data/wave.surf", res, &np_u, &np_v);
+        if (!verts) { LOGE("Wireframe failed\n"); return; }
+        int totalVerts = np_u * np_v * res * res;
+        VkDeviceSize vbSize = totalVerts * 3 * sizeof(float);
+
+        // Vertex buffer via staging uploader
+        m_alloc.createBuffer(m_vertexBuffer, vbSize, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT|VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_GPU_ONLY);
+        { void* ptr; NVVK_CHECK(m_stagingUploader.appendBufferMapping(m_vertexBuffer, 0, vbSize, ptr));
+          float* dst = (float*)ptr;
+          for (int pi=0; pi<np_u; pi++) for (int pj=0; pj<np_v; pj++) {
+              float* v = verts + (pi*np_v+pj)*res*res*3;
+              for (int y=0; y<res; y++) for (int x=0; x<res; x++) {
+                  *dst++ = v[(y*res+x)*3+0];
+                  *dst++ = v[(y*res+x)*3+1];
+                  *dst++ = v[(y*res+x)*3+2];
+              }
+          }
+        }
+
+        // Index buffer via staging uploader
+        int quadsPerPatch = (res-1)*(res-1);
+        m_indexCount = np_u * np_v * quadsPerPatch * 6;
+        VkDeviceSize ibSize = m_indexCount * sizeof(uint32_t);
+        m_alloc.createBuffer(m_indexBuffer, ibSize, VK_BUFFER_USAGE_INDEX_BUFFER_BIT|VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_GPU_ONLY);
+        { void* ptr; NVVK_CHECK(m_stagingUploader.appendBufferMapping(m_indexBuffer, 0, ibSize, ptr));
+          uint32_t* idx = (uint32_t*)ptr;
+          for (int pi=0; pi<np_u; pi++) for (int pj=0; pj<np_v; pj++) {
+              uint32_t base = (pi*np_v + pj) * res * res;
+              for (int y=0; y<res-1; y++) for (int x=0; x<res-1; x++) {
+                  uint32_t a=base+y*res+x, b=a+1, c=a+res, d=c+1;
+                  *idx++=a;*idx++=b;*idx++=c;
+                  *idx++=b;*idx++=d;*idx++=c;
+              }
+          }
+        }
+        free(verts);
+
+        // Submit all staging uploads together
+        VkCommandBuffer c = m_app->createTempCmdBuffer();
+        m_stagingUploader.cmdUploadAppended(c);
+        m_app->submitAndWaitTempCmdBuffer(c);
+        m_stagingUploader.releaseStaging();
+        LOGI("Verts=%d Indices=%d\n", totalVerts, m_indexCount);
+    }
+    LOGI("Buffers created\n");
+
+    // Transition viewport image UNDEFINED → SHADER_READ_ONLY for ImGui
+    {
+        VkCommandBuffer c = m_app->createTempCmdBuffer();
+        nvvk::cmdImageMemoryBarrier(c, {m_viewportImage.image,
+            VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL});
+        m_app->submitAndWaitTempCmdBuffer(c);
+    }
+
+    // ---- 7. ImGui display texture ----
+    m_imguiImage = ImGui_ImplVulkan_AddTexture(m_viewportImage.descriptor.sampler,
+        m_viewportImage.descriptor.imageView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+
     m_profilerTimeline = m_info.profilerManager->createTimeline({"graphics"});
-    m_profilerGpuTimer.init(m_profilerTimeline, app->getDevice(), app->getPhysicalDevice(), app->getQueue(0).familyIndex, true);
+    m_profilerGpuTimer.init(m_profilerTimeline, dev, app->getPhysicalDevice(), app->getQueue(0).familyIndex, true);
+    LOGI("Pipeline ready, onAttach done\n");
   }
 
   void onDetach() override
   {
     NVVK_CHECK(vkDeviceWaitIdle(m_app->getDevice()));
-
+    VkDevice dev = m_app->getDevice();
     ImGui_ImplVulkan_RemoveTexture(m_imguiImage);
+    vkDestroyPipeline(dev, m_pipeline, nullptr);
+    vkDestroyPipelineLayout(dev, m_pipelineLayout, nullptr);
+    vkDestroyDescriptorSetLayout(dev, m_dsLayout, nullptr);
+    vkDestroyDescriptorPool(dev, m_dsPool, nullptr);
+    m_alloc.destroyBuffer(m_ubo);
+    m_alloc.destroyBuffer(m_indexBuffer);
+    m_alloc.destroyBuffer(m_vertexBuffer);
+    m_alloc.destroyImage(m_renderTarget);
+    m_alloc.destroyImage(m_depthImage);
     m_alloc.destroyImage(m_viewportImage);
     m_stagingUploader.deinit();
     m_samplerPool.deinit();
@@ -168,7 +294,7 @@ public:
   void onUIRender() override
   {
     ImGui::Begin("Settings");
-    ImGui::Text("NURBS heatmap + wireframe");
+    ImGui::Text("3D Mesh — %d triangles", m_indexCount/3);
     ImGui::TextDisabled("%d FPS / %.3fms", static_cast<int>(ImGui::GetIO().Framerate), 1000.F / ImGui::GetIO().Framerate);
 
     // Add window information
@@ -187,7 +313,76 @@ public:
 
   void onRender(VkCommandBuffer cmd)
   {
-    // NURBS texture is static for now — generated once in onAttach
+    // Update camera matrices in UBO
+    MVP mvp;
+    mvp.model = glm::mat4(1.f);
+    mvp.view  = m_camera->getViewMatrix();
+    mvp.proj  = m_camera->getPerspectiveMatrix();
+    memcpy(m_ubo.mapping, &mvp, sizeof(MVP));
+
+    // 1. Transition render target to COLOR_ATTACHMENT
+    VkImageLayout rtOld = m_firstFrame ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    m_firstFrame = false;
+    if (rtOld == VK_IMAGE_LAYOUT_UNDEFINED) {
+        nvvk::cmdImageMemoryBarrier(cmd, {m_renderTarget.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL});
+        // Depth barrier with explicit aspect
+        VkImageMemoryBarrier2 db = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+        db.srcStageMask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
+        db.dstStageMask = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT;
+        db.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED; db.newLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+        db.image = m_depthImage.image;
+        db.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
+        VkDependencyInfo di = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+        di.imageMemoryBarrierCount = 1; di.pImageMemoryBarriers = &db;
+        vkCmdPipelineBarrier2(cmd, &di);
+    }
+
+    // 2. Dynamic rendering on render target + depth
+    VkRenderingAttachmentInfo da = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    da.imageView=m_depthImage.descriptor.imageView;
+    da.imageLayout=VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+    da.loadOp=VK_ATTACHMENT_LOAD_OP_CLEAR; da.storeOp=VK_ATTACHMENT_STORE_OP_STORE;
+    da.clearValue.depthStencil = {1.f, 0};
+
+    VkRenderingAttachmentInfo ca = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    ca.imageView=m_renderTarget.descriptor.imageView;
+    ca.imageLayout=VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    ca.loadOp=VK_ATTACHMENT_LOAD_OP_CLEAR; ca.storeOp=VK_ATTACHMENT_STORE_OP_STORE;
+    ca.clearValue.color = {0.1f,0.1f,0.15f,1.f};
+
+    VkRenderingInfo ri = {VK_STRUCTURE_TYPE_RENDERING_INFO};
+    ri.renderArea={{0,0},{256,256}}; ri.layerCount=1;
+    ri.colorAttachmentCount=1; ri.pColorAttachments=&ca;
+    ri.pDepthAttachment=&da;
+    vkCmdBeginRendering(cmd, &ri);
+
+    VkViewport vp = {0,256,256,-256,0,1}; // Vulkan Y flip
+    VkRect2D sc = {{0,0},{256,256}};
+    vkCmdSetViewport(cmd,0,1,&vp); vkCmdSetScissor(cmd,0,1,&sc);
+    vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,m_pipeline);
+    vkCmdBindDescriptorSets(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,m_pipelineLayout,0,1,&m_ds,0,nullptr);
+    VkDeviceSize off=0;
+    vkCmdBindVertexBuffers(cmd,0,1,&m_vertexBuffer.buffer,&off);
+    vkCmdBindIndexBuffer(cmd,m_indexBuffer.buffer,0,VK_INDEX_TYPE_UINT32);
+    vkCmdDrawIndexed(cmd,m_indexCount,1,0,0,0);
+    vkCmdEndRendering(cmd);
+
+    // 3. Blit renderTarget → viewportImage
+    nvvk::cmdImageMemoryBarrier(cmd, {m_renderTarget.image,
+        VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL});
+    nvvk::cmdImageMemoryBarrier(cmd, {m_viewportImage.image,
+        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL});
+    VkImageBlit blit = {};
+    blit.srcSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1}; blit.srcOffsets[1]={256,256,1};
+    blit.dstSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1}; blit.dstOffsets[1]={256,256,1};
+    vkCmdBlitImage(cmd, m_renderTarget.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                   m_viewportImage.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_NEAREST);
+
+    // 4. Transition back for next frame
+    nvvk::cmdImageMemoryBarrier(cmd, {m_renderTarget.image,
+        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL});
+    nvvk::cmdImageMemoryBarrier(cmd, {m_viewportImage.image,
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL});
   }
 
   // Called if showMenu is true
@@ -225,18 +420,34 @@ public:
 
 private:
   Info m_info;
+  int  m_imgW = 256, m_imgH = 256;
 
   nvvk::ResourceAllocator m_alloc{};
   nvapp::Application*     m_app{};
   nvvk::SamplerPool       m_samplerPool{};
   nvvk::StagingUploader   m_stagingUploader{};
-
   nvutils::ProfilerTimeline* m_profilerTimeline{};
   nvvk::ProfilerGpuTimer     m_profilerGpuTimer;
 
-  nvvk::Image m_viewportImage{};
+  // Display
+  nvvk::Image       m_viewportImage{};
+  nvvk::Image       m_renderTarget{};
+  nvvk::Image       m_depthImage{};
+  VkDescriptorSet   m_imguiImage{};
+  bool m_firstFrame = true;
 
-  VkDescriptorSet m_imguiImage{};
+  // Geometry
+  nvvk::Buffer m_vertexBuffer{};
+  nvvk::Buffer m_indexBuffer{};
+  uint32_t     m_indexCount = 0;
+
+  // Pipeline
+  VkPipeline            m_pipeline       = VK_NULL_HANDLE;
+  VkPipelineLayout      m_pipelineLayout = VK_NULL_HANDLE;
+  VkDescriptorSetLayout m_dsLayout       = VK_NULL_HANDLE;
+  VkDescriptorPool      m_dsPool         = VK_NULL_HANDLE;
+  VkDescriptorSet       m_ds             = VK_NULL_HANDLE;
+  nvvk::Buffer          m_ubo{};  // MVP uniform buffer
 };
 
 
@@ -307,6 +518,10 @@ int main(int argc, char** argv)
   // Create the application
   nvapp::Application app;
   app.init(appInfo);
+
+  // Camera element (must be added BEFORE sampleElement for per-frame matrix update)
+  auto camElement = std::make_shared<nvapp::ElementCamera>(sampleElement->getCamera());
+  app.addElement(camElement);
 
   // add the sample main element
   app.addElement(sampleElement);

@@ -160,7 +160,7 @@ float* nurbs_wireframe(const char* surf_path, int res,
     int np_v = (s->n_v + 1) / rv;
     *np_u_out = np_u; *np_v_out = np_v;
 
-    float* verts = (float*)malloc(np_u * np_v * res * res * 2 * sizeof(float));
+    float* verts = (float*)malloc(np_u * np_v * res * res * 3 * sizeof(float));
     BezierPatch bp;
     bp.p_u = s->p_u; bp.p_v = s->p_v;
     bp.CP = (float*)malloc(ru * rv * 4 * sizeof(float));
@@ -175,11 +175,12 @@ float* nurbs_wireframe(const char* surf_path, int res,
             float* V = (float*)malloc(res * res * 3 * sizeof(float));
             eval_bezier_patch(&bp, V, res, res);
 
-            float* dst = verts + (pi * np_v + pj) * res * res * 2;
+            float* dst = verts + (pi * np_v + pj) * res * res * 3;
             for (int y = 0; y < res; y++)
                 for (int x = 0; x < res; x++) {
-                    dst[(y * res + x) * 2 + 0] = V[(x * res + y) * 3 + 0]; // x
-                    dst[(y * res + x) * 2 + 1] = V[(x * res + y) * 3 + 1]; // y
+                    dst[(y * res + x) * 3 + 0] = V[(x * res + y) * 3 + 0]; // x
+                    dst[(y * res + x) * 3 + 1] = V[(x * res + y) * 3 + 1]; // y
+                    dst[(y * res + x) * 3 + 2] = V[(x * res + y) * 3 + 2]; // z
                 }
             free(V);
         }

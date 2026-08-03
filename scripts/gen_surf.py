@@ -44,15 +44,29 @@ def gen_flat(p_u=2, p_v=2, n_u=3, n_v=3):
     return grid, None
 
 def gen_bulge(p_u=2, p_v=2, n_u=3, n_v=3):
-    """A bulging pillow surface."""
+    """A bulging pillow surface (diamond contour)."""
     grid = []
     for i in range(n_u + 1):
         row = []
         for j in range(n_v + 1):
             x = float(i) / n_u
             y = float(j) / n_v
-            # corners stay low, center rises
             z = 1.0 - 2.0 * abs(x - 0.5) - 2.0 * abs(y - 0.5)
+            z = max(0.0, z)
+            row.append((x, y, z))
+        grid.append(row)
+    return grid, None
+
+def gen_dome(p_u=2, p_v=2, n_u=3, n_v=3):
+    """A circular dome: z = 1 - 4*r^2, r = distance from center."""
+    grid = []
+    for i in range(n_u + 1):
+        row = []
+        for j in range(n_v + 1):
+            x = float(i) / n_u
+            y = float(j) / n_v
+            r2 = (x - 0.5)**2 + (y - 0.5)**2
+            z = 1.0 - 4.0 * r2
             z = max(0.0, z)
             row.append((x, y, z))
         grid.append(row)
@@ -121,6 +135,7 @@ def gen_cylinder(p_u=2, p_v=2, n_u=3, n_v=3):
 SHAPES = {
     'flat':     gen_flat,
     'bulge':    gen_bulge,
+    'dome':     gen_dome,
     'saddle':   gen_saddle,
     'wave':     gen_wave,
     'sphere':   gen_sphere,
@@ -129,7 +144,7 @@ SHAPES = {
 
 def main():
     parser = argparse.ArgumentParser(description='Generate NURBS .surf files')
-    parser.add_argument('--shape', choices=SHAPES.keys(), default='bulge',
+    parser.add_argument('--shape', choices=list(SHAPES.keys()), default='bulge',
                         help='Shape type')
     parser.add_argument('--out', default='data/gen.surf',
                         help='Output file path')
