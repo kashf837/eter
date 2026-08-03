@@ -4,11 +4,17 @@ project(${PROJECT_NAME} LANGUAGES C CXX CUDA)
 
 # 针对 RTX 4060 (Compute Capability 8.9)
 set(CMAKE_CUDA_ARCHITECTURES 89)
+# UTF-8 编码，消掉 C4819 warning
+add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>)
 
 # Prior adding the package one can disable certain libraries
 # e.g.
 option(NVPRO2_ENABLE_nvgl "" OFF)
 option(NVPRO2_ENABLE_nvgpu_monitor "" OFF)
+option(NVPRO2_ENABLE_nvslang "" OFF)     # we don't need Slang shader compiler
+option(NVPRO2_ENABLE_nvvkglsl "" OFF)    # or GLSL compiler
+option(NVPRO2_ENABLE_nvvkgltf "" OFF)    # or glTF loader
+option(NVPRO2_ENABLE_nvshaders_host "" OFF)
 
 # Call FindNvproCore2 to download nvpro_core2 or find it if it is already
 # downloaded, or is located as a subdirectory or up to two levels up.
@@ -21,7 +27,7 @@ find_package(NvproCore2 REQUIRED)
 
 set(SOURCE_FILES
   main.cpp
-  gradient.cu        # CUDA kernel + wrapper, compiled by nvcc
+  nurbs_tex.cu       # CUDA: Bezier eval + color map in one kernel
 )
 
 source_group("Source Files" FILES ${SOURCE_FILES})

@@ -26,7 +26,7 @@
 #include <vector>
 #include <backends/imgui_impl_vulkan.h>
 
-#include "gradient.h"  // launch_fill_gradient() — all CUDA hidden inside
+#include "nurbs_tex.h"  // NURBS surface → texture
 #include <nvapp/application.hpp>
 #include <nvapp/elem_profiler.hpp>
 #include <nvapp/elem_logger.hpp>
@@ -55,10 +55,7 @@ public:
 
   SampleElement(const Info& info)
       : m_info(info)
-  {
-    // let's add a command-line option to toggle animation
-    m_info.parameterRegistry->add({"animate"}, &m_animate);
-  }
+  { }
 
   ~SampleElement() override = default;
 
@@ -92,10 +89,21 @@ public:
     imageInfo.format            = VK_FORMAT_R32G32B32A32_SFLOAT;
     imageInfo.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
 
-    // CUDA GPU 并行填充 256x256 渐变图 —— 65536 个线程同时跑
+    // 3x3 (p=2) Bezier patch — pillow shape: corners z=0, center z=1
+    TestPatch patch;
+    patch.p_u = 2; patch.p_v = 2;
+    // CPs: 3x3 grid, row-major, each = {x, y, z, w=1}
+    float cps[] = {
+        0.0f,0.0f,0.0f,1.0f,  0.5f,0.0f,0.0f,1.0f,  1.0f,0.0f,0.0f,1.0f,
+        0.0f,0.5f,0.0f,1.0f,  0.5f,0.5f,1.0f,1.0f,  1.0f,0.5f,0.0f,1.0f,
+        0.0f,1.0f,0.0f,1.0f,  0.5f,1.0f,0.0f,1.0f,  1.0f,1.0f,0.0f,1.0f,
+    };
+    memcpy(patch.CP, cps, sizeof(cps));
+
+    // CUDA evaluates Bezier surface at 256x256 points, maps xyz→RGBA
     int W = 256, H = 256;
     std::vector<float> imageData(W * H * 4);
-    launch_fill_gradient(imageData.data(), W, H, 0.2f);  // one call, all CUDA hidden
+    launch_nurbs_texture(imageData.data(), W, H, &patch);
 
     VkImageViewCreateInfo viewInfo = DEFAULT_VkImageViewCreateInfo;
     viewInfo.components            = {.a = VK_COMPONENT_SWIZZLE_ONE};
@@ -138,8 +146,7 @@ public:
   void onUIRender() override
   {
     ImGui::Begin("Settings");
-    ImGui::Checkbox("Animated Viewport", &m_animate);
-    ImGui::SliderFloat("Blue", &m_blue, 0.0f, 1.0f);  // 拖这个滑块，蓝色分量 0=黑 1=蓝
+    ImGui::Text("NURBS Bezier patch — 3x3 CPs");
     ImGui::TextDisabled("%d FPS / %.3fms", static_cast<int>(ImGui::GetIO().Framerate), 1000.F / ImGui::GetIO().Framerate);
 
     // Add window information
@@ -158,19 +165,7 @@ public:
 
   void onRender(VkCommandBuffer cmd)
   {
-    // 每帧用滑块的 m_blue 值清屏 —— 拖滑块实时变色
-    VkClearColorValue clearColor{};
-    clearColor.float32[0] = 0.0f;
-    clearColor.float32[1] = m_blue;            // G = 滑块值（0=黑, 1=绿）
-    clearColor.float32[2] = 1.0f - m_blue;     // B = 反向（滑块→1 时蓝→0）
-    clearColor.float32[3] = 1.0f;
-
-    VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    nvvk::cmdImageMemoryBarrier(cmd, {m_viewportImage.image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                                      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL});
-    vkCmdClearColorImage(cmd, m_viewportImage.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clearColor, 1, &range);
-    nvvk::cmdImageMemoryBarrier(cmd, {m_viewportImage.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                                      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL});
+    // NURBS texture is static for now — generated once in onAttach
   }
 
   // Called if showMenu is true
@@ -208,8 +203,6 @@ public:
 
 private:
   Info m_info;
-  bool  m_animate = false;
-  float m_blue    = 0.2f;  // 蓝色分量，由 UI 滑块控制
 
   nvvk::ResourceAllocator m_alloc{};
   nvapp::Application*     m_app{};
