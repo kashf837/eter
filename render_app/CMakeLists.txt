@@ -1,6 +1,9 @@
 cmake_minimum_required(VERSION 3.22 FATAL_ERROR)
 get_filename_component(PROJECT_NAME ${CMAKE_CURRENT_SOURCE_DIR} NAME)
-project(${PROJECT_NAME} LANGUAGES C CXX)
+project(${PROJECT_NAME} LANGUAGES C CXX CUDA)
+
+# 针对 RTX 4060 (Compute Capability 8.9)
+set(CMAKE_CUDA_ARCHITECTURES 89)
 
 # Prior adding the package one can disable certain libraries
 # e.g.
@@ -18,6 +21,7 @@ find_package(NvproCore2 REQUIRED)
 
 set(SOURCE_FILES
   main.cpp
+  gradient.cu        # CUDA kernel + wrapper, compiled by nvcc
 )
 
 source_group("Source Files" FILES ${SOURCE_FILES})

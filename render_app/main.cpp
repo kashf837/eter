@@ -23,7 +23,10 @@
 
 #define VMA_IMPLEMENTATION
 
+#include <vector>
 #include <backends/imgui_impl_vulkan.h>
+
+#include "gradient.h"  // launch_fill_gradient() — all CUDA hidden inside
 #include <nvapp/application.hpp>
 #include <nvapp/elem_profiler.hpp>
 #include <nvapp/elem_logger.hpp>
@@ -82,16 +85,20 @@ public:
     // You should get a breakpoint at the creation of the resource that was leaked.
 #endif
 
-    // Create a 1x1 Vulkan texture
+    // Create a 256x256 texture with gradient pattern
     VkCommandBuffer   cmd       = m_app->createTempCmdBuffer();
     VkImageCreateInfo imageInfo = DEFAULT_VkImageCreateInfo;
-    imageInfo.extent            = {1, 1, 1};
+    imageInfo.extent            = {256, 256, 1};
     imageInfo.format            = VK_FORMAT_R32G32B32A32_SFLOAT;
-    imageInfo.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;  // Added transfer dst bit
-    std::array<float, 4> imageData = {0.46F, 0.72F, 0, 1};                           // NVIDIA Green
+    imageInfo.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+
+    // CUDA GPU 并行填充 256x256 渐变图 —— 65536 个线程同时跑
+    int W = 256, H = 256;
+    std::vector<float> imageData(W * H * 4);
+    launch_fill_gradient(imageData.data(), W, H, 0.2f);  // one call, all CUDA hidden
 
     VkImageViewCreateInfo viewInfo = DEFAULT_VkImageViewCreateInfo;
-    viewInfo.components            = {.a = VK_COMPONENT_SWIZZLE_ONE};  // Force alpha to 1.0
+    viewInfo.components            = {.a = VK_COMPONENT_SWIZZLE_ONE};
     NVVK_CHECK(m_alloc.createImage(m_viewportImage, imageInfo, viewInfo));
     NVVK_CHECK(m_samplerPool.acquireSampler(m_viewportImage.descriptor.sampler));
 
@@ -99,7 +106,7 @@ public:
     NVVK_DBG_NAME(m_viewportImage.descriptor.imageView);
     NVVK_DBG_NAME(m_viewportImage.descriptor.sampler);
 
-    // upload image
+    // upload image data to GPU
     NVVK_CHECK(m_stagingUploader.appendImage(m_viewportImage, std::span<float>(imageData.data(), imageData.size()),
                                              VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL));
     m_stagingUploader.cmdUploadAppended(cmd);
@@ -132,6 +139,7 @@ public:
   {
     ImGui::Begin("Settings");
     ImGui::Checkbox("Animated Viewport", &m_animate);
+    ImGui::SliderFloat("Blue", &m_blue, 0.0f, 1.0f);  // 拖这个滑块，蓝色分量 0=黑 1=蓝
     ImGui::TextDisabled("%d FPS / %.3fms", static_cast<int>(ImGui::GetIO().Framerate), 1000.F / ImGui::GetIO().Framerate);
 
     // Add window information
@@ -150,20 +158,19 @@ public:
 
   void onRender(VkCommandBuffer cmd)
   {
-    if(m_animate)
-    {
-      auto timerSection = m_profilerGpuTimer.cmdFrameSection(cmd, "Animation");
+    // 每帧用滑块的 m_blue 值清屏 —— 拖滑块实时变色
+    VkClearColorValue clearColor{};
+    clearColor.float32[0] = 0.0f;
+    clearColor.float32[1] = m_blue;            // G = 滑块值（0=黑, 1=绿）
+    clearColor.float32[2] = 1.0f - m_blue;     // B = 反向（滑块→1 时蓝→0）
+    clearColor.float32[3] = 1.0f;
 
-      VkClearColorValue clearColor{};
-      ImGui::ColorConvertHSVtoRGB((float)ImGui::GetTime() * 0.05f, 1, 1, clearColor.float32[0], clearColor.float32[1],
-                                  clearColor.float32[2]);
-      VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-      nvvk::cmdImageMemoryBarrier(cmd, {m_viewportImage.image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL});
-      vkCmdClearColorImage(cmd, m_viewportImage.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clearColor, 1, &range);
-      nvvk::cmdImageMemoryBarrier(cmd, {m_viewportImage.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                                        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL});
-    }
+    VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    nvvk::cmdImageMemoryBarrier(cmd, {m_viewportImage.image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL});
+    vkCmdClearColorImage(cmd, m_viewportImage.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clearColor, 1, &range);
+    nvvk::cmdImageMemoryBarrier(cmd, {m_viewportImage.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL});
   }
 
   // Called if showMenu is true
@@ -201,7 +208,8 @@ public:
 
 private:
   Info m_info;
-  bool m_animate = false;
+  bool  m_animate = false;
+  float m_blue    = 0.2f;  // 蓝色分量，由 UI 滑块控制
 
   nvvk::ResourceAllocator m_alloc{};
   nvapp::Application*     m_app{};
