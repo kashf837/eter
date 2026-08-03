@@ -5,8 +5,6 @@
 #include "knot_insert.h"
 #include "bezier_eval.h"
 
-// ---- File I/O helpers (from nurbs_eval.cu) ----
-
 static int next_line(FILE* f, char* buf, int size) {
     while (fgets(buf, size, f))
         if (buf[0] != '#' && buf[0] != '\n') return 1;
@@ -54,8 +52,6 @@ static void free_surf(NurbsSurf* s) {
     free(s);
 }
 
-// ---- Main pipeline ----
-
 int launch_nurbs_texture(float* cpu_data, int W, int H, const char* surf_path)
 {
     // 1. Load .surf
@@ -63,7 +59,7 @@ int launch_nurbs_texture(float* cpu_data, int W, int H, const char* surf_path)
     if (!s) return -1;
     printf("Loaded: p=(%d,%d) CPs=%dx%d\n", s->p_u, s->p_v, s->n_u+1, s->n_v+1);
 
-    // 2. Knot insertion → Bezier patches
+    // 2. Knot insertion -> Bezier patches
     for (int i = s->p_u + 1; i <= s->m_u - s->p_u - 1; i++) {
         float u = s->U[i];
         while (mult_of(s->U, s->m_u, u) < s->p_u + 1)
@@ -76,31 +72,51 @@ int launch_nurbs_texture(float* cpu_data, int W, int H, const char* surf_path)
     }
     printf("After KI: CPs=%dx%d\n", s->n_u+1, s->n_v+1);
 
-    // 3. Extract first Bezier patch
+    // 3. Evaluate all patches, find z range
     int ru = s->p_u + 1, rv = s->p_v + 1;
+    int np_u = (s->n_u + 1) / ru;
+    int np_v = (s->n_v + 1) / rv;
+    int pw = W / np_u, ph = H / np_v;
+    printf("Patches: %dx%d, each %dx%d pixels\n", np_u, np_v, pw, ph);
+
+    float zmin = 1e30f, zmax = -1e30f;
+
     BezierPatch bp;
     bp.p_u = s->p_u; bp.p_v = s->p_v;
     bp.CP = (float*)malloc(ru * rv * 4 * sizeof(float));
-    for (int i = 0; i < ru; i++)
-        for (int j = 0; j < rv; j++)
-            memcpy(&bp.CP[(i * rv + j) * 4], s->Ps[i][j], 4 * sizeof(float));
 
-    // 4. Evaluate on GPU at W×H sampling points
-    float* V = (float*)malloc(W * H * 3 * sizeof(float));
-    eval_bezier_patch(&bp, V, W, H);
+    for (int pi = 0; pi < np_u; pi++) {
+        for (int pj = 0; pj < np_v; pj++) {
+            // Extract patch from CP grid
+            for (int i = 0; i < ru; i++)
+                for (int j = 0; j < rv; j++)
+                    memcpy(&bp.CP[(i * rv + j) * 4],
+                           s->Ps[pi * ru + i][pj * rv + j], 4 * sizeof(float));
 
-    // 5. Find z range for heatmap
-    float zmin = 1e30f, zmax = -1e30f;
-    for (int i = 0; i < W * H; i++) {
-        float z = V[i * 3 + 2];
-        if (z < zmin) zmin = z;
-        if (z > zmax) zmax = z;
+            // Evaluate at pw x ph points
+            float* V = (float*)malloc(pw * ph * 3 * sizeof(float));
+            eval_bezier_patch(&bp, V, pw, ph);
+
+            // Map to texture region: x=pi*width (no flip), y = flip v (image y↓ vs NURBS v↑)
+            int x0 = pi * pw;
+            int y0 = pj * ph;
+            for (int y = 0; y < ph; y++) {
+                for (int x = 0; x < pw; x++) {
+                    float z = V[(x * ph + y) * 3 + 2];
+                    if (z < zmin) zmin = z;
+                    if (z > zmax) zmax = z;
+                    int tx = x0 + x, ty = y0 + y;
+                    cpu_data[(ty * W + tx) * 4 + 0] = z;  // stash z in R channel
+                }
+            }
+            free(V);
+        }
     }
     printf("z range: [%.4f, %.4f]\n", zmin, zmax);
 
-    // 6. Convert xyz → heatmap RGBA
+    // 4. Convert z -> heatmap RGBA
     for (int i = 0; i < W * H; i++) {
-        float z = V[i * 3 + 2];
+        float z = cpu_data[i * 4 + 0];
         float t = (z - zmin) / (zmax - zmin + 1e-6f);
         float r, g, b;
         if (t < 0.5f) {
@@ -110,12 +126,11 @@ int launch_nurbs_texture(float* cpu_data, int W, int H, const char* surf_path)
             float s = (t - 0.5f) * 2.0f;
             r = s;     g = 1.0f - s;  b = 0.0f;
         }
-        float* pixel = cpu_data + i * 4;
-        pixel[0] = r; pixel[1] = g; pixel[2] = b; pixel[3] = 1.0f;
+        cpu_data[i * 4 + 0] = r; cpu_data[i * 4 + 1] = g;
+        cpu_data[i * 4 + 2] = b; cpu_data[i * 4 + 3] = 1.0f;
     }
 
-    // 7. Cleanup
-    free(V); free(bp.CP);
+    free(bp.CP);
     free_surf(s);
     return 0;
 }
