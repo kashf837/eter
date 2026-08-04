@@ -471,36 +471,32 @@ private:
   // Load NURBS surface from .surf → knot insertion → Bezier patches →
   // GPU evaluation → vertex & index buffers ready for rendering.
   void createMeshBuffers(VkDevice dev, const char* surfPath) {
-    int np_u, np_v, res = 12;  // 12×12 vertices sampled per Bezier patch
-    float* verts = nurbs_wireframe(surfPath, res, &np_u, &np_v);
-    if (!verts) { LOGE("NURBS wireframe failed: %s\n", surfPath); return; }
+    // Build camera params from current camera state
+    CameraParams cam;
+    glm::dvec3 eye = m_camera->getEye();
+    cam.camX = (float)eye.x; cam.camY = (float)eye.y; cam.camZ = (float)eye.z;
+    cam.fovY = 60.0f;
+    cam.scrW = m_imgW; cam.scrH = m_imgH;
 
-    int totalVerts = np_u * np_v * res * res;
+    // Adaptive mesh: per-patch tess factors based on camera distance + curvature
+    uint32_t* idxData = nullptr;
+    int totalVerts = 0, totalIndices = 0;
+    float* verts = nurbs_adaptive_mesh(surfPath, &cam, &idxData, &totalVerts, &totalIndices);
+    m_indexCount = totalIndices;
+    if (!verts) { LOGE("Adaptive mesh failed: %s\n", surfPath); return; }
+
+    // Upload vertex buffer
     VkDeviceSize vbSize = totalVerts * 3 * sizeof(float);
-
-    // Create GPU vertex buffer + upload data via staging uploader
     m_alloc.createBuffer(m_vertexBuffer, vbSize,
         VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
         VMA_MEMORY_USAGE_GPU_ONLY);
     {
         void* ptr;
         NVVK_CHECK(m_stagingUploader.appendBufferMapping(m_vertexBuffer, 0, vbSize, ptr));
-        float* dst = (float*)ptr;
-        for (int pi = 0; pi < np_u; pi++)
-            for (int pj = 0; pj < np_v; pj++) {
-                float* v = verts + (pi * np_v + pj) * res * res * 3;
-                for (int y = 0; y < res; y++)
-                    for (int x = 0; x < res; x++) {
-                        *dst++ = v[(y * res + x) * 3 + 0]; // x
-                        *dst++ = v[(y * res + x) * 3 + 1]; // y
-                        *dst++ = v[(y * res + x) * 3 + 2]; // z
-                    }
-            }
+        memcpy(ptr, verts, vbSize);
     }
 
-    // Create GPU index buffer: each quad → 2 triangles → 6 indices
-    int quadsPerPatch = (res - 1) * (res - 1);
-    m_indexCount = np_u * np_v * quadsPerPatch * 6;
+    // Upload index buffer
     VkDeviceSize ibSize = m_indexCount * sizeof(uint32_t);
     m_alloc.createBuffer(m_indexBuffer, ibSize,
         VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
@@ -508,18 +504,7 @@ private:
     {
         void* ptr;
         NVVK_CHECK(m_stagingUploader.appendBufferMapping(m_indexBuffer, 0, ibSize, ptr));
-        uint32_t* idx = (uint32_t*)ptr;
-        for (int pi = 0; pi < np_u; pi++)
-            for (int pj = 0; pj < np_v; pj++) {
-                uint32_t base = (pi * np_v + pj) * res * res;
-                for (int y = 0; y < res - 1; y++)
-                    for (int x = 0; x < res - 1; x++) {
-                        uint32_t a = base + y * res + x, b = a + 1;
-                        uint32_t c = a + res, d = c + 1;
-                        *idx++ = a; *idx++ = b; *idx++ = c; // triangle 1
-                        *idx++ = b; *idx++ = d; *idx++ = c; // triangle 2
-                    }
-            }
+        memcpy(ptr, idxData, ibSize);
     }
 
     // Submit all staging uploads at once
@@ -527,9 +512,9 @@ private:
     m_stagingUploader.cmdUploadAppended(c);
     m_app->submitAndWaitTempCmdBuffer(c);
     m_stagingUploader.releaseStaging();
-    free(verts);
-    LOGI("Mesh: %d vertices, %d indices (%d triangles), %dx%d patches\n",
-         totalVerts, m_indexCount, m_indexCount / 3, np_u, np_v);
+    free(verts); free(idxData);
+    LOGI("Adaptive mesh: %d verts, %d indices (%d tris)\n",
+         totalVerts, m_indexCount, m_indexCount / 3);
   }
 
   // Transition viewport image to readable layout, then register with ImGui.

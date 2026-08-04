@@ -23,6 +23,7 @@ add_executable(eter
   src/nurbs.cu
   src/knot_insert.cu
   src/bezier_eval.cu
+  src/adaptive_tess.cu
 )
 
 # ---- Link ----
