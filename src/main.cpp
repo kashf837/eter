@@ -373,12 +373,15 @@ private:
     plCI.setLayoutCount = 1; plCI.pSetLayouts = &m_dsLayout;
     NVVK_CHECK(vkCreatePipelineLayout(dev, &plCI, nullptr, &m_pipelineLayout));
 
-    // Vertex input: each vertex is 3 floats (x, y, z)
-    VkVertexInputBindingDescription vib = {0, 3 * sizeof(float), VK_VERTEX_INPUT_RATE_VERTEX};
-    VkVertexInputAttributeDescription via = {0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0};
+    // Vertex input: 6 floats per vertex (x,y,z + nx,ny,nz)
+    VkVertexInputBindingDescription vib = {0, 6 * sizeof(float), VK_VERTEX_INPUT_RATE_VERTEX};
+    VkVertexInputAttributeDescription via[2] = {
+        {0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0},           // location=0: position (offset 0)
+        {1, 0, VK_FORMAT_R32G32B32_SFLOAT, 3*sizeof(float)}, // location=1: normal (offset 12)
+    };
     VkPipelineVertexInputStateCreateInfo vi = {VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
     vi.vertexBindingDescriptionCount = 1; vi.pVertexBindingDescriptions = &vib;
-    vi.vertexAttributeDescriptionCount = 1; vi.pVertexAttributeDescriptions = &via;
+    vi.vertexAttributeDescriptionCount = 2; vi.pVertexAttributeDescriptions = via;
 
     // Standard pipeline state: triangle list, 1 viewport, no blending
     VkPipelineInputAssemblyStateCreateInfo ia = {VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
@@ -479,11 +482,43 @@ private:
     if (!verts) { LOGE("Wireframe failed: %s\n", surfPath); return; }
 
     int totalVerts = np_u * np_v * res * res;
-    VkDeviceSize vbSize = totalVerts * 3 * sizeof(float);
+    int strideVerts = totalVerts * 6;  // x,y,z + nx,ny,nz per vertex
+    float* vdata = (float*)malloc(strideVerts * sizeof(float));
+
+    // Copy positions + compute normals via cross product of grid neighbors
+    for (int pi = 0; pi < np_u; pi++) for (int pj = 0; pj < np_v; pj++) {
+        float* src = verts + (pi * np_v + pj) * res * res * 3;
+        float* dst = vdata + (pi * np_v + pj) * res * res * 6;
+        for (int y = 0; y < res; y++) for (int x = 0; x < res; x++) {
+            int i = (y * res + x);
+            dst[i*6+0] = src[i*3+0]; dst[i*6+1] = src[i*3+1]; dst[i*6+2] = src[i*3+2];
+            // Tangent in u: vertex to the right (or left at boundary)
+            int xR = (x + 1 < res) ? x + 1 : x;
+            int xL = (xR > 0) ? xR - 1 : 0;
+            float du[3] = { src[(y*res+xR)*3+0] - src[(y*res+xL)*3+0],
+                            src[(y*res+xR)*3+1] - src[(y*res+xL)*3+1],
+                            src[(y*res+xR)*3+2] - src[(y*res+xL)*3+2] };
+            // Tangent in v: vertex below (or above at boundary)
+            int yD = (y + 1 < res) ? y + 1 : y;
+            int yU = (yD > 0) ? yD - 1 : 0;
+            float dv[3] = { src[(yD*res+x)*3+0] - src[(yU*res+x)*3+0],
+                            src[(yD*res+x)*3+1] - src[(yU*res+x)*3+1],
+                            src[(yD*res+x)*3+2] - src[(yU*res+x)*3+2] };
+            // Cross product → normal
+            float nx = du[1]*dv[2] - du[2]*dv[1];
+            float ny = du[2]*dv[0] - du[0]*dv[2];
+            float nz = du[0]*dv[1] - du[1]*dv[0];
+            float len = sqrtf(nx*nx + ny*ny + nz*nz) + 1e-10f;
+            dst[i*6+3] = nx / len; dst[i*6+4] = ny / len; dst[i*6+5] = nz / len;
+        }
+    }
+
+    VkDeviceSize vbSize = strideVerts * sizeof(float);
     m_alloc.createBuffer(m_vertexBuffer, vbSize,
         VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
         VMA_MEMORY_USAGE_GPU_ONLY);
-    { void* ptr; NVVK_CHECK(m_stagingUploader.appendBufferMapping(m_vertexBuffer, 0, vbSize, ptr)); memcpy(ptr, verts, vbSize); }
+    { void* ptr; NVVK_CHECK(m_stagingUploader.appendBufferMapping(m_vertexBuffer, 0, vbSize, ptr)); memcpy(ptr, vdata, vbSize); }
+    free(vdata);
 
     int qpp = (res - 1) * (res - 1);
     m_indexCount = np_u * np_v * qpp * 6;

@@ -1,8 +1,10 @@
 #version 450
 
 layout(location = 0) in vec3 inPosition;
+layout(location = 1) in vec3 inNormal;
 
-layout(location = 0) out vec3 fragPos;  // pass world position to fragment shader
+layout(location = 0) out vec3 fragNormal;
+layout(location = 1) out vec3 fragWorldPos;
 
 layout(set = 0, binding = 0) uniform MVP {
     mat4 model;
@@ -12,6 +14,9 @@ layout(set = 0, binding = 0) uniform MVP {
 
 void main()
 {
-    fragPos = inPosition;  // world-space position = input (model matrix is identity)
-    gl_Position = mvp.proj * mvp.view * mvp.model * vec4(inPosition, 1.0);
+    vec4 worldPos = mvp.model * vec4(inPosition, 1.0);
+    fragWorldPos = worldPos.xyz;
+    // Transform normal to world space (no non-uniform scale, so just mat3)
+    fragNormal = mat3(mvp.model) * inNormal;
+    gl_Position = mvp.proj * mvp.view * worldPos;
 }
