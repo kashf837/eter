@@ -5,6 +5,7 @@
 
 #include <vector>
 #include <fstream>
+#include <filesystem>
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 #include <backends/imgui_impl_vulkan.h>
@@ -94,6 +95,14 @@ public:
 
     // 6. Register viewport image with ImGui (so onUIRender can display it)
     initViewportForImGui(dev);
+
+    // 6b. Auto-fit camera to loaded model
+    { float cx=(m_bbMin[0]+m_bbMax[0])*0.5f,cy=(m_bbMin[1]+m_bbMax[1])*0.5f,cz=(m_bbMin[2]+m_bbMax[2])*0.5f;
+      float dx=m_bbMax[0]-m_bbMin[0],dy=m_bbMax[1]-m_bbMin[1],dz=m_bbMax[2]-m_bbMin[2];
+      float dist=fmaxf(fmaxf(dx,dy),dz)*1.2f; if(dist<1.f)dist=2.f;
+      m_camera->setLookat({cx,cy,cz+dist},{cx,cy,cz},{0,-1,0});
+      m_camera->setWindowSize({(uint32_t)m_imgW,(uint32_t)m_imgH});
+      LOGI("BBox x:[%.0f-%.0f] y:[%.0f-%.0f] z:[%.0f-%.0f] dist=%.0f\n",m_bbMin[0],m_bbMax[0],m_bbMin[1],m_bbMax[1],m_bbMin[2],m_bbMax[2],dist); }
 
     // 7. Profiler
     m_profilerTimeline = m_info.profilerManager->createTimeline({"graphics"});
@@ -281,6 +290,7 @@ private:
   nvvk::Buffer m_vertexBuffer{};   // vertex positions (x,y,z per vertex)
   nvvk::Buffer m_indexBuffer{};    // triangle indices (3 x uint32_t per triangle)
   uint32_t     m_indexCount = 0;
+  float m_bbMin[3]={1e30f,1e30f,1e30f}, m_bbMax[3]={-1e30f,-1e30f,-1e30f};
 
   // ---- Graphics pipeline ----
   // Pipeline = shaders + rasterization state + blend state + depth state
@@ -471,80 +481,72 @@ private:
     vkUpdateDescriptorSets(dev, 1, &wds, 0, nullptr);
   }
 
-  // Load NURBS surface from .surf → knot insertion → Bezier patches →
-  // GPU evaluation → vertex & index buffers ready for rendering.
-  void createMeshBuffers(VkDevice dev, const char* surfPath) {
-    // Fixed-resolution mesh for now.
-    // Adaptive tess (compute_tess_factors) works but cracks between patches
-    // require the full ETER crack-filling pipeline.
-    int np_u, np_v, res = 16;
-    float* verts = nurbs_wireframe(surfPath, res, &np_u, &np_v);
-    if (!verts) { LOGE("Wireframe failed: %s\n", surfPath); return; }
-
-    int totalVerts = np_u * np_v * res * res;
-    int strideVerts = totalVerts * 6;  // x,y,z + nx,ny,nz per vertex
-    float* vdata = (float*)malloc(strideVerts * sizeof(float));
-
-    // Copy positions + compute normals via cross product of grid neighbors
-    for (int pi = 0; pi < np_u; pi++) for (int pj = 0; pj < np_v; pj++) {
-        float* src = verts + (pi * np_v + pj) * res * res * 3;
-        float* dst = vdata + (pi * np_v + pj) * res * res * 6;
-        for (int y = 0; y < res; y++) for (int x = 0; x < res; x++) {
-            int i = (y * res + x);
-            dst[i*6+0] = src[i*3+0]; dst[i*6+1] = src[i*3+1]; dst[i*6+2] = src[i*3+2];
-            // Tangent in u: vertex to the right (or left at boundary)
-            int xR = (x + 1 < res) ? x + 1 : x;
-            int xL = (xR > 0) ? xR - 1 : 0;
-            float du[3] = { src[(y*res+xR)*3+0] - src[(y*res+xL)*3+0],
-                            src[(y*res+xR)*3+1] - src[(y*res+xL)*3+1],
-                            src[(y*res+xR)*3+2] - src[(y*res+xL)*3+2] };
-            // Tangent in v: vertex below (or above at boundary)
-            int yD = (y + 1 < res) ? y + 1 : y;
-            int yU = (yD > 0) ? yD - 1 : 0;
-            float dv[3] = { src[(yD*res+x)*3+0] - src[(yU*res+x)*3+0],
-                            src[(yD*res+x)*3+1] - src[(yU*res+x)*3+1],
-                            src[(yD*res+x)*3+2] - src[(yU*res+x)*3+2] };
-            // Cross product → normal
-            float nx = du[1]*dv[2] - du[2]*dv[1];
-            float ny = du[2]*dv[0] - du[0]*dv[2];
-            float nz = du[0]*dv[1] - du[1]*dv[0];
-            float len = sqrtf(nx*nx + ny*ny + nz*nz) + 1e-10f;
-            dst[i*6+3] = nx / len; dst[i*6+4] = ny / len; dst[i*6+5] = nz / len;
+  // ---- Per-surface helper ----
+  void addSurf(const char* path, int res, std::vector<float>& vd, std::vector<uint32_t>& id) {
+    int np_u, np_v;
+    float* verts = nurbs_wireframe(path, res, &np_u, &np_v);
+    if (!verts) return;
+    uint32_t vb = (uint32_t)(vd.size() / 6);
+    for (int pi=0; pi<np_u; pi++) for (int pj=0; pj<np_v; pj++) {
+        float* s = verts + (pi*np_v+pj)*res*res*3;
+        for (int y=0; y<res; y++) for (int x=0; x<res; x++) {
+            int i=y*res+x;
+            float px=s[i*3+0],py=s[i*3+1],pz=s[i*3+2];
+            vd.push_back(px);vd.push_back(py);vd.push_back(pz);
+            if(px<m_bbMin[0])m_bbMin[0]=px;if(py<m_bbMin[1])m_bbMin[1]=py;if(pz<m_bbMin[2])m_bbMin[2]=pz;
+            if(px>m_bbMax[0])m_bbMax[0]=px;if(py>m_bbMax[1])m_bbMax[1]=py;if(pz>m_bbMax[2])m_bbMax[2]=pz;
+            int xR=(x+1<res)?x+1:x,xL=xR>0?xR-1:0;
+            float du[3]={s[(y*res+xR)*3+0]-s[(y*res+xL)*3+0],s[(y*res+xR)*3+1]-s[(y*res+xL)*3+1],s[(y*res+xR)*3+2]-s[(y*res+xL)*3+2]};
+            int yD=(y+1<res)?y+1:y,yU=yD>0?yD-1:0;
+            float dv[3]={s[(yD*res+x)*3+0]-s[(yU*res+x)*3+0],s[(yD*res+x)*3+1]-s[(yU*res+x)*3+1],s[(yD*res+x)*3+2]-s[(yU*res+x)*3+2]};
+            float nx=du[1]*dv[2]-du[2]*dv[1],ny=du[2]*dv[0]-du[0]*dv[2],nz=du[0]*dv[1]-du[1]*dv[0];
+            float ln=sqrtf(nx*nx+ny*ny+nz*nz)+1e-10f;
+            vd.push_back(nx/ln);vd.push_back(ny/ln);vd.push_back(nz/ln);
         }
     }
-
-    VkDeviceSize vbSize = strideVerts * sizeof(float);
-    m_alloc.createBuffer(m_vertexBuffer, vbSize,
-        VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-        VMA_MEMORY_USAGE_GPU_ONLY);
-    { void* ptr; NVVK_CHECK(m_stagingUploader.appendBufferMapping(m_vertexBuffer, 0, vbSize, ptr)); memcpy(ptr, vdata, vbSize); }
-    free(vdata);
-
-    int qpp = (res - 1) * (res - 1);
-    m_indexCount = np_u * np_v * qpp * 6;
-    VkDeviceSize ibSize = m_indexCount * sizeof(uint32_t);
-    m_alloc.createBuffer(m_indexBuffer, ibSize,
-        VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-        VMA_MEMORY_USAGE_GPU_ONLY);
-    { void* ptr; NVVK_CHECK(m_stagingUploader.appendBufferMapping(m_indexBuffer, 0, ibSize, ptr));
-      uint32_t* idx = (uint32_t*)ptr;
-      for (int pi = 0; pi < np_u; pi++) for (int pj = 0; pj < np_v; pj++) {
-          uint32_t base = (pi * np_v + pj) * res * res;
-          for (int y = 0; y < res-1; y++) for (int x = 0; x < res-1; x++) {
-              uint32_t a = base + y*res + x, b = a+1, c = a+res, d = c+1;
-              *idx++=a;*idx++=b;*idx++=c; *idx++=b;*idx++=d;*idx++=c;
-          }
-      }
+    for (int pi=0;pi<np_u;pi++) for (int pj=0;pj<np_v;pj++) {
+        uint32_t base=vb+(pi*np_v+pj)*res*res;
+        for (int y=0;y<res-1;y++) for (int x=0;x<res-1;x++) {
+            uint32_t a=base+y*res+x,b=a+1,c=a+res,d=c+1;
+            id.push_back(a);id.push_back(b);id.push_back(c);
+            id.push_back(b);id.push_back(d);id.push_back(c);
+        }
     }
-    VkCommandBuffer c = m_app->createTempCmdBuffer();
+    free(verts);
+  }
+
+  // Batch-load .surf files (single file or directory)
+  void createMeshBuffers(VkDevice dev, const char* surfPath) {
+    int res=12;
+    std::vector<float> vd; std::vector<uint32_t> id;
+    namespace fs=std::filesystem;
+    if (fs::is_directory(surfPath)) {
+        std::vector<std::string> files;
+        for (auto& e:fs::directory_iterator(surfPath))
+            if(e.path().extension()==".surf") files.push_back(e.path().string());
+        std::sort(files.begin(),files.end());
+        LOGI("Loading %zu surf files ...\n",files.size());
+        for(size_t i=0;i<files.size();i++) {
+            if (i==2279) { printf("  SKIP 2279\n"); continue; }  // crash suspect
+            if (i%500==0) printf("  [%4zu] %zu verts\n",i,vd.size()/6);
+            addSurf(files[i].c_str(),res,vd,id);
+        }
+        printf("  ALL DONE, %zu verts\n",vd.size()/6);
+    } else { addSurf(surfPath,res,vd,id); }
+    m_indexCount=(uint32_t)id.size();
+    int tv=(int)(vd.size()/6);
+    VkDeviceSize vb=vd.size()*sizeof(float);
+    m_alloc.createBuffer(m_vertexBuffer,vb,VK_BUFFER_USAGE_VERTEX_BUFFER_BIT|VK_BUFFER_USAGE_TRANSFER_DST_BIT,VMA_MEMORY_USAGE_GPU_ONLY);
+    {void*p;NVVK_CHECK(m_stagingUploader.appendBufferMapping(m_vertexBuffer,0,vb,p));memcpy(p,vd.data(),vb);}
+    VkDeviceSize ib=id.size()*sizeof(uint32_t);
+    m_alloc.createBuffer(m_indexBuffer,ib,VK_BUFFER_USAGE_INDEX_BUFFER_BIT|VK_BUFFER_USAGE_TRANSFER_DST_BIT,VMA_MEMORY_USAGE_GPU_ONLY);
+    {void*p;NVVK_CHECK(m_stagingUploader.appendBufferMapping(m_indexBuffer,0,ib,p));memcpy(p,id.data(),ib);}
+    VkCommandBuffer c=m_app->createTempCmdBuffer();
     m_stagingUploader.cmdUploadAppended(c);
     m_app->submitAndWaitTempCmdBuffer(c);
     m_stagingUploader.releaseStaging();
-    free(verts);
-    LOGI("Mesh: %d verts, %d tris, %dx%d patches\n", totalVerts, m_indexCount/3, np_u, np_v);
+    LOGI("Total: %d verts, %d tris\n",tv,m_indexCount/3);
   }
-
-  // Transition viewport image to readable layout, then register with ImGui.
   void initViewportForImGui(VkDevice dev) {
     VkCommandBuffer c = m_app->createTempCmdBuffer();
     nvvk::cmdImageMemoryBarrier(c, {m_viewportImage.image,
@@ -631,8 +633,8 @@ int main(int argc, char** argv)
   app.addElement(std::make_shared<nvapp::ElementCamera>(nurbsRenderer->getCamera()));
 
   // Initialize camera position
-  nurbsRenderer->getCamera()->setWindowSize({256, 256});
-  nurbsRenderer->getCamera()->setLookat({0.5f, 0.3f, 1.8f}, {0.5f, 0.5f, 0.16f}, {0, 1, 0});
+  // Window size set in onAttach
+  // Camera auto-fitted by bounding box
 
   app.addElement(nurbsRenderer);
   app.addElement(std::make_shared<nvapp::ElementProfiler>(&profilerManager));
