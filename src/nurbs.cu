@@ -132,8 +132,6 @@ float* nurbs_adaptive_mesh(const char* surf_path, const CameraParams* cam,
     // 2. Compute per-patch tess factors
     int* tu_arr = (int*)malloc(np_u * np_v * sizeof(int));
     int* tv_arr = (int*)malloc(np_u * np_v * sizeof(int));
-    int* voff   = (int*)malloc((np_u * np_v + 1) * sizeof(int)); // vertex offsets
-    voff[0] = 0;
 
     BezierPatch bp;
     bp.p_u = s->p_u; bp.p_v = s->p_v;
@@ -154,21 +152,34 @@ float* nurbs_adaptive_mesh(const char* surf_path, const CameraParams* cam,
 
             int idx = pi * np_v + pj;
             tu_arr[idx] = tu; tv_arr[idx] = tv;
-            voff[idx + 1] = voff[idx] + tu * tv;
         }
     }
 
-    *vertCountOut = voff[np_u * np_v];
-    float* verts = (float*)malloc(*vertCountOut * 3 * sizeof(float));
-    printf("Total adaptive verts: %d (was %d fixed)\n", *vertCountOut,
-           np_u * np_v * 12 * 12);  // compare with old res=12
+    // Crack prevention: all patches must share the same tu and tv.
+    // (Full fix requires §6 crack-filling pipeline; this is the simple fallback.)
+    int max_tu = 0, max_tv = 0;
+    for (int i = 0; i < np_u * np_v; i++) {
+        if (tu_arr[i] > max_tu) max_tu = tu_arr[i];
+        if (tv_arr[i] > max_tv) max_tv = tv_arr[i];
+    }
+    for (int i = 0; i < np_u * np_v; i++) {
+        tu_arr[i] = max_tu; tv_arr[i] = max_tv;
+    }
+    int tu = max_tu, tv = max_tv;
 
-    // 3. Evaluate each patch at its adaptive resolution
+    // Shared-boundary vertex grid: unique vertices = (np_u*(tu-1)+1) × (np_v*(tv-1)+1)
+    int gCols = np_u * (tu - 1) + 1;  // global grid columns
+    int gRows = np_v * (tv - 1) + 1;  // global grid rows
+    *vertCountOut = gCols * gRows;
+    float* verts = (float*)calloc(*vertCountOut * 3, sizeof(float));
+
+    printf("Global grid: %dx%d = %d verts (was %d per-patch)\n",
+           gCols, gRows, *vertCountOut, np_u * np_v * tu * tv);
+
+    // Evaluate each patch and write interior + boundary vertices
+    // Each patch covers: col [pi*(tu-1), (pi+1)*(tu-1)], row [pj*(tv-1), (pj+1)*(tv-1)]
     for (int pi = 0; pi < np_u; pi++) {
         for (int pj = 0; pj < np_v; pj++) {
-            int idx = pi * np_v + pj;
-            int tu = tu_arr[idx], tv = tv_arr[idx];
-
             for (int i = 0; i < ru; i++)
                 for (int j = 0; j < rv; j++)
                     memcpy(&bp.CP[(i * rv + j) * 4],
@@ -177,44 +188,40 @@ float* nurbs_adaptive_mesh(const char* surf_path, const CameraParams* cam,
             float* V = (float*)malloc(tu * tv * 3 * sizeof(float));
             eval_bezier_patch(&bp, V, tu, tv);
 
-            float* dst = verts + voff[idx] * 3;
+            int cx = pi * (tu - 1);  // column offset in global grid
+            int cy = pj * (tv - 1);  // row offset in global grid
             for (int y = 0; y < tv; y++)
                 for (int x = 0; x < tu; x++) {
-                    *dst++ = V[(x * tv + y) * 3 + 0];
-                    *dst++ = V[(x * tv + y) * 3 + 1];
-                    *dst++ = V[(x * tv + y) * 3 + 2];
+                    int gx = cx + x, gy = cy + y;
+                    float* dst = verts + (gy * gCols + gx) * 3;
+                    dst[0] = V[(x * tv + y) * 3 + 0];
+                    dst[1] = V[(x * tv + y) * 3 + 1];
+                    dst[2] = V[(x * tv + y) * 3 + 2];
                 }
             free(V);
         }
     }
 
-    // 4. Build index buffer with correct per-patch offsets
-    *idxCountOut = 0;
-    for (int pi = 0; pi < np_u; pi++)
-        for (int pj = 0; pj < np_v; pj++) {
-            int idx = pi * np_v + pj;
-            *idxCountOut += (tu_arr[idx] - 1) * (tv_arr[idx] - 1) * 6;
-        }
-
+    // Build index buffer: each patch references shared global grid vertices
+    *idxCountOut = np_u * np_v * (tu - 1) * (tv - 1) * 6;
     *indicesOut = (uint32_t*)malloc(*idxCountOut * sizeof(uint32_t));
     uint32_t* idxPtr = *indicesOut;
-
     for (int pi = 0; pi < np_u; pi++) {
         for (int pj = 0; pj < np_v; pj++) {
-            int pidx = pi * np_v + pj;
-            int tu = tu_arr[pidx], tv = tv_arr[pidx];
-            uint32_t base = voff[pidx];
+            int cx = pi * (tu - 1);  // column offset in global grid
+            int cy = pj * (tv - 1);
             for (int y = 0; y < tv - 1; y++)
                 for (int x = 0; x < tu - 1; x++) {
-                    uint32_t a = base + y * tu + x, b = a + 1;
-                    uint32_t c = a + tu, d = c + 1;
+                    uint32_t a = (cy + y) * gCols + (cx + x);
+                    uint32_t b = a + 1;
+                    uint32_t c = a + gCols, d = c + 1;
                     *idxPtr++ = a; *idxPtr++ = b; *idxPtr++ = c;
                     *idxPtr++ = b; *idxPtr++ = d; *idxPtr++ = c;
                 }
         }
     }
 
-    free(tu_arr); free(tv_arr); free(voff);
+    free(tu_arr); free(tv_arr);
     free(bp.CP); free_surf(s);
     return verts;
 }

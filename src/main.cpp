@@ -471,50 +471,42 @@ private:
   // Load NURBS surface from .surf → knot insertion → Bezier patches →
   // GPU evaluation → vertex & index buffers ready for rendering.
   void createMeshBuffers(VkDevice dev, const char* surfPath) {
-    // Build camera params from current camera state
-    CameraParams cam;
-    glm::dvec3 eye = m_camera->getEye();
-    cam.camX = (float)eye.x; cam.camY = (float)eye.y; cam.camZ = (float)eye.z;
-    cam.fovY = 60.0f;
-    cam.scrW = m_imgW; cam.scrH = m_imgH;
+    // Fixed-resolution mesh for now.
+    // Adaptive tess (compute_tess_factors) works but cracks between patches
+    // require the full ETER crack-filling pipeline.
+    int np_u, np_v, res = 16;
+    float* verts = nurbs_wireframe(surfPath, res, &np_u, &np_v);
+    if (!verts) { LOGE("Wireframe failed: %s\n", surfPath); return; }
 
-    // Adaptive mesh: per-patch tess factors based on camera distance + curvature
-    uint32_t* idxData = nullptr;
-    int totalVerts = 0, totalIndices = 0;
-    float* verts = nurbs_adaptive_mesh(surfPath, &cam, &idxData, &totalVerts, &totalIndices);
-    m_indexCount = totalIndices;
-    if (!verts) { LOGE("Adaptive mesh failed: %s\n", surfPath); return; }
-
-    // Upload vertex buffer
+    int totalVerts = np_u * np_v * res * res;
     VkDeviceSize vbSize = totalVerts * 3 * sizeof(float);
     m_alloc.createBuffer(m_vertexBuffer, vbSize,
         VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
         VMA_MEMORY_USAGE_GPU_ONLY);
-    {
-        void* ptr;
-        NVVK_CHECK(m_stagingUploader.appendBufferMapping(m_vertexBuffer, 0, vbSize, ptr));
-        memcpy(ptr, verts, vbSize);
-    }
+    { void* ptr; NVVK_CHECK(m_stagingUploader.appendBufferMapping(m_vertexBuffer, 0, vbSize, ptr)); memcpy(ptr, verts, vbSize); }
 
-    // Upload index buffer
+    int qpp = (res - 1) * (res - 1);
+    m_indexCount = np_u * np_v * qpp * 6;
     VkDeviceSize ibSize = m_indexCount * sizeof(uint32_t);
     m_alloc.createBuffer(m_indexBuffer, ibSize,
         VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
         VMA_MEMORY_USAGE_GPU_ONLY);
-    {
-        void* ptr;
-        NVVK_CHECK(m_stagingUploader.appendBufferMapping(m_indexBuffer, 0, ibSize, ptr));
-        memcpy(ptr, idxData, ibSize);
+    { void* ptr; NVVK_CHECK(m_stagingUploader.appendBufferMapping(m_indexBuffer, 0, ibSize, ptr));
+      uint32_t* idx = (uint32_t*)ptr;
+      for (int pi = 0; pi < np_u; pi++) for (int pj = 0; pj < np_v; pj++) {
+          uint32_t base = (pi * np_v + pj) * res * res;
+          for (int y = 0; y < res-1; y++) for (int x = 0; x < res-1; x++) {
+              uint32_t a = base + y*res + x, b = a+1, c = a+res, d = c+1;
+              *idx++=a;*idx++=b;*idx++=c; *idx++=b;*idx++=d;*idx++=c;
+          }
+      }
     }
-
-    // Submit all staging uploads at once
     VkCommandBuffer c = m_app->createTempCmdBuffer();
     m_stagingUploader.cmdUploadAppended(c);
     m_app->submitAndWaitTempCmdBuffer(c);
     m_stagingUploader.releaseStaging();
-    free(verts); free(idxData);
-    LOGI("Adaptive mesh: %d verts, %d indices (%d tris)\n",
-         totalVerts, m_indexCount, m_indexCount / 3);
+    free(verts);
+    LOGI("Mesh: %d verts, %d tris, %dx%d patches\n", totalVerts, m_indexCount/3, np_u, np_v);
   }
 
   // Transition viewport image to readable layout, then register with ImGui.
