@@ -16,6 +16,7 @@
 #include <nvapp/elem_logger.hpp>
 #include <nvapp/elem_default_menu.hpp>
 #include <nvapp/elem_camera.hpp>
+#include <nvgui/file_dialog.hpp>
 #include <nvutils/logger.hpp>
 #include <nvvk/check_error.hpp>
 #include <nvvk/context.hpp>
@@ -59,13 +60,30 @@ class NURBSRenderer : public nvapp::IAppElement
 {
 public:
   struct Info { nvutils::ProfilerManager* profilerManager{}; nvutils::ParameterRegistry* parameterRegistry{}; };
-  NURBSRenderer(const Info& info) : m_info(info) {
-    // Register command-line parameter: --surf <path> or -s <path>
-    m_info.parameterRegistry->add({"surf"}, &m_surfPath);
-  }
+  NURBSRenderer(const Info& info) : m_info(info) { }
 
   // ---- Expose camera so ElementCamera can control it ----
   auto getCamera() { return m_camera; }
+
+  // Reload mesh from a new surf file/directory
+  void reloadMesh(const std::string& path) {
+    NVVK_CHECK(vkDeviceWaitIdle(m_app->getDevice()));
+    if (m_indexCount > 0) {
+        m_alloc.destroyBuffer(m_indexBuffer);
+        m_alloc.destroyBuffer(m_vertexBuffer);
+        m_indexCount = 0;
+    }
+    m_bbMin[0]=m_bbMin[1]=m_bbMin[2]=1e30f; m_bbMax[0]=m_bbMax[1]=m_bbMax[2]=-1e30f;
+    m_surfPath = path;
+    createMeshBuffers(m_app->getDevice(), m_surfPath.c_str());
+    if (m_indexCount > 0) {
+        float cx=(m_bbMin[0]+m_bbMax[0])*0.5f,cy=(m_bbMin[1]+m_bbMax[1])*0.5f,cz=(m_bbMin[2]+m_bbMax[2])*0.5f;
+        float dx=m_bbMax[0]-m_bbMin[0],dy=m_bbMax[1]-m_bbMin[1],dz=m_bbMax[2]-m_bbMin[2];
+        float dist=fmaxf(fmaxf(dx,dy),dz)*1.2f; if(dist<1.f)dist=2.f;
+        m_camera->setLookat({cx,cy,cz+dist},{cx,cy,cz},{0,-1,0});
+        m_camera->setWindowSize({(uint32_t)m_imgW,(uint32_t)m_imgH});
+    }
+  }
 
   // ============================================================
   // onAttach — one-time GPU resource creation
@@ -90,8 +108,9 @@ public:
     // 4. Upload MVP matrix (updated per-frame by camera)
     createUniformBuffer(dev);
 
-    // 5. Generate NURBS triangle mesh from .surf file
-    createMeshBuffers(dev, m_surfPath.c_str());
+    // 5. Generate NURBS triangle mesh from .surf file (if path set)
+    if (!m_surfPath.empty())
+        createMeshBuffers(dev, m_surfPath.c_str());
 
     // 6. Register viewport image with ImGui (so onUIRender can display it)
     initViewportForImGui(dev);
@@ -190,7 +209,8 @@ public:
     ri.pDepthAttachment = &da;
     vkCmdBeginRendering(cmd, &ri);
 
-    // Step C: draw the mesh
+    // Step C: draw the mesh (skip if nothing loaded)
+    if (m_indexCount > 0) {
     VkViewport vp = {0, (float)m_imgH, (float)m_imgW, -(float)m_imgH, 0, 1}; // Vulkan Y-flip
     VkRect2D   sc = {{0, 0}, {(uint32_t)m_imgW, (uint32_t)m_imgH}};
     vkCmdSetViewport(cmd, 0, 1, &vp);
@@ -201,6 +221,7 @@ public:
     vkCmdBindVertexBuffers(cmd, 0, 1, &m_vertexBuffer.buffer, &off);
     vkCmdBindIndexBuffer(cmd, m_indexBuffer.buffer, 0, VK_INDEX_TYPE_UINT32);
     vkCmdDrawIndexed(cmd, m_indexCount, 1, 0, 0, 0);
+    } // m_indexCount > 0
     vkCmdEndRendering(cmd);
 
     // Step D: blit (copy) render target → viewport image for ImGui display
@@ -253,6 +274,17 @@ public:
   {
     bool vsync = m_app->isVsync();
     if (ImGui::BeginMenu("File")) {
+        if (ImGui::MenuItem("Open Surf...")) {
+            auto path = nvgui::windowOpenFileDialog(m_app->getWindowHandle(), "Open NURBS Surface", "*.surf");
+            if (!path.empty()) {
+                auto dir = path.parent_path();
+                // If in a folder full of .surf files, load whole dir; else load single file
+                int count = 0;
+                for (auto& e : std::filesystem::directory_iterator(dir))
+                    if (e.path().extension() == ".surf") count++;
+                reloadMesh(count > 50 ? dir.string() : path.string());
+            }
+        }
         if (ImGui::MenuItem("Exit", "Ctrl+Q")) m_app->close();
         ImGui::EndMenu();
     }
@@ -269,7 +301,7 @@ public:
 private:
   // ---- Framework ----
   Info                          m_info;
-  std::string                   m_surfPath = "data/wave.surf";
+  std::string                   m_surfPath;  // empty = no mesh, use File>Open
   float                         m_intensity = 1.0f;
   float                         m_lightAz   = 0.6f;   // azimuth (radians)
   float                         m_lightEl   = 0.8f;   // elevation (radians)
@@ -282,7 +314,7 @@ private:
 
   // ---- Display images ----
   // Rendering pipeline:  mesh → m_renderTarget → blit → m_viewportImage → ImGui → screen
-  int            m_imgW = 256, m_imgH = 256;
+  int            m_imgW = 1024, m_imgH = 1024;
   nvvk::Image    m_viewportImage{};   // R32G32B32A32, ImGui display texture
   nvvk::Image    m_renderTarget{};    // R8G8B8A8, color attachment
   nvvk::Image    m_depthImage{};      // D32_SFLOAT, depth attachment (Z-buffer)
@@ -574,7 +606,11 @@ private:
     MVP mvp;
     mvp.model = glm::mat4(1.f);
     mvp.view  = m_camera->getViewMatrix();
-    mvp.proj  = m_camera->getPerspectiveMatrix();
+    // Projection with viewport aspect ratio, not render-target aspect
+    auto vsz  = m_app->getViewportSize();
+    float asp = vsz.width / (float)vsz.height;
+    mvp.proj  = glm::perspective(glm::radians(60.f), asp, 0.1f, 10.f);
+    mvp.proj[1][1] *= -1.f; // Vulkan Y flip
     mvp.intensity = m_intensity;
     mvp.lightAz   = m_lightAz;
     mvp.lightEl   = m_lightEl;
