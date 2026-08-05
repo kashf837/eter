@@ -517,7 +517,7 @@ private:
 
   // Batch-load .surf files (single file or directory)
   void createMeshBuffers(VkDevice dev, const char* surfPath) {
-    int res=12;
+    int res=32;
     std::vector<float> vd; std::vector<uint32_t> id;
     namespace fs=std::filesystem;
     if (fs::is_directory(surfPath)) {
@@ -527,8 +527,8 @@ private:
         std::sort(files.begin(),files.end());
         LOGI("Loading %zu surf files ...\n",files.size());
         for(size_t i=0;i<files.size();i++) {
-            if (i==2279) { printf("  SKIP 2279\n"); continue; }  // crash suspect
-            if (i%500==0) printf("  [%4zu] %zu verts\n",i,vd.size()/6);
+            if (i==2279) continue;  // corrupted file
+            if (i%1000==0) printf("  [%4zu/%zu]\n",i,files.size());
             addSurf(files[i].c_str(),res,vd,id);
         }
         printf("  ALL DONE, %zu verts\n",vd.size()/6);
