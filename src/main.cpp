@@ -42,7 +42,7 @@ static std::vector<char> readFile(const std::string& fn) {
 
 // MVP matrices passed to vertex shader via uniform buffer
 // (matches layout(set=0, binding=0) in mesh.vert)
-struct MVP { glm::mat4 model, view, proj; };
+struct MVP { glm::mat4 model, view, proj; float intensity, lightAz, lightEl; float _pad; };
 
 // ============================================================
 // NURBSRenderer — implements IAppElement, renders NURBS surface as 3D mesh
@@ -229,6 +229,9 @@ public:
   void onUIRender() override
   {
     ImGui::Begin("Settings");
+    ImGui::SliderFloat("Intensity", &m_intensity, 0.0f, 2.0f);
+    ImGui::SliderFloat("Light Azimuth", &m_lightAz, -3.14f, 3.14f);
+    ImGui::SliderFloat("Light Elevation", &m_lightEl, 0.0f, 1.57f);
     ImGui::Text("Triangles: %d", m_indexCount / 3);
     ImGui::TextDisabled("%d FPS / %.3fms",
         static_cast<int>(ImGui::GetIO().Framerate), 1000.f / ImGui::GetIO().Framerate);
@@ -266,7 +269,10 @@ public:
 private:
   // ---- Framework ----
   Info                          m_info;
-  std::string                   m_surfPath = "data/wave.surf";  // can override via --surf
+  std::string                   m_surfPath = "data/wave.surf";
+  float                         m_intensity = 1.0f;
+  float                         m_lightAz   = 0.6f;   // azimuth (radians)
+  float                         m_lightEl   = 0.8f;   // elevation (radians)
   nvapp::Application*           m_app{};
   nvvk::ResourceAllocator       m_alloc{};        // GPU memory manager (wraps VMA)
   nvvk::SamplerPool             m_samplerPool{};
@@ -374,7 +380,7 @@ private:
 
     // Descriptor set layout: tells shader WHAT resources it can access.
     // Here: just one uniform buffer (MVP matrix) at set=0, binding=0.
-    VkDescriptorSetLayoutBinding dslb = {0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT};
+    VkDescriptorSetLayoutBinding dslb = {0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT};
     VkDescriptorSetLayoutCreateInfo dslCI = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     dslCI.bindingCount = 1; dslCI.pBindings = &dslb;
     NVVK_CHECK(vkCreateDescriptorSetLayout(dev, &dslCI, nullptr, &m_dsLayout));
@@ -569,6 +575,9 @@ private:
     mvp.model = glm::mat4(1.f);
     mvp.view  = m_camera->getViewMatrix();
     mvp.proj  = m_camera->getPerspectiveMatrix();
+    mvp.intensity = m_intensity;
+    mvp.lightAz   = m_lightAz;
+    mvp.lightEl   = m_lightEl;
     memcpy(m_ubo.mapping, &mvp, sizeof(MVP));
   }
 };
