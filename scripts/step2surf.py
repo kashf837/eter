@@ -2,6 +2,21 @@
 """Convert STEP B_SPLINE_SURFACE to .surf (supports inline and entity formats)."""
 import sys, os, re
 
+def parse_cp_grid(grid_text):
+    """Parse nested CP grid like ((#1,#2),(#3,#4)) into list of row strings."""
+    inner = grid_text.strip()
+    if inner.startswith('('): inner = inner[1:]
+    if inner.endswith(')'): inner = inner[:-1]
+    rows, depth, cur = [], 0, ''
+    for ch in inner:
+        if ch == '(': depth += 1
+        elif ch == ')':
+            depth -= 1
+            if depth == 0: rows.append(cur.strip()); cur = ''; continue
+        if depth == 1: cur += ch
+    return rows
+
+
 def parse_step_file(path):
     """Read STEP file, return (entities dict, list of surface data dicts)."""
     with open(path) as f:
@@ -12,6 +27,7 @@ def parse_step_file(path):
     for m in re.finditer(r'#(\d+)\s*=\s*CARTESIAN_POINT\s*\(\s*\'[^\']*\'\s*,\s*\(\s*([^)]+)\s*\)\s*\)\s*;', text):
         cid = int(m.group(1))
         xyz = [float(v.strip()) for v in m.group(2).split(',')]
+        while len(xyz) < 3: xyz.append(0.0)  # pad 1D/2D to 3D
         cart_points[cid] = xyz
 
     surfaces = []
@@ -40,17 +56,13 @@ def parse_step_file(path):
                 cp_grid_raw = m.group(3)
                 knot_raw = m.group(5)
 
-                # Parse CP grid rows — each row is (#id, #id, ...)
-                rows = re.findall(r'\(\s*((?:#\d+[\s,]*)+)\)', cp_grid_raw)
+                # Parse CP grid rows with depth-based parser
                 cp_grid = []
-                for row in rows:
-                    ids = [int(s.strip().lstrip('#')) for s in row.split(',') if s.strip()]
-                    row_pts = []
-                    for cid in ids:
-                        if cid in cart_points:
-                            row_pts.append(cart_points[cid])
-                    if row_pts:
-                        cp_grid.append(row_pts)
+                for row_text in parse_cp_grid(cp_grid_raw):
+                    clean = row_text.strip().lstrip('(')
+                    ids = [int(s.strip().lstrip('#')) for s in clean.split(',') if s.strip()]
+                    row_pts = [cart_points[cid] for cid in ids if cid in cart_points]
+                    if row_pts: cp_grid.append(row_pts)
 
                 if len(cp_grid) < 2:
                     continue
@@ -63,17 +75,15 @@ def parse_step_file(path):
                     u_knots = [float(v.strip()) for v in lists[2].split(',') if v.strip()]
                     v_knots = [float(v.strip()) for v in lists[3].split(',') if v.strip()]
 
-                    U = []
-                    for kval, km in zip(u_knots, u_mult):
-                        U.extend([kval] * km)
-                    V = []
-                    for kval, km in zip(v_knots, v_mult):
-                        V.extend([kval] * km)
+                    U = []; V = []
+                    for k, m in zip(u_knots, u_mult): U.extend([k]*m)
+                    for k, m in zip(v_knots, v_mult): V.extend([k]*m)
 
+                    n_v = max(len(r) for r in cp_grid) - 1 if cp_grid else 0
                     surf = {
                         'p_u': p_u, 'p_v': p_v,
                         'n_u': len(cp_grid) - 1,
-                        'n_v': len(cp_grid[0]) - 1,
+                        'n_v': n_v,
                         'U': U, 'V': V,
                         'cp_grid': cp_grid
                     }
@@ -90,13 +100,14 @@ def parse_standalone_surface(body, cart_points):
     p_u = int(parts[1].strip())
     p_v = int(parts[2].strip())
 
-    rows = re.findall(r'\(([^)]+)\)', parts[3])
+    # Parse CP grid with depth-based parser
     cp_grid = []
-    for row in rows:
-        ids = [int(s.strip().lstrip('#')) for s in row.split(',') if s.strip().startswith('#')]
+    for row_text in parse_cp_grid(parts[3]):
+        # Strip leading '(' that may prefix the first ref
+        clean = row_text.strip().lstrip('(')
+        ids = [int(s.strip().lstrip('#')) for s in clean.split(',') if s.strip().startswith('#')]
         row_pts = [cart_points[cid] for cid in ids if cid in cart_points]
-        if row_pts:
-            cp_grid.append(row_pts)
+        if row_pts: cp_grid.append(row_pts)
 
     knot_section = ','.join(parts[4:])
     lists = re.findall(r'\(([0-9.,\s]+)\)', knot_section)
@@ -111,7 +122,8 @@ def parse_standalone_surface(body, cart_points):
     for k, m in zip(u_knots, u_mult): U.extend([k] * m)
     for k, m in zip(v_knots, v_mult): V.extend([k] * m)
 
-    return {'p_u': p_u, 'p_v': p_v, 'n_u': len(cp_grid)-1, 'n_v': len(cp_grid[0])-1,
+    n_v = max(len(row) for row in cp_grid) - 1 if cp_grid else 0
+    return {'p_u': p_u, 'p_v': p_v, 'n_u': len(cp_grid)-1, 'n_v': n_v,
             'U': U, 'V': V, 'cp_grid': cp_grid}
 
 

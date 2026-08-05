@@ -163,10 +163,13 @@ public:
     if (!m.empty()) {
         uploadMesh(m);
         m_modelScale = m.scale();
-        float cx=m.cx(), cy=m.cy(), cz=m.cz(), dist=m_modelScale*1.2f;
-        m_camera->setLookat({cx,cy,cz+dist},{cx,cy,cz},{0,-1,0});
+        m_center[0]=m.cx(); m_center[1]=m.cy(); m_center[2]=m.cz();
+        float dist = m_modelScale * 1.5f;  // closer: 1.5× instead of 1.2×
+        m_camera->setLookat({m_center[0],m_center[1],m_center[2]+dist},
+                            {m_center[0],m_center[1],m_center[2]},{0,-1,0});
         m_camera->setWindowSize({(uint32_t)m_imgW,(uint32_t)m_imgH});
-        LOGI("Camera: scale=%.1f dist=%.1f\n", m_modelScale, dist);
+        LOGI("Camera: center=(%.1f,%.1f,%.1f) scale=%.1f dist=%.1f\n",
+             m_center[0],m_center[1],m_center[2],m_modelScale,dist);
     }
     if (isDir) std::filesystem::remove_all(path);
   }
@@ -197,7 +200,11 @@ public:
     // 5. Generate NURBS triangle mesh from .surf file (if path set)
     if (!m_surfPath.empty()) {
         Mesh m = MeshBuilder::single(m_surfPath.c_str());
-        if (!m.empty()) { uploadMesh(m); m_modelScale = m.scale(); }
+        if (!m.empty()) {
+            uploadMesh(m);
+            m_modelScale = m.scale();
+            m_center[0]=m.cx(); m_center[1]=m.cy(); m_center[2]=m.cz();
+        }
     }
 
     // 6. Register viewport image with ImGui (so onUIRender can display it)
@@ -205,10 +212,12 @@ public:
 
     // 6b. Auto-fit camera to loaded model
     if (m_indexCount > 0) {
-        float s = m_modelScale, dist = s*1.2f;
-        m_camera->setLookat({0,0,dist},{0,0,0},{0,-1,0});
+        float dist = m_modelScale * 1.5f;
+        m_camera->setLookat({m_center[0],m_center[1],m_center[2]+dist},
+                            {m_center[0],m_center[1],m_center[2]},{0,-1,0});
         m_camera->setWindowSize({(uint32_t)m_imgW,(uint32_t)m_imgH});
-        LOGI("Camera: scale=%.0f dist=%.0f\n", s, dist);
+        LOGI("Camera: center=(%.1f,%.1f,%.1f) scale=%.1f dist=%.1f\n",
+             m_center[0],m_center[1],m_center[2],m_modelScale,dist);
     }
 
     // 7. Profiler
@@ -429,6 +438,7 @@ private:
   nvvk::Buffer m_indexBuffer{};    // triangle indices (3 x uint32_t per triangle)
   uint32_t     m_indexCount = 0;
   float m_modelScale = 1.0f;  // max dimension, for near/far auto-fit
+  float m_center[3] = {0,0,0};  // model center, for camera lookat
 
   // ---- Graphics pipeline ----
   // Pipeline = shaders + rasterization state + blend state + depth state

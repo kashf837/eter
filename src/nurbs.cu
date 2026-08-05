@@ -37,9 +37,9 @@ static NurbsSurf* read_surf(const char* path) {
     FILE* f = fopen(path, "r");
     if (!f) { fprintf(stderr, "  [SKIP] Cannot open %s\n", path); return NULL; }
     NurbsSurf* s = (NurbsSurf*)calloc(1, sizeof(NurbsSurf));
-    char line[256];
+    char line[4096];  // some STEP surfaces have very long knot lines
 
-    if (!next_line(f, line, 256)) { fclose(f); free(s); return NULL; }
+    if (!next_line(f, line, sizeof(line))) { fclose(f); free(s); return NULL; }
     sscanf(line, "%d %d %d %d", &s->p_u, &s->p_v, &s->n_u, &s->n_v);
     if (s->p_u <= 0 || s->p_v <= 0 || s->n_u <= 0 || s->n_v <= 0 ||
         s->p_u > 20 || s->p_v > 20 || s->n_u > 10000 || s->n_v > 10000) {
@@ -49,12 +49,12 @@ static NurbsSurf* read_surf(const char* path) {
     }
 
     // U knot vector — count actual values, derive m_u from count
-    if (!next_line(f, line, 256)) { fclose(f); free_surf(s); return NULL; }
+    if (!next_line(f, line, sizeof(line))) { fclose(f); free_surf(s); return NULL; }
     {   int n = count_floats(line); s->m_u = n - 1;
         s->U = (float*)malloc(n * sizeof(float)); parse_floats(line, s->U, n); }
 
     // V knot vector
-    if (!next_line(f, line, 256)) { fclose(f); free_surf(s); return NULL; }
+    if (!next_line(f, line, sizeof(line))) { fclose(f); free_surf(s); return NULL; }
     {   int n = count_floats(line); s->m_v = n - 1;
         s->V = (float*)malloc(n * sizeof(float)); parse_floats(line, s->V, n); }
 
@@ -62,13 +62,19 @@ static NurbsSurf* read_surf(const char* path) {
     s->Ps = new_cpgrid(s->n_u, s->n_v, 4);
     for (int i = 0; i <= s->n_u; i++)
         for (int j = 0; j <= s->n_v; j++) {
-            if (!next_line(f, line, 256) ||
-                sscanf(line, "%f %f %f %f",
-                       &s->Ps[i][j][0], &s->Ps[i][j][1],
-                       &s->Ps[i][j][2], &s->Ps[i][j][3]) < 4) {
-                fprintf(stderr, "  [SKIP] %s: bad CP at (%d,%d)\n", path, i, j);
+            if (!next_line(f, line, sizeof(line))) {
                 fclose(f); free_surf(s); return NULL;
             }
+            int got = sscanf(line, "%f %f %f %f",
+                   &s->Ps[i][j][0], &s->Ps[i][j][1],
+                   &s->Ps[i][j][2], &s->Ps[i][j][3]);
+            if (got < 1) {
+                fprintf(stderr, "  [SKIP] %s: bad CP at (%d,%d) got=%d\n", path, i, j, got);
+                fclose(f); free_surf(s); return NULL;
+            }
+            // Pad missing coordinates: 1→xyz with y=z=0,w=1; 2→xyz with z=0,w=1; 3→w=1
+            if (got < 3) { s->Ps[i][j][1] = 0; s->Ps[i][j][2] = 0; }
+            if (got < 4) s->Ps[i][j][3] = 1.0f;
         }
     fclose(f);
     return s;
