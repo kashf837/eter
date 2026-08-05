@@ -5,6 +5,9 @@
 #include "knot_insert.h"
 #include "bezier_eval.h"
 
+// Forward declaration — read_surf uses it before free_surf is defined
+static void free_surf(NurbsSurf* s);
+
 static int next_line(FILE* f, char* buf, int size) {
     while (fgets(buf, size, f))
         if (buf[0] != '#' && buf[0] != '\n') return 1;
@@ -13,34 +16,64 @@ static int next_line(FILE* f, char* buf, int size) {
 
 static NurbsSurf* read_surf(const char* path) {
     FILE* f = fopen(path, "r");
-    if (!f) { printf("Cannot open %s\n", path); return NULL; }
+    if (!f) { printf("  [SKIP] Cannot open %s\n", path); return NULL; }
     NurbsSurf* s = (NurbsSurf*)calloc(1, sizeof(NurbsSurf));
     char line[256];
 
-    next_line(f, line, 256);
+    if (!next_line(f, line, 256)) { fclose(f); free(s); return NULL; }
     sscanf(line, "%d %d %d %d", &s->p_u, &s->p_v, &s->n_u, &s->n_v);
-    s->m_u = s->n_u + s->p_u + 1;
-    s->m_v = s->n_v + s->p_v + 1;
+    // Sanity check: reject obviously corrupted files (negative / huge dimensions)
+    if (s->p_u <= 0 || s->p_v <= 0 || s->n_u <= 0 || s->n_v <= 0 ||
+        s->p_u > 20 || s->p_v > 20 || s->n_u > 10000 || s->n_v > 10000) {
+        printf("  [SKIP] %s: bad dimensions p=(%d,%d) n=(%d,%d)\n", path, s->p_u, s->p_v, s->n_u, s->n_v);
+        fclose(f); free(s); return NULL;
+    }
+    // Read U knot vector — count actual values, set m_u from that
+    if (!next_line(f, line, 256)) { fclose(f); free_surf(s); return NULL; }
+    {
+        int cnt = 1;  // count spaces to get number of values
+        for (char* c = line; *c; c++) if (*c == ' ') cnt++;
+        s->m_u = cnt - 1;  // last index
+        s->U = (float*)malloc(cnt * sizeof(float));
+        char* p = line;
+        for (int i = 0; i < cnt; i++) {
+            sscanf(p, "%f", &s->U[i]);
+            char* next = strchr(p, ' ');
+            if (!next) { p += strlen(p); break; }
+            p = next + 1;
+        }
+    }
 
-    s->U = (float*)malloc((s->m_u + 1) * sizeof(float));
-    next_line(f, line, 256);
-    char* p = line;
-    for (int i = 0; i <= s->m_u; i++, p = strchr(p, ' ') + 1)
-        sscanf(p, "%f", &s->U[i]);
-
-    s->V = (float*)malloc((s->m_v + 1) * sizeof(float));
-    next_line(f, line, 256);
-    p = line;
-    for (int i = 0; i <= s->m_v; i++, p = strchr(p, ' ') + 1)
-        sscanf(p, "%f", &s->V[i]);
+    // Read V knot vector similarly
+    if (!next_line(f, line, 256)) { fclose(f); free_surf(s); return NULL; }
+    {
+        int cnt = 1;
+        for (char* c = line; *c; c++) if (*c == ' ') cnt++;
+        s->m_v = cnt - 1;
+        s->V = (float*)malloc(cnt * sizeof(float));
+        char* p = line;
+        for (int i = 0; i < cnt; i++) {
+            sscanf(p, "%f", &s->V[i]);
+            char* next = strchr(p, ' ');
+            if (!next) { p += strlen(p); break; }
+            p = next + 1;
+        }
+    }
 
     s->Ps = new_cpgrid(s->n_u, s->n_v, 4);
     for (int i = 0; i <= s->n_u; i++)
         for (int j = 0; j <= s->n_v; j++) {
-            next_line(f, line, 256);
-            sscanf(line, "%f %f %f %f",
+            if (!next_line(f, line, 256)) {
+                printf("  [SKIP] %s: missing CP at (%d,%d)\n", path, i, j);
+                fclose(f); free_surf(s); return NULL;
+            }
+            int got = sscanf(line, "%f %f %f %f",
                    &s->Ps[i][j][0], &s->Ps[i][j][1],
                    &s->Ps[i][j][2], &s->Ps[i][j][3]);
+            if (got < 4) {
+                printf("  [SKIP] %s: bad CP line at (%d,%d) got=%d\n", path, i, j, got);
+                fclose(f); free_surf(s); return NULL;
+            }
         }
     fclose(f);
     return s;

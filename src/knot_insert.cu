@@ -70,8 +70,9 @@ void knot_insert_surf(NurbsSurf* s, int dir, float x) {
 // dir=1: t is row,    cols 0..old_n are the varying index
 static void process_slice(CPGrid* Ps, int t, int old_n, int first, int last,
                            float* alpha, int dim, int dir) {
-    // save all old CPs in this slice: P_0 .. P_{old_n}
-    float saved[64][8];
+    // Dynamically allocate saved array — old_n can be arbitrarily large
+    // after multiple rounds of knot insertion on high-res CAD patches.
+    float (*saved)[8] = (float(*)[8])malloc((old_n + 1) * sizeof(float[8]));
     for (int v = 0; v <= old_n; v++)
         for (int d = 0; d < dim; d++) {
             float* cp = (dir == 0) ? &(*Ps)[v][t][d] : &(*Ps)[t][v][d];
@@ -88,6 +89,7 @@ static void process_slice(CPGrid* Ps, int t, int old_n, int first, int last,
             *dst = alpha[v] * saved[pi][d] + (1.0f - alpha[v]) * saved[pi1][d];
         }
     }
+    free(saved);
 }
 
 // ========== Internal implementation ==========

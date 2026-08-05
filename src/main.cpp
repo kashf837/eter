@@ -5,7 +5,6 @@
 
 #include <vector>
 #include <fstream>
-#include <filesystem>
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 #include <backends/imgui_impl_vulkan.h>
@@ -66,7 +65,8 @@ public:
   auto getCamera() { return m_camera; }
 
   // Reload mesh from a new surf file/directory
-  void reloadMesh(const std::string& path) {
+  void doReload(const std::string& path) {
+    LOGI("doReload: %s\n", path.c_str());
     NVVK_CHECK(vkDeviceWaitIdle(m_app->getDevice()));
     if (m_indexCount > 0) {
         m_alloc.destroyBuffer(m_indexBuffer);
@@ -79,7 +79,8 @@ public:
     if (m_indexCount > 0) {
         float cx=(m_bbMin[0]+m_bbMax[0])*0.5f,cy=(m_bbMin[1]+m_bbMax[1])*0.5f,cz=(m_bbMin[2]+m_bbMax[2])*0.5f;
         float dx=m_bbMax[0]-m_bbMin[0],dy=m_bbMax[1]-m_bbMin[1],dz=m_bbMax[2]-m_bbMin[2];
-        float dist=fmaxf(fmaxf(dx,dy),dz)*1.2f; if(dist<1.f)dist=2.f;
+        m_modelScale = fmaxf(fmaxf(dx,dy),dz); if(m_modelScale<1.f)m_modelScale=1.f;
+        float dist=m_modelScale*1.2f;
         m_camera->setLookat({cx,cy,cz+dist},{cx,cy,cz},{0,-1,0});
         m_camera->setWindowSize({(uint32_t)m_imgW,(uint32_t)m_imgH});
     }
@@ -118,10 +119,11 @@ public:
     // 6b. Auto-fit camera to loaded model
     { float cx=(m_bbMin[0]+m_bbMax[0])*0.5f,cy=(m_bbMin[1]+m_bbMax[1])*0.5f,cz=(m_bbMin[2]+m_bbMax[2])*0.5f;
       float dx=m_bbMax[0]-m_bbMin[0],dy=m_bbMax[1]-m_bbMin[1],dz=m_bbMax[2]-m_bbMin[2];
-      float dist=fmaxf(fmaxf(dx,dy),dz)*1.2f; if(dist<1.f)dist=2.f;
+      m_modelScale = fmaxf(fmaxf(dx,dy),dz); if(m_modelScale<1.f)m_modelScale=1.f;
+      float dist=m_modelScale*1.2f;
       m_camera->setLookat({cx,cy,cz+dist},{cx,cy,cz},{0,-1,0});
       m_camera->setWindowSize({(uint32_t)m_imgW,(uint32_t)m_imgH});
-      LOGI("BBox x:[%.0f-%.0f] y:[%.0f-%.0f] z:[%.0f-%.0f] dist=%.0f\n",m_bbMin[0],m_bbMax[0],m_bbMin[1],m_bbMax[1],m_bbMin[2],m_bbMax[2],dist); }
+      LOGI("BBox x:[%.0f-%.0f] y:[%.0f-%.0f] z:[%.0f-%.0f] scale=%.0f dist=%.0f\n",m_bbMin[0],m_bbMax[0],m_bbMin[1],m_bbMax[1],m_bbMin[2],m_bbMax[2],m_modelScale,dist); }
 
     // 7. Profiler
     m_profilerTimeline = m_info.profilerManager->createTimeline({"graphics"});
@@ -166,6 +168,12 @@ public:
   // ============================================================
   void onRender(VkCommandBuffer cmd) override
   {
+    // Process pending mesh reload (deferred from menu callback)
+    if (!m_pendingLoad.empty()) {
+        doReload(m_pendingLoad);
+        m_pendingLoad.clear();
+        return;  // skip rendering this frame (buffers were recreated)
+    }
     // Upload latest camera matrices to GPU
     updateCameraUBO();
 
@@ -274,15 +282,10 @@ public:
   {
     bool vsync = m_app->isVsync();
     if (ImGui::BeginMenu("File")) {
-        if (ImGui::MenuItem("Open Surf...")) {
-            auto path = nvgui::windowOpenFileDialog(m_app->getWindowHandle(), "Open NURBS Surface", "*.surf");
+        if (ImGui::MenuItem("Open...")) {
+            auto path = nvgui::windowOpenFileDialog(m_app->getWindowHandle(), "Open SURF file", "*.surf");
             if (!path.empty()) {
-                auto dir = path.parent_path();
-                // If in a folder full of .surf files, load whole dir; else load single file
-                int count = 0;
-                for (auto& e : std::filesystem::directory_iterator(dir))
-                    if (e.path().extension() == ".surf") count++;
-                reloadMesh(count > 50 ? dir.string() : path.string());
+                m_pendingLoad = path.string();
             }
         }
         if (ImGui::MenuItem("Exit", "Ctrl+Q")) m_app->close();
@@ -301,7 +304,8 @@ public:
 private:
   // ---- Framework ----
   Info                          m_info;
-  std::string                   m_surfPath;  // empty = no mesh, use File>Open
+  std::string                   m_surfPath;
+  std::string                   m_pendingLoad;  // set by menu, processed next frame
   float                         m_intensity = 1.0f;
   float                         m_lightAz   = 0.6f;   // azimuth (radians)
   float                         m_lightEl   = 0.8f;   // elevation (radians)
@@ -329,6 +333,7 @@ private:
   nvvk::Buffer m_indexBuffer{};    // triangle indices (3 x uint32_t per triangle)
   uint32_t     m_indexCount = 0;
   float m_bbMin[3]={1e30f,1e30f,1e30f}, m_bbMax[3]={-1e30f,-1e30f,-1e30f};
+  float m_modelScale = 1.0f;  // max dimension, for near/far auto-fit
 
   // ---- Graphics pipeline ----
   // Pipeline = shaders + rasterization state + blend state + depth state
@@ -523,7 +528,7 @@ private:
   void addSurf(const char* path, int res, std::vector<float>& vd, std::vector<uint32_t>& id) {
     int np_u, np_v;
     float* verts = nurbs_wireframe(path, res, &np_u, &np_v);
-    if (!verts) return;
+    if (!verts) { printf("  [SKIP] nurbs_wireframe failed: %s\n", path); return; }
     uint32_t vb = (uint32_t)(vd.size() / 6);
     for (int pi=0; pi<np_u; pi++) for (int pj=0; pj<np_v; pj++) {
         float* s = verts + (pi*np_v+pj)*res*res*3;
@@ -553,24 +558,10 @@ private:
     free(verts);
   }
 
-  // Batch-load .surf files (single file or directory)
+  // Load a single .surf file and generate triangle mesh
   void createMeshBuffers(VkDevice dev, const char* surfPath) {
-    int res=32;
     std::vector<float> vd; std::vector<uint32_t> id;
-    namespace fs=std::filesystem;
-    if (fs::is_directory(surfPath)) {
-        std::vector<std::string> files;
-        for (auto& e:fs::directory_iterator(surfPath))
-            if(e.path().extension()==".surf") files.push_back(e.path().string());
-        std::sort(files.begin(),files.end());
-        LOGI("Loading %zu surf files ...\n",files.size());
-        for(size_t i=0;i<files.size();i++) {
-            if (i==2279) continue;  // corrupted file
-            if (i%1000==0) printf("  [%4zu/%zu]\n",i,files.size());
-            addSurf(files[i].c_str(),res,vd,id);
-        }
-        printf("  ALL DONE, %zu verts\n",vd.size()/6);
-    } else { addSurf(surfPath,res,vd,id); }
+    addSurf(surfPath, 32, vd, id);  // res=32: high-quality sampling
     m_indexCount=(uint32_t)id.size();
     int tv=(int)(vd.size()/6);
     VkDeviceSize vb=vd.size()*sizeof(float);
@@ -583,7 +574,7 @@ private:
     m_stagingUploader.cmdUploadAppended(c);
     m_app->submitAndWaitTempCmdBuffer(c);
     m_stagingUploader.releaseStaging();
-    LOGI("Total: %d verts, %d tris\n",tv,m_indexCount/3);
+    LOGI("Loaded %s: %d verts, %d tris\n",surfPath,tv,m_indexCount/3);
   }
   void initViewportForImGui(VkDevice dev) {
     VkCommandBuffer c = m_app->createTempCmdBuffer();
@@ -609,7 +600,10 @@ private:
     // Projection with viewport aspect ratio, not render-target aspect
     auto vsz  = m_app->getViewportSize();
     float asp = vsz.width / (float)vsz.height;
-    mvp.proj  = glm::perspective(glm::radians(60.f), asp, 0.1f, 10.f);
+    float nearP = m_modelScale * 0.001f;  // auto-scale: near = 0.1% of model size
+    float farP  = m_modelScale * 5.0f;     // far = 5× model size, plenty of room
+    if (nearP < 0.001f) nearP = 0.001f;
+    mvp.proj  = glm::perspective(glm::radians(60.f), asp, nearP, farP);
     mvp.proj[1][1] *= -1.f; // Vulkan Y flip
     mvp.intensity = m_intensity;
     mvp.lightAz   = m_lightAz;

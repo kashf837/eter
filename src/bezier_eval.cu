@@ -214,23 +214,33 @@ void eval_bezier_patch(BezierPatch* bp, float* V_out, int nu, int nv) {
     int* binom_u = (int*)malloc((order_u+1)*sizeof(int));
     int* binom_v = (int*)malloc((order_v+1)*sizeof(int));
     compute_binom(order_u,binom_u); compute_binom(order_v,binom_v);
-    float *d_CP, *d_V; int *d_binom_u, *d_binom_v;
-    cudaMalloc(&d_CP, num_cp*4*sizeof(float));
-    cudaMalloc(&d_V, total*3*sizeof(float));
-    cudaMalloc(&d_binom_u, (order_u+1)*sizeof(int));
-    cudaMalloc(&d_binom_v, (order_v+1)*sizeof(int));
-    cudaMemcpy(d_CP,bp->CP,num_cp*4*sizeof(float),cudaMemcpyHostToDevice);
-    cudaMemcpy(d_binom_u,binom_u,(order_u+1)*sizeof(int),cudaMemcpyHostToDevice);
-    cudaMemcpy(d_binom_v,binom_v,(order_v+1)*sizeof(int),cudaMemcpyHostToDevice);
+    float *d_CP=0, *d_V=0; int *d_binom_u=0, *d_binom_v=0;
     dim3 block(BLOCK_SIZE,BLOCK_SIZE);
     dim3 grid((nv+BLOCK_SIZE-1)/BLOCK_SIZE, (nu+BLOCK_SIZE-1)/BLOCK_SIZE);
     bool useTC = (order_u>=3 && order_v>=3);
+    cudaError_t e;
+    e=cudaMalloc(&d_CP, num_cp*4*sizeof(float));
+    if(e!=cudaSuccess){fprintf(stderr,"  [CUDA] cudaMalloc d_CP failed: %s\n",cudaGetErrorString(e));goto cleanup;}
+    e=cudaMalloc(&d_V, total*3*sizeof(float));
+    if(e!=cudaSuccess){fprintf(stderr,"  [CUDA] cudaMalloc d_V failed: %s\n",cudaGetErrorString(e));goto cleanup;}
+    e=cudaMalloc(&d_binom_u, (order_u+1)*sizeof(int));
+    if(e!=cudaSuccess){fprintf(stderr,"  [CUDA] cudaMalloc d_binom_u failed: %s\n",cudaGetErrorString(e));goto cleanup;}
+    e=cudaMalloc(&d_binom_v, (order_v+1)*sizeof(int));
+    if(e!=cudaSuccess){fprintf(stderr,"  [CUDA] cudaMalloc d_binom_v failed: %s\n",cudaGetErrorString(e));goto cleanup;}
+    e=cudaMemcpy(d_CP,bp->CP,num_cp*4*sizeof(float),cudaMemcpyHostToDevice);
+    if(e!=cudaSuccess){fprintf(stderr,"  [CUDA] cudaMemcpy H2D failed: %s\n",cudaGetErrorString(e));goto cleanup;}
+    e=cudaMemcpy(d_binom_u,binom_u,(order_u+1)*sizeof(int),cudaMemcpyHostToDevice);
+    e=cudaMemcpy(d_binom_v,binom_v,(order_v+1)*sizeof(int),cudaMemcpyHostToDevice);
     if (useTC)
         eval_surface_tc<<<grid,block>>>(d_CP,d_V,nu,nv,order_u,order_v,cols,d_binom_u,d_binom_v);
     else
         eval_surface<<<grid,block>>>(d_CP,d_V,nu,nv,order_u,order_v,cols,d_binom_u,d_binom_v);
-    cudaMemcpy(V_out,d_V,total*3*sizeof(float),cudaMemcpyDeviceToHost);
-    cudaFree(d_CP); cudaFree(d_V);
-    cudaFree(d_binom_u); cudaFree(d_binom_v);
+    e=cudaGetLastError();
+    if(e!=cudaSuccess) fprintf(stderr,"  [CUDA] kernel failed: %s\n",cudaGetErrorString(e));
+    e=cudaMemcpy(V_out,d_V,total*3*sizeof(float),cudaMemcpyDeviceToHost);
+    if(e!=cudaSuccess){fprintf(stderr,"  [CUDA] cudaMemcpy D2H failed: %s\n",cudaGetErrorString(e));memset(V_out,0,total*3*sizeof(float));}
+cleanup:
+    if(d_CP) cudaFree(d_CP); if(d_V) cudaFree(d_V);
+    if(d_binom_u) cudaFree(d_binom_u); if(d_binom_v) cudaFree(d_binom_v);
     free(binom_u); free(binom_v);
 }
