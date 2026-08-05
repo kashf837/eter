@@ -5,6 +5,8 @@
 
 #include <vector>
 #include <fstream>
+#include <filesystem>
+#include <algorithm>
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 #include <backends/imgui_impl_vulkan.h>
@@ -45,6 +47,90 @@ static std::vector<char> readFile(const std::string& fn) {
 struct MVP { glm::mat4 model, view, proj; float intensity, lightAz, lightEl; float _pad; };
 
 // ============================================================
+// Mesh — host-side triangle mesh data
+// ============================================================
+struct Mesh {
+    std::vector<float>    v;  // interleaved xyz + nxnynz (6 floats/vertex)
+    std::vector<uint32_t> i;  // triangle indices
+    float bbMin[3], bbMax[3];
+    bool   empty() const { return i.empty(); }
+    int    verts() const { return (int)(v.size()/6); }
+    float  scale() const { float dx=bbMax[0]-bbMin[0],dy=bbMax[1]-bbMin[1],dz=bbMax[2]-bbMin[2];
+                           float s=dx>dy?dx:dy; s=s>dz?s:dz; return s<1.f?1.f:s; }
+    float  cx() const { return (bbMin[0]+bbMax[0])*0.5f; }
+    float  cy() const { return (bbMin[1]+bbMax[1])*0.5f; }
+    float  cz() const { return (bbMin[2]+bbMax[2])*0.5f; }
+};
+
+// ============================================================
+// MeshBuilder — builds Mesh from .surf file(s)
+// ============================================================
+class MeshBuilder {
+public:
+    static Mesh single(const char* path, int res = 32) {
+        Mesh m; resetBBox(m);
+        int nu, nv;
+        float* verts = nurbs_wireframe(path, res, &nu, &nv);
+        if (!verts) { fprintf(stderr, "  [SKIP] %s\n", path); return m; }
+        addPatchGrid(m, verts, nu, nv, res);
+        free(verts);
+        LOGI("Loaded %s: %d verts, %d tris\n", path, m.verts(), (int)(m.i.size()/3));
+        return m;
+    }
+    static Mesh directory(const char* dirPath, int res = 8) {
+        namespace fs = std::filesystem;
+        Mesh m; resetBBox(m);
+        std::vector<std::string> files;
+        for (auto& e : fs::directory_iterator(dirPath))
+            if (e.path().extension() == ".surf") files.push_back(e.path().string());
+        std::sort(files.begin(), files.end());
+        LOGI("Loading %zu surf files (res=%d)...\n", files.size(), res);
+        int skipped = 0;
+        for (size_t i = 0; i < files.size(); i++) {
+            if ((i+1) % 500 == 0) LOGI("  [%zu/%zu] ...\n", i+1, files.size());
+            int nu, nv;
+            float* verts = nurbs_wireframe(files[i].c_str(), res, &nu, &nv);
+            if (!verts) { skipped++; continue; }
+            addPatchGrid(m, verts, nu, nv, res);
+            free(verts);
+        }
+        LOGI("Done: %d verts, %d tris, %d skipped\n", m.verts(), (int)(m.i.size()/3), skipped);
+        return m;
+    }
+private:
+    static void resetBBox(Mesh& m) {
+        m.bbMin[0]=m.bbMin[1]=m.bbMin[2]= 1e30f;
+        m.bbMax[0]=m.bbMax[1]=m.bbMax[2]=-1e30f;
+    }
+    static void addPatchGrid(Mesh& m, const float* verts, int nu, int nv, int res) {
+        for (int pi = 0; pi < nu; pi++)
+            for (int pj = 0; pj < nv; pj++) {
+                uint32_t base = (uint32_t)m.v.size() / 6;
+                const float* p = verts + (pi*nv+pj)*res*res*3;
+                for (int y = 0; y < res; y++)
+                    for (int x = 0; x < res; x++) {
+                        int idx = y*res+x;
+                        float px=p[idx*3+0], py=p[idx*3+1], pz=p[idx*3+2];
+                        m.v.insert(m.v.end(),{px,py,pz});
+                        if(px<m.bbMin[0])m.bbMin[0]=px; if(py<m.bbMin[1])m.bbMin[1]=py; if(pz<m.bbMin[2])m.bbMin[2]=pz;
+                        if(px>m.bbMax[0])m.bbMax[0]=px; if(py>m.bbMax[1])m.bbMax[1]=py; if(pz>m.bbMax[2])m.bbMax[2]=pz;
+                        int xR=(x+1<res)?x+1:x,xL=xR>0?xR-1:0, yD=(y+1<res)?y+1:y,yU=yD>0?yD-1:0;
+                        float du[3]={p[(y*res+xR)*3+0]-p[(y*res+xL)*3+0],p[(y*res+xR)*3+1]-p[(y*res+xL)*3+1],p[(y*res+xR)*3+2]-p[(y*res+xL)*3+2]};
+                        float dv[3]={p[(yD*res+x)*3+0]-p[(yU*res+x)*3+0],p[(yD*res+x)*3+1]-p[(yU*res+x)*3+1],p[(yD*res+x)*3+2]-p[(yU*res+x)*3+2]};
+                        float nx=du[1]*dv[2]-du[2]*dv[1], ny=du[2]*dv[0]-du[0]*dv[2], nz=du[0]*dv[1]-du[1]*dv[0];
+                        float inv=1.f/(sqrtf(nx*nx+ny*ny+nz*nz)+1e-10f);
+                        m.v.insert(m.v.end(),{nx*inv,ny*inv,nz*inv});
+                    }
+                for (int y = 0; y < res-1; y++)
+                    for (int x = 0; x < res-1; x++) {
+                        uint32_t a=base+y*res+x, b=a+1, c=a+res, d=c+1;
+                        m.i.insert(m.i.end(),{a,b,c, b,d,c});
+                    }
+            }
+    }
+};
+
+// ============================================================
 // NURBSRenderer — implements IAppElement, renders NURBS surface as 3D mesh
 // ============================================================
 // The nvpro_core2 framework uses a "plugin" architecture:
@@ -64,26 +150,25 @@ public:
   // ---- Expose camera so ElementCamera can control it ----
   auto getCamera() { return m_camera; }
 
-  // Reload mesh from a new surf file/directory
-  void doReload(const std::string& path) {
-    LOGI("doReload: %s\n", path.c_str());
+  // Reload mesh from a single file or directory (STEP temp)
+  void doReload(const std::string& path, bool isDir = false) {
+    LOGI("doReload: %s (dir=%d)\n", path.c_str(), isDir);
     NVVK_CHECK(vkDeviceWaitIdle(m_app->getDevice()));
     if (m_indexCount > 0) {
         m_alloc.destroyBuffer(m_indexBuffer);
         m_alloc.destroyBuffer(m_vertexBuffer);
         m_indexCount = 0;
     }
-    m_bbMin[0]=m_bbMin[1]=m_bbMin[2]=1e30f; m_bbMax[0]=m_bbMax[1]=m_bbMax[2]=-1e30f;
-    m_surfPath = path;
-    createMeshBuffers(m_app->getDevice(), m_surfPath.c_str());
-    if (m_indexCount > 0) {
-        float cx=(m_bbMin[0]+m_bbMax[0])*0.5f,cy=(m_bbMin[1]+m_bbMax[1])*0.5f,cz=(m_bbMin[2]+m_bbMax[2])*0.5f;
-        float dx=m_bbMax[0]-m_bbMin[0],dy=m_bbMax[1]-m_bbMin[1],dz=m_bbMax[2]-m_bbMin[2];
-        m_modelScale = fmaxf(fmaxf(dx,dy),dz); if(m_modelScale<1.f)m_modelScale=1.f;
-        float dist=m_modelScale*1.2f;
+    Mesh m = isDir ? MeshBuilder::directory(path.c_str()) : MeshBuilder::single(path.c_str());
+    if (!m.empty()) {
+        uploadMesh(m);
+        m_modelScale = m.scale();
+        float cx=m.cx(), cy=m.cy(), cz=m.cz(), dist=m_modelScale*1.2f;
         m_camera->setLookat({cx,cy,cz+dist},{cx,cy,cz},{0,-1,0});
         m_camera->setWindowSize({(uint32_t)m_imgW,(uint32_t)m_imgH});
+        LOGI("Camera: scale=%.1f dist=%.1f\n", m_modelScale, dist);
     }
+    if (isDir) std::filesystem::remove_all(path);
   }
 
   // ============================================================
@@ -110,20 +195,21 @@ public:
     createUniformBuffer(dev);
 
     // 5. Generate NURBS triangle mesh from .surf file (if path set)
-    if (!m_surfPath.empty())
-        createMeshBuffers(dev, m_surfPath.c_str());
+    if (!m_surfPath.empty()) {
+        Mesh m = MeshBuilder::single(m_surfPath.c_str());
+        if (!m.empty()) { uploadMesh(m); m_modelScale = m.scale(); }
+    }
 
     // 6. Register viewport image with ImGui (so onUIRender can display it)
     initViewportForImGui(dev);
 
     // 6b. Auto-fit camera to loaded model
-    { float cx=(m_bbMin[0]+m_bbMax[0])*0.5f,cy=(m_bbMin[1]+m_bbMax[1])*0.5f,cz=(m_bbMin[2]+m_bbMax[2])*0.5f;
-      float dx=m_bbMax[0]-m_bbMin[0],dy=m_bbMax[1]-m_bbMin[1],dz=m_bbMax[2]-m_bbMin[2];
-      m_modelScale = fmaxf(fmaxf(dx,dy),dz); if(m_modelScale<1.f)m_modelScale=1.f;
-      float dist=m_modelScale*1.2f;
-      m_camera->setLookat({cx,cy,cz+dist},{cx,cy,cz},{0,-1,0});
-      m_camera->setWindowSize({(uint32_t)m_imgW,(uint32_t)m_imgH});
-      LOGI("BBox x:[%.0f-%.0f] y:[%.0f-%.0f] z:[%.0f-%.0f] scale=%.0f dist=%.0f\n",m_bbMin[0],m_bbMax[0],m_bbMin[1],m_bbMax[1],m_bbMin[2],m_bbMax[2],m_modelScale,dist); }
+    if (m_indexCount > 0) {
+        float s = m_modelScale, dist = s*1.2f;
+        m_camera->setLookat({0,0,dist},{0,0,0},{0,-1,0});
+        m_camera->setWindowSize({(uint32_t)m_imgW,(uint32_t)m_imgH});
+        LOGI("Camera: scale=%.0f dist=%.0f\n", s, dist);
+    }
 
     // 7. Profiler
     m_profilerTimeline = m_info.profilerManager->createTimeline({"graphics"});
@@ -170,7 +256,7 @@ public:
   {
     // Process pending mesh reload (deferred from menu callback)
     if (!m_pendingLoad.empty()) {
-        doReload(m_pendingLoad);
+        doReload(m_pendingLoad, m_pendingIsDir);
         m_pendingLoad.clear();
         return;  // skip rendering this frame (buffers were recreated)
     }
@@ -283,9 +369,17 @@ public:
     bool vsync = m_app->isVsync();
     if (ImGui::BeginMenu("File")) {
         if (ImGui::MenuItem("Open...")) {
-            auto path = nvgui::windowOpenFileDialog(m_app->getWindowHandle(), "Open SURF file", "*.surf");
+            auto path = nvgui::windowOpenFileDialog(m_app->getWindowHandle(), "Open SURF / STEP", "*.surf;*.stp;*.step");
             if (!path.empty()) {
-                m_pendingLoad = path.string();
+                std::string sp = path.string();
+                if (sp.ends_with(".stp") || sp.ends_with(".step")) {
+                    auto stem = path.stem().string();
+                    m_tempDir = (path.parent_path() / (stem + "_parts")).string();
+                    std::filesystem::create_directory(m_tempDir);
+                    std::string cmd = "python scripts/step2surf.py --all \"" + sp + "\" \"" + m_tempDir + "/out\"";
+                    LOGI("Converting STEP...\n"); system(cmd.c_str());
+                    m_pendingLoad = m_tempDir; m_pendingIsDir = true;
+                } else { m_pendingLoad = sp; m_pendingIsDir = false; }
             }
         }
         if (ImGui::MenuItem("Exit", "Ctrl+Q")) m_app->close();
@@ -305,7 +399,9 @@ private:
   // ---- Framework ----
   Info                          m_info;
   std::string                   m_surfPath;
-  std::string                   m_pendingLoad;  // set by menu, processed next frame
+  std::string                   m_pendingLoad;
+  std::string                   m_tempDir;
+  bool                          m_pendingIsDir = false;  // set by menu, processed next frame
   float                         m_intensity = 1.0f;
   float                         m_lightAz   = 0.6f;   // azimuth (radians)
   float                         m_lightEl   = 0.8f;   // elevation (radians)
@@ -332,7 +428,6 @@ private:
   nvvk::Buffer m_vertexBuffer{};   // vertex positions (x,y,z per vertex)
   nvvk::Buffer m_indexBuffer{};    // triangle indices (3 x uint32_t per triangle)
   uint32_t     m_indexCount = 0;
-  float m_bbMin[3]={1e30f,1e30f,1e30f}, m_bbMax[3]={-1e30f,-1e30f,-1e30f};
   float m_modelScale = 1.0f;  // max dimension, for near/far auto-fit
 
   // ---- Graphics pipeline ----
@@ -524,57 +619,21 @@ private:
     vkUpdateDescriptorSets(dev, 1, &wds, 0, nullptr);
   }
 
-  // ---- Per-surface helper ----
-  void addSurf(const char* path, int res, std::vector<float>& vd, std::vector<uint32_t>& id) {
-    int np_u, np_v;
-    float* verts = nurbs_wireframe(path, res, &np_u, &np_v);
-    if (!verts) { printf("  [SKIP] nurbs_wireframe failed: %s\n", path); return; }
-    uint32_t vb = (uint32_t)(vd.size() / 6);
-    for (int pi=0; pi<np_u; pi++) for (int pj=0; pj<np_v; pj++) {
-        float* s = verts + (pi*np_v+pj)*res*res*3;
-        for (int y=0; y<res; y++) for (int x=0; x<res; x++) {
-            int i=y*res+x;
-            float px=s[i*3+0],py=s[i*3+1],pz=s[i*3+2];
-            vd.push_back(px);vd.push_back(py);vd.push_back(pz);
-            if(px<m_bbMin[0])m_bbMin[0]=px;if(py<m_bbMin[1])m_bbMin[1]=py;if(pz<m_bbMin[2])m_bbMin[2]=pz;
-            if(px>m_bbMax[0])m_bbMax[0]=px;if(py>m_bbMax[1])m_bbMax[1]=py;if(pz>m_bbMax[2])m_bbMax[2]=pz;
-            int xR=(x+1<res)?x+1:x,xL=xR>0?xR-1:0;
-            float du[3]={s[(y*res+xR)*3+0]-s[(y*res+xL)*3+0],s[(y*res+xR)*3+1]-s[(y*res+xL)*3+1],s[(y*res+xR)*3+2]-s[(y*res+xL)*3+2]};
-            int yD=(y+1<res)?y+1:y,yU=yD>0?yD-1:0;
-            float dv[3]={s[(yD*res+x)*3+0]-s[(yU*res+x)*3+0],s[(yD*res+x)*3+1]-s[(yU*res+x)*3+1],s[(yD*res+x)*3+2]-s[(yU*res+x)*3+2]};
-            float nx=du[1]*dv[2]-du[2]*dv[1],ny=du[2]*dv[0]-du[0]*dv[2],nz=du[0]*dv[1]-du[1]*dv[0];
-            float ln=sqrtf(nx*nx+ny*ny+nz*nz)+1e-10f;
-            vd.push_back(nx/ln);vd.push_back(ny/ln);vd.push_back(nz/ln);
-        }
-    }
-    for (int pi=0;pi<np_u;pi++) for (int pj=0;pj<np_v;pj++) {
-        uint32_t base=vb+(pi*np_v+pj)*res*res;
-        for (int y=0;y<res-1;y++) for (int x=0;x<res-1;x++) {
-            uint32_t a=base+y*res+x,b=a+1,c=a+res,d=c+1;
-            id.push_back(a);id.push_back(b);id.push_back(c);
-            id.push_back(b);id.push_back(d);id.push_back(c);
-        }
-    }
-    free(verts);
-  }
-
-  // Load a single .surf file and generate triangle mesh
-  void createMeshBuffers(VkDevice dev, const char* surfPath) {
-    std::vector<float> vd; std::vector<uint32_t> id;
-    addSurf(surfPath, 32, vd, id);  // res=32: high-quality sampling
-    m_indexCount=(uint32_t)id.size();
-    int tv=(int)(vd.size()/6);
-    VkDeviceSize vb=vd.size()*sizeof(float);
-    m_alloc.createBuffer(m_vertexBuffer,vb,VK_BUFFER_USAGE_VERTEX_BUFFER_BIT|VK_BUFFER_USAGE_TRANSFER_DST_BIT,VMA_MEMORY_USAGE_GPU_ONLY);
-    {void*p;NVVK_CHECK(m_stagingUploader.appendBufferMapping(m_vertexBuffer,0,vb,p));memcpy(p,vd.data(),vb);}
-    VkDeviceSize ib=id.size()*sizeof(uint32_t);
-    m_alloc.createBuffer(m_indexBuffer,ib,VK_BUFFER_USAGE_INDEX_BUFFER_BIT|VK_BUFFER_USAGE_TRANSFER_DST_BIT,VMA_MEMORY_USAGE_GPU_ONLY);
-    {void*p;NVVK_CHECK(m_stagingUploader.appendBufferMapping(m_indexBuffer,0,ib,p));memcpy(p,id.data(),ib);}
-    VkCommandBuffer c=m_app->createTempCmdBuffer();
+  // ---- Upload a Mesh to GPU ----
+  void uploadMesh(const Mesh& m) {
+    VkDevice dev = m_app->getDevice();
+    VkDeviceSize vsz = m.v.size() * sizeof(float);
+    m_alloc.createBuffer(m_vertexBuffer, vsz, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_GPU_ONLY);
+    { void* p; NVVK_CHECK(m_stagingUploader.appendBufferMapping(m_vertexBuffer, 0, vsz, p)); memcpy(p, m.v.data(), vsz); }
+    VkDeviceSize isz = m.i.size() * sizeof(uint32_t);
+    m_alloc.createBuffer(m_indexBuffer, isz, VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_GPU_ONLY);
+    { void* p; NVVK_CHECK(m_stagingUploader.appendBufferMapping(m_indexBuffer, 0, isz, p)); memcpy(p, m.i.data(), isz); }
+    VkCommandBuffer c = m_app->createTempCmdBuffer();
     m_stagingUploader.cmdUploadAppended(c);
     m_app->submitAndWaitTempCmdBuffer(c);
     m_stagingUploader.releaseStaging();
-    LOGI("Loaded %s: %d verts, %d tris\n",surfPath,tv,m_indexCount/3);
+    m_indexCount = (uint32_t)m.i.size();
+    LOGI("Uploaded: %d verts, %d tris\n", m.verts(), (int)(m.i.size()/3));
   }
   void initViewportForImGui(VkDevice dev) {
     VkCommandBuffer c = m_app->createTempCmdBuffer();
