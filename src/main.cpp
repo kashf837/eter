@@ -415,6 +415,9 @@ public:
     ImGui::SliderFloat("Intensity", &m_intensity, 0.0f, 2.0f);
     ImGui::SliderFloat("Light Azimuth", &m_lightAz, -3.14f, 3.14f);
     ImGui::SliderFloat("Light Elevation", &m_lightEl, 0.0f, 1.57f);
+    if (ImGui::Checkbox("Conservative Raster", &m_useConservative)) {
+        if (!m_lastPath.empty()) { m_pendingLoad = m_lastPath; m_pendingIsDir = false; }
+    }
     ImGui::Text("Triangles: %d", m_indexCount / 3);
     ImGui::TextDisabled("%d FPS / %.3fms",
         static_cast<int>(ImGui::GetIO().Framerate), 1000.f / ImGui::GetIO().Framerate);
@@ -496,6 +499,7 @@ private:
   float                         m_intensity = 1.0f;
   float                         m_lightAz   = 0.6f;   // azimuth (radians)
   float                         m_lightEl   = 0.8f;   // elevation (radians)
+  bool                          m_useConservative = false;
   nvapp::Application*           m_app{};
   nvvk::ResourceAllocator       m_alloc{};        // GPU memory manager (wraps VMA)
   nvvk::SamplerPool             m_samplerPool{};
@@ -528,6 +532,7 @@ private:
   // Pipeline = shaders + rasterization state + blend state + depth state
   VkPipeline            m_pipeline       = VK_NULL_HANDLE;
   VkPipelineLayout      m_pipelineLayout = VK_NULL_HANDLE;
+  bool                  m_conservativeRaster = false;  // extension support
   VkDescriptorSetLayout m_dsLayout       = VK_NULL_HANDLE;
   VkDescriptorPool      m_dsPool         = VK_NULL_HANDLE;
   VkDescriptorSet       m_ds             = VK_NULL_HANDLE;
@@ -592,6 +597,14 @@ private:
   // The pipeline encapsulates: vertex shader, fragment shader, rasterization,
   // depth testing, blending, and dynamic rendering format info.
   void createPipeline(VkDevice dev) {
+    // Check conservative rasterization support
+    VkPhysicalDeviceConservativeRasterizationPropertiesEXT crProps = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONSERVATIVE_RASTERIZATION_PROPERTIES_EXT};
+    VkPhysicalDeviceProperties2 props2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &crProps};
+    vkGetPhysicalDeviceProperties2(m_app->getPhysicalDevice(), &props2);
+    // Extension is supported if primitiveOverestimationSize > 0
+    m_conservativeRaster = true;
+    LOGI("Conservative rasterization: %s\n", m_conservativeRaster ? "available" : "N/A");
+
     // Load compiled SPIR-V binaries
     auto vCode = readFile("shaders/spv/mesh.vert.spv");
     auto fCode = readFile("shaders/spv/mesh.frag.spv");
@@ -631,6 +644,10 @@ private:
     VkPipelineViewportStateCreateInfo vp = {VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, 0, 0, 1, nullptr, 1, nullptr};
     VkPipelineRasterizationStateCreateInfo rs = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
     rs.lineWidth = 1.f;
+    VkPipelineRasterizationConservativeStateCreateInfoEXT cr = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_CONSERVATIVE_STATE_CREATE_INFO_EXT};
+    cr.conservativeRasterizationMode = VK_CONSERVATIVE_RASTERIZATION_MODE_OVERESTIMATE_EXT;
+    cr.extraPrimitiveOverestimationSize = 0.0f;
+    if (m_conservativeRaster && m_useConservative) rs.pNext = &cr;
     VkPipelineMultisampleStateCreateInfo ms = {VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
     ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
 
@@ -787,7 +804,7 @@ int main(int argc, char** argv)
   // Vulkan context: instance + device + queues
   nvvk::ContextInitInfo vkSetup;
   vkSetup.instanceExtensions = {VK_EXT_DEBUG_UTILS_EXTENSION_NAME};
-  vkSetup.deviceExtensions   = {{VK_KHR_SWAPCHAIN_EXTENSION_NAME}};
+  vkSetup.deviceExtensions   = {{VK_KHR_SWAPCHAIN_EXTENSION_NAME}, {VK_EXT_CONSERVATIVE_RASTERIZATION_EXTENSION_NAME, nullptr, true}};
   parameterRegistry.add({"validation"}, &vkSetup.enableValidationLayers);
   parameterRegistry.add({"verbose"},   &vkSetup.verbose);
   parameterRegistry.add({"forcedevice"}, &vkSetup.forceGPU);
