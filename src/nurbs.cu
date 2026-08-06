@@ -114,7 +114,7 @@ float* nurbs_wireframe(const char* surf_path, int res,
     int np_u = (s->n_u + 1) / ru, np_v = (s->n_v + 1) / rv;
     *np_u_out = np_u; *np_v_out = np_v;
 
-    float* verts = (float*)malloc(np_u * np_v * res * res * 3 * sizeof(float));
+    float* verts = (float*)malloc(np_u * np_v * res * res * 6 * sizeof(float));
     BezierPatch bp = {s->p_u, s->p_v, (float*)malloc(ru * rv * 4 * sizeof(float))};
 
     for (int pi = 0; pi < np_u; pi++) {
@@ -124,14 +124,14 @@ float* nurbs_wireframe(const char* surf_path, int res,
                     memcpy(&bp.CP[(i * rv + j) * 4],
                            s->Ps[pi * ru + i][pj * rv + j], 4 * sizeof(float));
 
-            float* pv = (float*)malloc(res * res * 3 * sizeof(float));
+            float* pv = (float*)malloc(res * res * 6 * sizeof(float));
             eval_bezier_patch(&bp, pv, res, res);
 
             // Transpose: GPU output is x-major, we need y-major
-            float* dst = verts + (pi * np_v + pj) * res * res * 3;
+            float* dst = verts + (pi * np_v + pj) * res * res * 6;
             for (int y = 0; y < res; y++)
                 for (int x = 0; x < res; x++)
-                    memcpy(&dst[(y * res + x) * 3], &pv[(x * res + y) * 3], 3 * sizeof(float));
+                    memcpy(&dst[(y * res + x) * 6], &pv[(x * res + y) * 6], 6 * sizeof(float));
             free(pv);
         }
     }

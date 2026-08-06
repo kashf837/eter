@@ -77,7 +77,7 @@ public:
         LOGI("Loaded %s: %d verts, %d tris\n", path, m.verts(), (int)(m.i.size()/3));
         return m;
     }
-    static Mesh directory(const char* dirPath, int res = 8) {
+    static Mesh directory(const char* dirPath, int res = 32) {
         namespace fs = std::filesystem;
         Mesh m; resetBBox(m);
         std::vector<std::string> files;
@@ -106,20 +106,25 @@ private:
         for (int pi = 0; pi < nu; pi++)
             for (int pj = 0; pj < nv; pj++) {
                 uint32_t base = (uint32_t)m.v.size() / 6;
-                const float* p = verts + (pi*nv+pj)*res*res*3;
+                const float* p = verts + (pi*nv+pj)*res*res*6;
                 for (int y = 0; y < res; y++)
                     for (int x = 0; x < res; x++) {
                         int idx = y*res+x;
-                        float px=p[idx*3+0], py=p[idx*3+1], pz=p[idx*3+2];
-                        m.v.insert(m.v.end(),{px,py,pz});
+                        float px=p[idx*6+0], py=p[idx*6+1], pz=p[idx*6+2];
+                        float gnx=p[idx*6+3], gny=p[idx*6+4], gnz=p[idx*6+5];
+                        float gnLen = gnx*gnx+gny*gny+gnz*gnz;
+                        if(gnLen < 1e-6f) {
+                            // CPU fallback (shared-memory kernel)
+                            int xR=(x+1<res)?x+1:x,xL=xR>0?xR-1:0, yD=(y+1<res)?y+1:y,yU=yD>0?yD-1:0;
+                            float du[3]={p[(y*res+xR)*6+0]-p[(y*res+xL)*6+0],p[(y*res+xR)*6+1]-p[(y*res+xL)*6+1],p[(y*res+xR)*6+2]-p[(y*res+xL)*6+2]};
+                            float dv[3]={p[(yD*res+x)*6+0]-p[(yU*res+x)*6+0],p[(yD*res+x)*6+1]-p[(yU*res+x)*6+1],p[(yD*res+x)*6+2]-p[(yU*res+x)*6+2]};
+                            gnx=du[1]*dv[2]-du[2]*dv[1]; gny=du[2]*dv[0]-du[0]*dv[2]; gnz=du[0]*dv[1]-du[1]*dv[0];
+                            gnLen = gnx*gnx+gny*gny+gnz*gnz;
+                        }
+                        float inv=1.f/(sqrtf(gnLen)+1e-10f);
+                        m.v.insert(m.v.end(),{px,py,pz, gnx*inv,gny*inv,gnz*inv});
                         if(px<m.bbMin[0])m.bbMin[0]=px; if(py<m.bbMin[1])m.bbMin[1]=py; if(pz<m.bbMin[2])m.bbMin[2]=pz;
                         if(px>m.bbMax[0])m.bbMax[0]=px; if(py>m.bbMax[1])m.bbMax[1]=py; if(pz>m.bbMax[2])m.bbMax[2]=pz;
-                        int xR=(x+1<res)?x+1:x,xL=xR>0?xR-1:0, yD=(y+1<res)?y+1:y,yU=yD>0?yD-1:0;
-                        float du[3]={p[(y*res+xR)*3+0]-p[(y*res+xL)*3+0],p[(y*res+xR)*3+1]-p[(y*res+xL)*3+1],p[(y*res+xR)*3+2]-p[(y*res+xL)*3+2]};
-                        float dv[3]={p[(yD*res+x)*3+0]-p[(yU*res+x)*3+0],p[(yD*res+x)*3+1]-p[(yU*res+x)*3+1],p[(yD*res+x)*3+2]-p[(yU*res+x)*3+2]};
-                        float nx=du[1]*dv[2]-du[2]*dv[1], ny=du[2]*dv[0]-du[0]*dv[2], nz=du[0]*dv[1]-du[1]*dv[0];
-                        float inv=1.f/(sqrtf(nx*nx+ny*ny+nz*nz)+1e-10f);
-                        m.v.insert(m.v.end(),{nx*inv,ny*inv,nz*inv});
                     }
                 for (int y = 0; y < res-1; y++)
                     for (int x = 0; x < res-1; x++) {

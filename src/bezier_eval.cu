@@ -46,114 +46,141 @@ __global__ void eval_surface(
             Sw[3] += w;
         }
     float inv = 1.f / Sw[3];
-    d_V[idx*3+0] = Sw[0]*inv; d_V[idx*3+1] = Sw[1]*inv; d_V[idx*3+2] = Sw[2]*inv;
+    d_V[idx*6+0] = Sw[0]*inv; d_V[idx*6+1] = Sw[1]*inv; d_V[idx*6+2] = Sw[2]*inv;
+    d_V[idx*6+3] = 0.f; d_V[idx*6+4] = 0.f; d_V[idx*6+5] = 0.f;  // sentinel: CPU fallback
 }
 
-// ---- Tensor Core kernel (ETER §5.1) ----
-// Step1: [B;B'](16xm)×C(mxn) → [T;Tu]
-// Step2: [T;Tu](16xn)×Bv(nx8) → [S; dS/du]
-// Step3: [T;0](16xn)×Bv'(nx8) → [dS/dv; 0]
+// ---- Tensor Core kernel (ETER §5.1, aligned to paper) ----
+// Paper uses m16n8k8 WMMA; our hardware (sm_89) supports m16n8k16.
+// K=16 means we pad m,n ≤ 8 to k=16 (acceptable overhead for degrees 3-7).
+//
+// Matrix definitions (m = order_u+1, n = order_v+1, both ≤ 8):
+//   A1 = [Bu; Bu']   : 16×m   (rows 0-7=Bu, rows 8-15=Bu')
+//   B1 = C_weighted   : m×n    (CP coords × w, one per component)
+//   C1 = [T; Tu]      : 16×n   (rows 0-7=T, rows 8-15=Tu)
+//   A2 = [T; Tu]      : 16×n   (reuse C1)
+//   B2 = Bv^T         : n×8    (Bernstein basis in v, transposed)
+//   C2 = [S; Su]      : 16×8   (positions + u-tangents)
+//   A3 = [T; 0]       : 8×n    (rows 0-7=T, rows 8-15=0)
+//   B3 = Bv'^T        : n×8    (derivative basis in v)
+//   C3 = [Sv; 0]      : 16×8   (v-tangents in rows 0-7)
+// Normal = cross(Su[ty], Sv[ty]) for each thread row ty.
 __global__ void eval_surface_tc(
     float* d_CP, float* d_V, int nu, int nv,
     int order_u, int order_v, int cols,
     int* d_binom_u, int* d_binom_v)
 {
-    int i = blockIdx.y * BLOCK_SIZE + threadIdx.y;
-    int j = blockIdx.x * BLOCK_SIZE + threadIdx.x;
+    int ty = threadIdx.y, tx = threadIdx.x;
+    int i = blockIdx.y * BLOCK_SIZE + ty;
+    int j = blockIdx.x * BLOCK_SIZE + tx;
     if (i >= nu || j >= nv) return;
     int idx = i * nv + j;
     float u = (float)i/(nu-1), v = (float)j/(nv-1);
     int m = order_u+1, n = order_v+1;
 
-    // Bernstein bases + derivatives
+    // ---- Shared: Bernstein bases + derivatives ----
     __shared__ float s_Bu[BLOCK_SIZE][MAX_ORDER+1];
     __shared__ float s_BuP[BLOCK_SIZE][MAX_ORDER+1];
     __shared__ float s_Bv[BLOCK_SIZE][MAX_ORDER+1];
     __shared__ float s_BvP[BLOCK_SIZE][MAX_ORDER+1];
 
-    if (threadIdx.x <= order_u) {
-        float b = (float)d_binom_u[threadIdx.x];
-        s_Bu[threadIdx.y][threadIdx.x] = powf(u,threadIdx.x)*powf(1.f-u,order_u-threadIdx.x)*b;
+    if (tx <= order_u) {
+        float b = (float)d_binom_u[tx];
+        s_Bu[ty][tx] = powf(u,tx)*powf(1.f-u,order_u-tx)*b;
     }
-    if (threadIdx.y <= order_v) {
-        float b = (float)d_binom_v[threadIdx.y];
-        s_Bv[threadIdx.x][threadIdx.y] = powf(v,threadIdx.y)*powf(1.f-v,order_v-threadIdx.y)*b;
-    }
-    // Compute derivatives: B'_k,p(t) = (k - p·t) / (t·(1-t)) * B_k,p(t)
-    // Simpler: B'_k,p = p*(B_{k-1,p-1} - B_{k,p-1}) using lower-order Bernstein
-    __syncthreads();
-    if (order_u > 0 && threadIdx.x <= order_u-1 && threadIdx.y < BLOCK_SIZE) {
-        int n1 = order_u-1;
-        int b1 = 1;
-        for (int k=1; k<=threadIdx.x; k++) b1 = b1*(n1-k+1)/k;
-        s_BuP[threadIdx.y][threadIdx.x] = order_u * b1 * powf(u,threadIdx.x)*powf(1.f-u,n1-threadIdx.x);
-    }
-    if (order_v > 0 && threadIdx.y <= order_v-1 && threadIdx.x < BLOCK_SIZE) {
-        int n1 = order_v-1;
-        int b1 = 1;
-        for (int k=1; k<=threadIdx.y; k++) b1 = b1*(n1-k+1)/k;
-        s_BvP[threadIdx.x][threadIdx.y] = order_v * b1 * powf(v,threadIdx.y)*powf(1.f-v,n1-threadIdx.y);
+    if (ty <= order_v) {
+        float b = (float)d_binom_v[ty];
+        s_Bv[tx][ty] = powf(v,ty)*powf(1.f-v,order_v-ty)*b;
     }
     __syncthreads();
 
-    __shared__ half  s_A[256];
-    __shared__ half  s_B[256];
-    __shared__ float s_C[256];
-    __shared__ float s_T[128]; // save Bu*C (rows 0-7) for step 3
-    bool warp0 = (threadIdx.y*BLOCK_SIZE+threadIdx.x) < 32;
+    // Derivatives: B'_{k,p}(t) = binom(p,k)*[k*t^{k-1}*(1-t)^{p-k} - (p-k)*t^k*(1-t)^{p-k-1}]
+    if (order_u > 0 && tx <= order_u) {
+        float k = (float)tx, p = (float)order_u;
+        float binom_pk = (float)d_binom_u[tx];
+        float t1 = (tx>0) ? k * powf(u,k-1.f) * powf(1.f-u, p-k) : 0.f;
+        float t2 = (tx<p) ? (p-k) * powf(u,k) * powf(1.f-u, p-k-1.f) : 0.f;
+        s_BuP[ty][tx] = binom_pk * (t1 - t2);
+    }
+    if (order_v > 0 && ty <= order_v) {
+        float k = (float)ty, p = (float)order_v;
+        float binom_pk = (float)d_binom_v[ty];
+        float t1 = (ty>0) ? k * powf(v,k-1.f) * powf(1.f-v, p-k) : 0.f;
+        float t2 = (ty<p) ? (p-k) * powf(v,k) * powf(1.f-v, p-k-1.f) : 0.f;
+        s_BvP[tx][ty] = binom_pk * (t1 - t2);
+    }
+    __syncthreads();
 
-    float pos[4]={0}, dSu[4]={0}, dSv[4]={0};
+    // ---- MMA scratchpad (shared mem reused across 4 components) ----
+    // m16n8k16: A=16×16half, B=16×8half, C=16×8float → stored in 16×16 for simplicity
+    __shared__ half  s_A[256];   // 16×16 half for A matrix
+    __shared__ half  s_B[256];   // 16×16 half for B matrix
+    __shared__ float s_C[256];   // 16×16 float for C accumulators
+    __shared__ float s_T[128];   // save T (first 8×n rows of MMA1 result)
+
+    bool warp0 = (ty*BLOCK_SIZE+tx) < 32;
+
+    float pos[4]={0}, su[4]={0}, sv[4]={0};
+
+    // Pad dimensions for m16n8k16: K=16, M=16, N=8
+    const int M = 16, N = 8, K = 16;
 
     for (int comp = 0; comp < 4; comp++) {
-        // ---- Build A = [Bu; Bu'](16xm) padded to 16x16 ----
-        for (int t = threadIdx.y*BLOCK_SIZE+threadIdx.x; t < 256; t += BLOCK_SIZE*BLOCK_SIZE) {
+
+        // ---- Build A = [Bu; Bu'] : 16×m, pad to 16×16 ----
+        for (int t = ty*BLOCK_SIZE+tx; t < 256; t += BLOCK_SIZE*BLOCK_SIZE) {
             int r = t/16, c = t%16;
             float val = 0;
-            if (c < m) {
-                if      (r < 8)                     val = s_Bu[r][c];
-                else if (r < 16 && r-8 < 8 && c <= order_u-1) val = s_BuP[r-8][c];
+            if (c <= order_u && r < 16) {
+                if (r < BLOCK_SIZE)            val = s_Bu[r][c];
+                else if (r >= BLOCK_SIZE && r-BLOCK_SIZE < BLOCK_SIZE)
+                    val = s_BuP[r-BLOCK_SIZE][c];
             }
             s_A[t] = __float2half(val);
         }
         __syncthreads();
 
-        // ---- Build B = C_weighted(mxn) padded to 16x16 ----
-        for (int t = threadIdx.y*BLOCK_SIZE+threadIdx.x; t < 256; t += BLOCK_SIZE*BLOCK_SIZE) {
+        // ---- Build B = C_weighted : m×n, pad to 16×8 ----
+        for (int t = ty*BLOCK_SIZE+tx; t < 256; t += BLOCK_SIZE*BLOCK_SIZE) {
             int r = t/16, c = t%16;
             float val = 0;
             if (r < m && c < n) {
-                float w = d_CP[(r*cols+c)*4+3];
-                val = (comp<3) ? w*d_CP[(r*cols+c)*4+comp] : w;
+                float cpw = d_CP[(r*cols+c)*4+3];
+                val = (comp < 3) ? cpw * d_CP[(r*cols+c)*4+comp] : cpw;
             }
             s_B[t] = __float2half(val);
         }
         __syncthreads();
 
-        // MMA1: [Bu;Bu'](16x16) * C(16x16) → [T;Tu](16x16)
+        // MMA1: [Bu;Bu'](16×16) × C_weighted(16×8) → [T;Tu](16×8)
         if (warp0) {
             wmma::fragment<wmma::matrix_a,16,16,16,half,wmma::row_major> a;
             wmma::fragment<wmma::matrix_b,16,16,16,half,wmma::row_major> b;
             wmma::fragment<wmma::accumulator,16,16,16,float> c;
-            wmma::fill_fragment(c,0);
-            wmma::load_matrix_sync(a,s_A,16); wmma::load_matrix_sync(b,s_B,16);
-            wmma::mma_sync(c,a,b,c);
-            wmma::store_matrix_sync(s_C,c,16,wmma::mem_row_major);
+            wmma::fill_fragment(c, 0);
+            wmma::load_matrix_sync(a, s_A, 16);
+            wmma::load_matrix_sync(b, s_B, 16);
+            wmma::mma_sync(c, a, b, c);
+            wmma::store_matrix_sync(s_C, c, 16, wmma::mem_row_major);
         }
         __syncthreads();
-        // Save T = Bu*C (first 8 rows) for step 3
-        for (int t = threadIdx.y*BLOCK_SIZE+threadIdx.x; t < 128; t += BLOCK_SIZE*BLOCK_SIZE)
+
+        // Save T = first 8 rows of MMA1 result for MMA3
+        for (int t = ty*BLOCK_SIZE+tx; t < 8*n; t += BLOCK_SIZE*BLOCK_SIZE)
             s_T[t] = s_C[t];
 
-        // ---- MMA2: [T;Tu] × Bv → [S; dS/du] ----
-        // Copy intermediate → A (float→half), rows 0-7=T, rows 8-15=Tu
-        for (int t = threadIdx.y*BLOCK_SIZE+threadIdx.x; t < 256; t += BLOCK_SIZE*BLOCK_SIZE)
-            s_A[t] = __float2half(s_C[t]);
+        // ---- MMA2: [T;Tu](16×n) × Bv^T(n×8) → [S;Su](16×8) ----
+        // A = [T;Tu] from s_C: rows 0-7=T, rows 8-15=Tu, cols 0..n-1
+        for (int t = ty*BLOCK_SIZE+tx; t < 256; t += BLOCK_SIZE*BLOCK_SIZE) {
+            int r = t/16, c = t%16;
+            s_A[t] = (r < 16 && c < n) ? __float2half(s_C[r*16+c]) : __float2half(0.f);
+        }
         __syncthreads();
 
-        // B = Bv^T (nx8 → 16x16 padded)
-        for (int t = threadIdx.y*BLOCK_SIZE+threadIdx.x; t < 256; t += BLOCK_SIZE*BLOCK_SIZE) {
+        // B = Bv^T : n×8 → pad to 16×8
+        for (int t = ty*BLOCK_SIZE+tx; t < 256; t += BLOCK_SIZE*BLOCK_SIZE) {
             int r = t/16, c = t%16;
-            s_B[t] = (c < BLOCK_SIZE && r < n) ? __float2half(s_Bv[c][r]) : __float2half(0.f);
+            s_B[t] = (r < n && c < BLOCK_SIZE) ? __float2half(s_Bv[c][r]) : __float2half(0.f);
         }
         __syncthreads();
 
@@ -161,29 +188,30 @@ __global__ void eval_surface_tc(
             wmma::fragment<wmma::matrix_a,16,16,16,half,wmma::row_major> a;
             wmma::fragment<wmma::matrix_b,16,16,16,half,wmma::row_major> b;
             wmma::fragment<wmma::accumulator,16,16,16,float> c;
-            wmma::fill_fragment(c,0);
-            wmma::load_matrix_sync(a,s_A,16); wmma::load_matrix_sync(b,s_B,16);
-            wmma::mma_sync(c,a,b,c);
-            wmma::store_matrix_sync(s_C,c,16,wmma::mem_row_major);
+            wmma::fill_fragment(c, 0);
+            wmma::load_matrix_sync(a, s_A, 16);
+            wmma::load_matrix_sync(b, s_B, 16);
+            wmma::mma_sync(c, a, b, c);
+            wmma::store_matrix_sync(s_C, c, 16, wmma::mem_row_major);
         }
         __syncthreads();
 
-        // pos from row threadIdx.y (T*Bv^T), dSu from row threadIdx.y+8 (Tu*Bv^T)
-        pos[comp] = s_C[threadIdx.y*16+threadIdx.x];
-        dSu[comp] = (threadIdx.y < BLOCK_SIZE) ? s_C[(8+threadIdx.y)*16+threadIdx.x] : 0;
+        // pos = S[ty] (row ty of S), su = Su[ty] (row ty+8)
+        pos[comp] = s_C[ty*16 + tx];
+        su[comp] = (ty < BLOCK_SIZE) ? s_C[(8+ty)*16 + tx] : 0;
 
-        // ---- MMA3: [T;0] × Bv' → [dS/dv; 0] ----
-        // Rebuild A: rows 0-7 = T (saved from MMA1), rows 8-15 = 0
-        for (int t = threadIdx.y*BLOCK_SIZE+threadIdx.x; t < 256; t += BLOCK_SIZE*BLOCK_SIZE) {
+        // ---- MMA3: [T;0](8×n) × Bv'^T(n×8) → [Sv;0](8×8) ----
+        // A = [T;0] : first 8 rows = T (saved), last 8 rows = 0
+        for (int t = ty*BLOCK_SIZE+tx; t < 256; t += BLOCK_SIZE*BLOCK_SIZE) {
             int r = t/16, c = t%16;
-            s_A[t] = (r < 8) ? __float2half(s_T[r*16+c]) : __float2half(0.f);
+            s_A[t] = (r < 8 && c < n) ? __float2half(s_T[r*16+c]) : __float2half(0.f);
         }
         __syncthreads();
 
-        // B = Bv'^T
-        for (int t = threadIdx.y*BLOCK_SIZE+threadIdx.x; t < 256; t += BLOCK_SIZE*BLOCK_SIZE) {
+        // B = Bv'^T : (order_v+1)×8
+        for (int t = ty*BLOCK_SIZE+tx; t < 256; t += BLOCK_SIZE*BLOCK_SIZE) {
             int r = t/16, c = t%16;
-            s_B[t] = (c < BLOCK_SIZE && r < n) ? __float2half(s_BvP[c][r]) : __float2half(0.f);
+            s_B[t] = (r <= order_v && c < BLOCK_SIZE) ? __float2half(s_BvP[c][r]) : __float2half(0.f);
         }
         __syncthreads();
 
@@ -191,21 +219,39 @@ __global__ void eval_surface_tc(
             wmma::fragment<wmma::matrix_a,16,16,16,half,wmma::row_major> a;
             wmma::fragment<wmma::matrix_b,16,16,16,half,wmma::row_major> b;
             wmma::fragment<wmma::accumulator,16,16,16,float> c;
-            wmma::fill_fragment(c,0);
-            wmma::load_matrix_sync(a,s_A,16); wmma::load_matrix_sync(b,s_B,16);
-            wmma::mma_sync(c,a,b,c);
-            wmma::store_matrix_sync(s_C,c,16,wmma::mem_row_major);
+            wmma::fill_fragment(c, 0);
+            wmma::load_matrix_sync(a, s_A, 16);
+            wmma::load_matrix_sync(b, s_B, 16);
+            wmma::mma_sync(c, a, b, c);
+            wmma::store_matrix_sync(s_C, c, 16, wmma::mem_row_major);
         }
         __syncthreads();
 
-        dSv[comp] = s_C[threadIdx.y*16+threadIdx.x];
+        sv[comp] = s_C[ty*16 + tx];
     }
 
-    // Perspective division
-    float iw = 1.f/(pos[3]+1e-10f);
-    d_V[idx*3+0] = pos[0]*iw;
-    d_V[idx*3+1] = pos[1]*iw;
-    d_V[idx*3+2] = pos[2]*iw;
+    // ---- Perspective division ----
+    float iw = 1.f / (pos[3] + 1e-10f);
+    float Px = pos[0]*iw, Py = pos[1]*iw, Pz = pos[2]*iw;
+    float Sux = su[0]*iw, Suy = su[1]*iw, Suz = su[2]*iw;
+    float Svx = sv[0]*iw, Svy = sv[1]*iw, Svz = sv[2]*iw;
+
+    // Quotient-rule tangents: T_u = (S_u*w - S*w_u) / w², dir preserved
+    float w = pos[3];
+    float Tux = su[0]*w - pos[0]*su[3];
+    float Tuy = su[1]*w - pos[1]*su[3];
+    float Tuz = su[2]*w - pos[2]*su[3];
+    float Tvx = sv[0]*w - pos[0]*sv[3];
+    float Tvy = sv[1]*w - pos[1]*sv[3];
+    float Tvz = sv[2]*w - pos[2]*sv[3];
+    // Cross product
+    float nx = Tuy*Tvz - Tuz*Tvy;
+    float ny = Tuz*Tvx - Tux*Tvz;
+    float nz = Tux*Tvy - Tuy*Tvx;
+    float il = 1.f / (sqrtf(nx*nx+ny*ny+nz*nz) + 1e-10f);
+
+    d_V[idx*6+0] = Px;     d_V[idx*6+1] = Py;     d_V[idx*6+2] = Pz;
+    d_V[idx*6+3] = nx*il;  d_V[idx*6+4] = ny*il;  d_V[idx*6+5] = nz*il;
 }
 
 void eval_bezier_patch(BezierPatch* bp, float* V_out, int nu, int nv) {
@@ -221,7 +267,7 @@ void eval_bezier_patch(BezierPatch* bp, float* V_out, int nu, int nv) {
     cudaError_t e;
     e=cudaMalloc(&d_CP, num_cp*4*sizeof(float));
     if(e!=cudaSuccess){fprintf(stderr,"  [CUDA] cudaMalloc d_CP failed: %s\n",cudaGetErrorString(e));goto cleanup;}
-    e=cudaMalloc(&d_V, total*3*sizeof(float));
+    e=cudaMalloc(&d_V, total*6*sizeof(float));
     if(e!=cudaSuccess){fprintf(stderr,"  [CUDA] cudaMalloc d_V failed: %s\n",cudaGetErrorString(e));goto cleanup;}
     e=cudaMalloc(&d_binom_u, (order_u+1)*sizeof(int));
     if(e!=cudaSuccess){fprintf(stderr,"  [CUDA] cudaMalloc d_binom_u failed: %s\n",cudaGetErrorString(e));goto cleanup;}
@@ -237,8 +283,8 @@ void eval_bezier_patch(BezierPatch* bp, float* V_out, int nu, int nv) {
         eval_surface<<<grid,block>>>(d_CP,d_V,nu,nv,order_u,order_v,cols,d_binom_u,d_binom_v);
     e=cudaGetLastError();
     if(e!=cudaSuccess) fprintf(stderr,"  [CUDA] kernel failed: %s\n",cudaGetErrorString(e));
-    e=cudaMemcpy(V_out,d_V,total*3*sizeof(float),cudaMemcpyDeviceToHost);
-    if(e!=cudaSuccess){fprintf(stderr,"  [CUDA] cudaMemcpy D2H failed: %s\n",cudaGetErrorString(e));memset(V_out,0,total*3*sizeof(float));}
+    e=cudaMemcpy(V_out,d_V,total*6*sizeof(float),cudaMemcpyDeviceToHost);
+    if(e!=cudaSuccess){fprintf(stderr,"  [CUDA] cudaMemcpy D2H failed: %s\n",cudaGetErrorString(e));memset(V_out,0,total*6*sizeof(float));}
 cleanup:
     if(d_CP) cudaFree(d_CP); if(d_V) cudaFree(d_V);
     if(d_binom_u) cudaFree(d_binom_u); if(d_binom_v) cudaFree(d_binom_v);
