@@ -24,10 +24,9 @@ __global__ void eval_surface(
 {
     int i = blockIdx.y * BLOCK_SIZE + threadIdx.y;
     int j = blockIdx.x * BLOCK_SIZE + threadIdx.x;
-    bool valid = (i < nu && j < nv);
-    float u = valid ? (float)i/(nu-1) : 0.5f;
-    float v = valid ? (float)j/(nv-1) : 0.5f;
-    int idx = valid ? i*nv+j : 0;
+    if (i >= nu || j >= nv) return;
+    int idx = i * nv + j;
+    float u = (float)i/(nu-1), v = (float)j/(nv-1);
 
     __shared__ float s_Bu[BLOCK_SIZE][MAX_ORDER + 1];
     __shared__ float s_Bv[BLOCK_SIZE][MAX_ORDER + 1];
@@ -37,8 +36,6 @@ __global__ void eval_surface(
     if (threadIdx.y <= order_v)
         s_Bv[threadIdx.x][threadIdx.y] = powf(v, threadIdx.y)*powf(1.f-v, order_v-threadIdx.y)*(float)d_binom_v[threadIdx.y];
     __syncthreads();
-
-    if (!valid) return;
 
     float Sw[4] = {0};
     for (int ii = 0; ii <= order_u; ii++)
@@ -81,6 +78,7 @@ __global__ void eval_surface_tc(
     int ty = threadIdx.y, tx = threadIdx.x;
     int i = blockIdx.y * BLOCK_SIZE + ty;
     int j = blockIdx.x * BLOCK_SIZE + tx;
+    if (i >= nu || j >= nv) return;
     int idx = i * nv + j;
     float u = (float)i/(nu-1), v = (float)j/(nv-1);
     int m = order_u+1, n = order_v+1;
@@ -117,8 +115,6 @@ __global__ void eval_surface_tc(
         s_BvP[tx][ty] = binom_pk * (t1 - t2);
     }
     __syncthreads();
-
-    if (i >= nu || j >= nv) return;  // after __syncthreads to avoid UB
 
     // ---- MMA scratchpad ----
     __shared__ half  s_A[256];   // A matrix (16×16 half)

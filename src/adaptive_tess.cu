@@ -18,14 +18,17 @@ float compute_epsilon(BezierPatch* bp, const CameraParams* cam) {
             float w  = bp->CP[(i * cols + j) * 4 + 3];
 
             float x = xw / w, y = yw / w, z = zw / w;
-            float cx = x - cam->camX;
-            float cy = y - cam->camY;
-            float cz = z - cam->camZ;
-            if (cz < 0.01f) cz = 0.01f;
+            // Use actual distance from camera, not camera-space z
+            float dx = x - cam->camX;
+            float dy = y - cam->camY;
+            float dz = z - cam->camZ;
+            float dist = sqrtf(dx*dx + dy*dy + dz*dz);
+            if (dist < 0.01f) dist = 0.01f;
 
-            if (cz < z_min) z_min = cz;
-            float axz = fabsf(cx / cz);
-            float ayz = fabsf(cy / cz);
+            // Project onto view direction (approximate: use min distance as z_min)
+            if (dist < z_min) z_min = dist;
+            float axz = fabsf(dx) / dist;
+            float ayz = fabsf(dy) / dist;
             if (axz > xz_max) xz_max = axz;
             if (ayz > yz_max) yz_max = ayz;
         }
@@ -103,11 +106,11 @@ void compute_tess_factors(BezierPatch* bp, float eps, int* tu, int* tv) {
     *tv = (int)ceilf(1.0f / delta_v);
 }
 
-// ========== §4.2: Scale to (7p+1)x(7q+1) for meshlets ==========
+// ========== §4.2: Round to multiples of BLOCK_SIZE (8) ==========
+// Paper uses (7p+1) for meshlet compatibility; we round to 8x for
+// clean GPU grid coverage (avoids __syncthreads UB on non-multiples).
 
 void adapt_tess_factors(int* tu, int* tv) {
-    int p = (*tu + 6) / 7;  if (p < 1) p = 1;
-    int q = (*tv + 6) / 7;  if (q < 1) q = 1;
-    *tu = 7 * p + 1;
-    *tv = 7 * q + 1;
+    *tu = ((*tu + 7) / 8) * 8;  if (*tu < 8) *tu = 8; if (*tu > 64) *tu = 64;
+    *tv = ((*tv + 7) / 8) * 8;  if (*tv < 8) *tv = 8; if (*tv > 64) *tv = 64;
 }

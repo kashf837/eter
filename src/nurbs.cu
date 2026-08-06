@@ -129,20 +129,27 @@ float* nurbs_wireframe(const char* surf_path, int res,
 }
 
 // ============================================================
-// Global adaptive resolution (ETER §4)
+// Per-patch adaptive evaluation (ETER §4)
 // ============================================================
 
-int compute_adaptive_res(const char* surf_path, const CameraParams* cam) {
+float* nurbs_adaptive_eval(const char* surf_path, const CameraParams* cam,
+                           int* np_u, int* np_v, PatchInfo** info_out, int* total_verts)
+{
     NurbsSurf* s = read_surf(surf_path);
-    if (!s) return 32;
+    if (!s) return NULL;
 
     nurbs_to_beziers(s);
 
     int ru = s->p_u + 1, rv = s->p_v + 1;
     int nu = (s->n_u + 1) / ru, nv = (s->n_v + 1) / rv;
-    BezierPatch bp = {s->p_u, s->p_v, (float*)malloc(ru * rv * 4 * sizeof(float))};
-    int g_tu = 8, g_tv = 8;
+    *np_u = nu; *np_v = nv;
+    int np = nu * nv;
 
+    PatchInfo* info = (PatchInfo*)malloc(np * sizeof(PatchInfo));
+    BezierPatch bp = {s->p_u, s->p_v, (float*)malloc(ru * rv * 4 * sizeof(float))};
+    int offset = 0;
+
+    // First pass: compute tess factors and offsets
     for (int i = 0; i < nu; i++) {
         for (int j = 0; j < nv; j++) {
             for (int ii = 0; ii < ru; ii++)
@@ -156,6 +163,78 @@ int compute_adaptive_res(const char* surf_path, const CameraParams* cam) {
             adapt_tess_factors(&tu, &tv);
             if (tu < 2) tu = 2; if (tv < 2) tv = 2;
             if (tu > 64) tu = 64; if (tv > 64) tv = 64;
+
+            int idx = i*nv+j;
+            info[idx].tu = tu; info[idx].tv = tv; info[idx].offset = offset;
+            offset += tu * tv;
+        }
+    }
+
+    // Second pass: evaluate each patch at its own resolution
+    float* verts = (float*)malloc(offset * 6 * sizeof(float));
+
+    for (int i = 0; i < nu; i++) {
+        for (int j = 0; j < nv; j++) {
+            for (int ii = 0; ii < ru; ii++)
+                for (int jj = 0; jj < rv; jj++)
+                    memcpy(&bp.CP[(ii*rv+jj)*4],
+                           s->Ps[i*ru+ii][j*rv+jj], 4*sizeof(float));
+
+            int idx = i*nv+j;
+            int tu = info[idx].tu, tv = info[idx].tv;
+            float* pv = (float*)malloc(tu * tv * 6 * sizeof(float));
+            eval_bezier_patch(&bp, pv, tu, tv);
+
+            float* dst = verts + info[idx].offset * 6;
+            for (int y = 0; y < tv; y++)
+                for (int x = 0; x < tu; x++)
+                    memcpy(&dst[(y*tu+x)*6], &pv[(x*tv+y)*6], 6*sizeof(float));
+            free(pv);
+        }
+    }
+
+    free(bp.CP);
+    free_surf(s);
+    *info_out = info;
+    *total_verts = offset;
+
+    int tu_min=999,tu_max=0,tv_min=999,tv_max=0;
+    for(int k=0;k<np;k++){if(info[k].tu<tu_min)tu_min=info[k].tu;if(info[k].tu>tu_max)tu_max=info[k].tu;if(info[k].tv<tv_min)tv_min=info[k].tv;if(info[k].tv>tv_max)tv_max=info[k].tv;}
+    printf("  [ADAPT] %dx%d patches, tu=[%d,%d] tv=[%d,%d] total=%d verts\n",
+           nu, nv, tu_min, tu_max, tv_min, tv_max, offset);
+    return verts;
+}
+
+// ============================================================
+// Global adaptive resolution (ETER §4)
+// ============================================================
+
+int compute_adaptive_res(const char* surf_path, const CameraParams* cam) {
+    NurbsSurf* s = read_surf(surf_path);
+    if (!s) return 32;
+
+    nurbs_to_beziers(s);
+
+    int ru = s->p_u + 1, rv = s->p_v + 1;
+    int nu = (s->n_u + 1) / ru, nv = (s->n_v + 1) / rv;
+    BezierPatch bp = {s->p_u, s->p_v, (float*)malloc(ru * rv * 4 * sizeof(float))};
+    int g_tu = 8, g_tv = 8;
+    float worst_eps = 0; int raw_tu = 0, raw_tv = 0;
+
+    for (int i = 0; i < nu; i++) {
+        for (int j = 0; j < nv; j++) {
+            for (int ii = 0; ii < ru; ii++)
+                for (int jj = 0; jj < rv; jj++)
+                    memcpy(&bp.CP[(ii*rv+jj)*4],
+                           s->Ps[i*ru+ii][j*rv+jj], 4*sizeof(float));
+
+            float eps = compute_epsilon(&bp, cam);
+            int tu = 0, tv = 0;
+            compute_tess_factors(&bp, eps, &tu, &tv);
+            if (eps < worst_eps || worst_eps == 0) { worst_eps = eps; raw_tu = tu; raw_tv = tv; }
+            adapt_tess_factors(&tu, &tv);
+            if (tu < 2) tu = 2; if (tv < 2) tv = 2;
+            if (tu > 64) tu = 64; if (tv > 64) tv = 64;
             if (tu > g_tu) g_tu = tu;
             if (tv > g_tv) g_tv = tv;
         }
@@ -164,7 +243,7 @@ int compute_adaptive_res(const char* surf_path, const CameraParams* cam) {
     free_surf(s);
 
     int res = (g_tu > g_tv) ? g_tu : g_tv;
-    printf("  [ADAPT] %s: %dx%d patches, max tu=%d tv=%d -> res=%d\n",
-           surf_path, nu, nv, g_tu, g_tv, res);
+    printf("  [ADAPT] eye=(%.1f,%.1f,%.1f) eps=%.6f raw=(%d,%d) -> res=%d\n",
+           cam->camX, cam->camY, cam->camZ, worst_eps, raw_tu, raw_tv, res);
     return res;
 }

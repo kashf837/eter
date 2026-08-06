@@ -67,6 +67,47 @@ struct Mesh {
 // ============================================================
 class MeshBuilder {
 public:
+    static Mesh adaptive(const char* path, const CameraParams* cam) {
+        Mesh m; resetBBox(m);
+        int nu, nv, total;
+        PatchInfo* info;
+        float* verts = nurbs_adaptive_eval(path, cam, &nu, &nv, &info, &total);
+        if (!verts) { fprintf(stderr, "  [SKIP] %s\n", path); return m; }
+        for (int pi = 0; pi < nu; pi++)
+            for (int pj = 0; pj < nv; pj++) {
+                PatchInfo* p = &info[pi*nv+pj];
+                float* patch = verts + p->offset * 6;
+                uint32_t base = (uint32_t)m.v.size() / 6;
+                for (int y = 0; y < p->tv; y++)
+                    for (int x = 0; x < p->tu; x++) {
+                        int k = y*p->tu + x;
+                        float px=patch[k*6+0], py=patch[k*6+1], pz=patch[k*6+2];
+                        float nx=patch[k*6+3], ny=patch[k*6+4], nz=patch[k*6+5];
+                        float nl=nx*nx+ny*ny+nz*nz;
+                        if (nl < 1e-6f) {
+                            int xR=(x+1<p->tu)?x+1:x, xL=xR>0?xR-1:0;
+                            int yD=(y+1<p->tv)?y+1:y, yU=yD>0?yD-1:0;
+                            float du[3]={patch[(y*p->tu+xR)*6+0]-patch[(y*p->tu+xL)*6+0],patch[(y*p->tu+xR)*6+1]-patch[(y*p->tu+xL)*6+1],patch[(y*p->tu+xR)*6+2]-patch[(y*p->tu+xL)*6+2]};
+                            float dv[3]={patch[(yD*p->tu+x)*6+0]-patch[(yU*p->tu+x)*6+0],patch[(yD*p->tu+x)*6+1]-patch[(yU*p->tu+x)*6+1],patch[(yD*p->tu+x)*6+2]-patch[(yU*p->tu+x)*6+2]};
+                            nx=du[1]*dv[2]-du[2]*dv[1];ny=du[2]*dv[0]-du[0]*dv[2];nz=du[0]*dv[1]-du[1]*dv[0];
+                            nl=nx*nx+ny*ny+nz*nz;
+                        }
+                        float inv=1.f/(sqrtf(nl)+1e-10f);
+                        m.v.insert(m.v.end(),{px,py,pz,nx*inv,ny*inv,nz*inv});
+                        if(px<m.bbMin[0])m.bbMin[0]=px;if(py<m.bbMin[1])m.bbMin[1]=py;if(pz<m.bbMin[2])m.bbMin[2]=pz;
+                        if(px>m.bbMax[0])m.bbMax[0]=px;if(py>m.bbMax[1])m.bbMax[1]=py;if(pz>m.bbMax[2])m.bbMax[2]=pz;
+                    }
+                for (int y = 0; y < p->tv-1; y++)
+                    for (int x = 0; x < p->tu-1; x++) {
+                        uint32_t a=base+y*p->tu+x, b=a+1, c=a+p->tu, d=c+1;
+                        m.i.insert(m.i.end(),{a,b,c,b,d,c});
+                    }
+            }
+        free(verts); free(info);
+        LOGI("Adaptive %s: %d verts, %d tris\n", path, m.verts(), (int)(m.i.size()/3));
+        return m;
+    }
+
     static Mesh single(const char* path, int res = 32) {
         Mesh m; resetBBox(m);
         int nu, nv;
@@ -172,13 +213,7 @@ public:
         if (eye.x > 5.f || eye.x < -5.f) eye = {0.f, 0.f, -2.f};
         cam.camX=(float)eye.x; cam.camY=(float)eye.y; cam.camZ=(float)eye.z;
         cam.fovY=60.f; cam.scrW=m_imgW; cam.scrH=m_imgH;
-        int res = compute_adaptive_res(path.c_str(), &cam);
-        // Snap to nearest power-of-2 multiple of 8 (GPU kernel limitation)
-        if (res <= 8) res = 8;
-        else if (res <= 16) res = 16;
-        else if (res <= 32) res = 32;
-        else res = 64;
-        m = MeshBuilder::single(path.c_str(), res);
+        m = MeshBuilder::adaptive(path.c_str(), &cam);
     }
 
     if (!m.empty()) {
@@ -191,6 +226,9 @@ public:
         m_camera->setWindowSize({(uint32_t)m_imgW,(uint32_t)m_imgH});
         LOGI("Camera: center=(%.1f,%.1f,%.1f) scale=%.1f dist=%.1f\n",
              m_center[0],m_center[1],m_center[2],m_modelScale,dist);
+      glm::dvec3 e = m_camera->getEye();
+      m_lastEye[0]=(float)e.x; m_lastEye[1]=(float)e.y; m_lastEye[2]=(float)e.z;
+      m_lastPath = path;
     }
     if (isDir) std::filesystem::remove_all(path);
   }
@@ -389,7 +427,30 @@ public:
     ImGui::End();
   }
 
-  void onPreRender() override { m_profilerTimeline->frameAdvance(); }
+  void onPreRender() override {
+    m_profilerTimeline->frameAdvance();
+    // Check if camera moved enough to re-tessellate
+    if (!m_lastPath.empty() && m_indexCount > 0) {
+        glm::dvec3 e = m_camera->getEye();
+        float dx=(float)e.x-m_lastEye[0], dy=(float)e.y-m_lastEye[1], dz=(float)e.z-m_lastEye[2];
+        float dist = sqrtf(dx*dx+dy*dy+dz*dz);
+        if (dist > m_modelScale * 0.2f) {  // moved >20% of model size
+            CameraParams cam;
+            cam.camX=(float)e.x; cam.camY=(float)e.y; cam.camZ=(float)e.z;
+            cam.fovY=60.f; cam.scrW=m_imgW; cam.scrH=m_imgH;
+            int res = compute_adaptive_res(m_lastPath.c_str(), &cam);
+            Mesh m = MeshBuilder::single(m_lastPath.c_str(), res);
+            if (!m.empty()) {
+                if (m_indexCount > 0) { m_alloc.destroyBuffer(m_indexBuffer); m_alloc.destroyBuffer(m_vertexBuffer); m_indexCount = 0; }
+                uploadMesh(m);
+                m_modelScale = m.scale();
+                m_center[0]=m.cx(); m_center[1]=m.cy(); m_center[2]=m.cz();
+                m_lastEye[0]=(float)e.x; m_lastEye[1]=(float)e.y; m_lastEye[2]=(float)e.z;
+                LOGI("[Adaptive] camera moved, res=%d\n", res);
+            }
+        }
+    }
+  }
 
   // ============================================================
   // onUIMenu — menu bar (File / View)
@@ -458,8 +519,10 @@ private:
   nvvk::Buffer m_vertexBuffer{};   // vertex positions (x,y,z per vertex)
   nvvk::Buffer m_indexBuffer{};    // triangle indices (3 x uint32_t per triangle)
   uint32_t     m_indexCount = 0;
-  float m_modelScale = 1.0f;  // max dimension, for near/far auto-fit
-  float m_center[3] = {0,0,0};  // model center, for camera lookat
+  float m_modelScale = 1.0f;
+  float m_center[3] = {0,0,0};
+  float m_lastEye[3] = {0,0,0};
+  std::string m_lastPath;
 
   // ---- Graphics pipeline ----
   // Pipeline = shaders + rasterization state + blend state + depth state
@@ -650,7 +713,6 @@ private:
     vkUpdateDescriptorSets(dev, 1, &wds, 0, nullptr);
   }
 
-  // ---- Upload a Mesh to GPU ----
   void uploadMesh(const Mesh& m) {
     VkDevice dev = m_app->getDevice();
     VkDeviceSize vsz = m.v.size() * sizeof(float);
