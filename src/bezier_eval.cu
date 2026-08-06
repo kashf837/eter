@@ -10,7 +10,7 @@ using namespace nvcuda;
 #define BLOCK_SIZE 8
 #define MAX_ORDER 7
 
-void compute_binom(int order, int* binom) {
+static void compute_binom(int order, int* binom) {
     binom[0] = 1;
     for (int k = 1; k <= order; k++)
         binom[k] = binom[k - 1] * (order - k + 1) / k;
@@ -127,7 +127,6 @@ __global__ void eval_surface_tc(
     float pos[4]={0}, su[4]={0}, sv[4]={0};
 
     // Pad dimensions for m16n8k16: K=16, M=16, N=8
-    const int M = 16, N = 8, K = 16;
 
     for (int comp = 0; comp < 4; comp++) {
 
@@ -238,8 +237,6 @@ __global__ void eval_surface_tc(
     // ---- Perspective division ----
     float iw = 1.f / (pos[3] + 1e-10f);
     float Px = pos[0]*iw, Py = pos[1]*iw, Pz = pos[2]*iw;
-    float Sux = su[0]*iw, Suy = su[1]*iw, Suz = su[2]*iw;
-    float Svx = sv[0]*iw, Svy = sv[1]*iw, Svz = sv[2]*iw;
 
     // Quotient-rule tangents: T_u = (S_u*w - S*w_u) / w², dir preserved
     float w = pos[3];

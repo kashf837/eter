@@ -9,7 +9,4 @@
 // nu, nv: sampling grid resolution (u-direction, v-direction)
 void eval_bezier_patch(BezierPatch* bp, float* V_out, int nu, int nv);
 
-// Compute binomial coefficients
-void compute_binom(int order, int* binom);
-
 #endif

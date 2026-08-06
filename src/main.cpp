@@ -3,6 +3,7 @@
 //              → Vulkan triangle mesh → dynamic rendering → ImGui display
 #define VMA_IMPLEMENTATION
 
+#pragma region Includes
 #include <vector>
 #include <fstream>
 #include <filesystem>
@@ -15,19 +16,18 @@
 #include <nvapp/application.hpp>
 #include <nvapp/elem_profiler.hpp>
 #include <nvapp/elem_logger.hpp>
-#include <nvapp/elem_default_menu.hpp>
 #include <nvapp/elem_camera.hpp>
 #include <nvgui/file_dialog.hpp>
 #include <nvutils/logger.hpp>
 #include <nvvk/check_error.hpp>
 #include <nvvk/context.hpp>
-#include <nvvk/debug_util.hpp>
 #include <nvvk/default_structs.hpp>
 #include <nvvk/resource_allocator.hpp>
 #include <nvvk/sampler_pool.hpp>
 #include <nvvk/staging.hpp>
 #include <nvvk/profiler_vk.hpp>
 #include <nvutils/parameter_parser.hpp>
+#pragma endregion
 
 // ============================================================
 // Utilities
@@ -67,6 +67,7 @@ struct Mesh {
 // ============================================================
 class MeshBuilder {
 public:
+
     static Mesh adaptive(const char* path, const CameraParams* cam) {
         Mesh m; resetBBox(m);
         int nu, nv, total;
@@ -118,6 +119,7 @@ public:
         LOGI("Loaded %s: %d verts, %d tris\n", path, m.verts(), (int)(m.i.size()/3));
         return m;
     }
+
     static Mesh directory(const char* dirPath, int res = 32) {
         namespace fs = std::filesystem;
         Mesh m; resetBBox(m);
@@ -139,10 +141,12 @@ public:
         return m;
     }
 private:
+
     static void resetBBox(Mesh& m) {
         m.bbMin[0]=m.bbMin[1]=m.bbMin[2]= 1e30f;
         m.bbMax[0]=m.bbMax[1]=m.bbMax[2]=-1e30f;
     }
+
     static void addPatchGrid(Mesh& m, const float* verts, int nu, int nv, int res) {
         for (int pi = 0; pi < nu; pi++)
             for (int pj = 0; pj < nv; pj++) {
@@ -256,17 +260,7 @@ public:
     // 4. Upload MVP matrix (updated per-frame by camera)
     createUniformBuffer(dev);
 
-    // 5. Generate NURBS triangle mesh from .surf file (if path set)
-    if (!m_surfPath.empty()) {
-        Mesh m = MeshBuilder::single(m_surfPath.c_str());
-        if (!m.empty()) {
-            uploadMesh(m);
-            m_modelScale = m.scale();
-            m_center[0]=m.cx(); m_center[1]=m.cy(); m_center[2]=m.cz();
-        }
-    }
-
-    // 6. Register viewport image with ImGui (so onUIRender can display it)
+    // 5. Register viewport image with ImGui (so onUIRender can display it)
     initViewportForImGui(dev);
 
     // 6b. Auto-fit camera to loaded model
@@ -490,9 +484,8 @@ public:
   }
 
 private:
-  // ---- Framework ----
+#pragma region Framework
   Info                          m_info;
-  std::string                   m_surfPath;
   std::string                   m_pendingLoad;
   std::string                   m_tempDir;
   bool                          m_pendingIsDir = false;  // set by menu, processed next frame
@@ -506,8 +499,9 @@ private:
   nvvk::StagingUploader         m_stagingUploader{}; // CPU→GPU data transfer helper
   nvutils::ProfilerTimeline*    m_profilerTimeline{};
   nvvk::ProfilerGpuTimer        m_profilerGpuTimer;
+#pragma endregion
 
-  // ---- Display images ----
+#pragma region Display images
   // Rendering pipeline:  mesh → m_renderTarget → blit → m_viewportImage → ImGui → screen
   int            m_imgW = 1024, m_imgH = 1024;
   nvvk::Image    m_viewportImage{};   // R32G32B32A32, ImGui display texture
@@ -515,11 +509,13 @@ private:
   nvvk::Image    m_depthImage{};      // D32_SFLOAT, depth attachment (Z-buffer)
   VkDescriptorSet m_imguiImage{};
   bool           m_firstFrame = true;
+#pragma endregion
 
-  // ---- Camera ----
+#pragma region Camera
   std::shared_ptr<nvutils::CameraManipulator> m_camera = std::make_shared<nvutils::CameraManipulator>();
+#pragma endregion
 
-  // ---- Mesh geometry ----
+#pragma region Mesh geometry
   nvvk::Buffer m_vertexBuffer{};   // vertex positions (x,y,z per vertex)
   nvvk::Buffer m_indexBuffer{};    // triangle indices (3 x uint32_t per triangle)
   uint32_t     m_indexCount = 0;
@@ -527,8 +523,9 @@ private:
   float m_center[3] = {0,0,0};
   float m_lastEye[3] = {0,0,0};
   std::string m_lastPath;
+#pragma endregion
 
-  // ---- Graphics pipeline ----
+#pragma region Graphics pipeline
   // Pipeline = shaders + rasterization state + blend state + depth state
   VkPipeline            m_pipeline       = VK_NULL_HANDLE;
   VkPipelineLayout      m_pipelineLayout = VK_NULL_HANDLE;
@@ -537,6 +534,7 @@ private:
   VkDescriptorPool      m_dsPool         = VK_NULL_HANDLE;
   VkDescriptorSet       m_ds             = VK_NULL_HANDLE;
   nvvk::Buffer          m_ubo{};  // Uniform Buffer Object — holds MVP matrix for shader
+#pragma endregion
 
   // ============================================================
   // Initialization helpers (called from onAttach)
@@ -601,8 +599,7 @@ private:
     VkPhysicalDeviceConservativeRasterizationPropertiesEXT crProps = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONSERVATIVE_RASTERIZATION_PROPERTIES_EXT};
     VkPhysicalDeviceProperties2 props2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &crProps};
     vkGetPhysicalDeviceProperties2(m_app->getPhysicalDevice(), &props2);
-    // Extension is supported if primitiveOverestimationSize > 0
-    m_conservativeRaster = true;
+    m_conservativeRaster = (crProps.primitiveOverestimationSize > 0.0f);
     LOGI("Conservative rasterization: %s\n", m_conservativeRaster ? "available" : "N/A");
 
     // Load compiled SPIR-V binaries
@@ -647,7 +644,7 @@ private:
     VkPipelineRasterizationConservativeStateCreateInfoEXT cr = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_CONSERVATIVE_STATE_CREATE_INFO_EXT};
     cr.conservativeRasterizationMode = VK_CONSERVATIVE_RASTERIZATION_MODE_OVERESTIMATE_EXT;
     cr.extraPrimitiveOverestimationSize = 0.0f;
-    if (m_conservativeRaster && m_useConservative) rs.pNext = &cr;
+    if (m_useConservative) rs.pNext = &cr;
     VkPipelineMultisampleStateCreateInfo ms = {VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
     ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
 
@@ -745,6 +742,7 @@ private:
     m_indexCount = (uint32_t)m.i.size();
     LOGI("Uploaded: %d verts, %d tris\n", m.verts(), (int)(m.i.size()/3));
   }
+
   void initViewportForImGui(VkDevice dev) {
     VkCommandBuffer c = m_app->createTempCmdBuffer();
     nvvk::cmdImageMemoryBarrier(c, {m_viewportImage.image,

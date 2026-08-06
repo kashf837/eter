@@ -2,7 +2,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include "nurbs.h"
-#include "knot_insert.h"
 #include "bezier_eval.h"
 
 // ============================================================
@@ -161,8 +160,6 @@ float* nurbs_adaptive_eval(const char* surf_path, const CameraParams* cam,
             int tu = 0, tv = 0;
             compute_tess_factors(&bp, eps, &tu, &tv);
             adapt_tess_factors(&tu, &tv);
-            if (tu < 2) tu = 2; if (tv < 2) tv = 2;
-            if (tu > 64) tu = 64; if (tv > 64) tv = 64;
 
             int idx = i*nv+j;
             info[idx].tu = tu; info[idx].tv = tv; info[idx].offset = offset;
@@ -233,8 +230,6 @@ int compute_adaptive_res(const char* surf_path, const CameraParams* cam) {
             compute_tess_factors(&bp, eps, &tu, &tv);
             if (eps < worst_eps || worst_eps == 0) { worst_eps = eps; raw_tu = tu; raw_tv = tv; }
             adapt_tess_factors(&tu, &tv);
-            if (tu < 2) tu = 2; if (tv < 2) tv = 2;
-            if (tu > 64) tu = 64; if (tv > 64) tv = 64;
             if (tu > g_tu) g_tu = tu;
             if (tv > g_tv) g_tv = tv;
         }
