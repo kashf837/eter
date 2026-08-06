@@ -164,12 +164,28 @@ public:
         m_alloc.destroyBuffer(m_vertexBuffer);
         m_indexCount = 0;
     }
-    Mesh m = isDir ? MeshBuilder::directory(path.c_str()) : MeshBuilder::single(path.c_str());
+    Mesh m;
+    if (isDir) { m = MeshBuilder::directory(path.c_str(), 32); }
+    else {
+        CameraParams cam;
+        glm::dvec3 eye = m_camera->getEye();
+        if (eye.x > 5.f || eye.x < -5.f) eye = {0.f, 0.f, -2.f};
+        cam.camX=(float)eye.x; cam.camY=(float)eye.y; cam.camZ=(float)eye.z;
+        cam.fovY=60.f; cam.scrW=m_imgW; cam.scrH=m_imgH;
+        int res = compute_adaptive_res(path.c_str(), &cam);
+        // Snap to nearest power-of-2 multiple of 8 (GPU kernel limitation)
+        if (res <= 8) res = 8;
+        else if (res <= 16) res = 16;
+        else if (res <= 32) res = 32;
+        else res = 64;
+        m = MeshBuilder::single(path.c_str(), res);
+    }
+
     if (!m.empty()) {
         uploadMesh(m);
         m_modelScale = m.scale();
         m_center[0]=m.cx(); m_center[1]=m.cy(); m_center[2]=m.cz();
-        float dist = m_modelScale * 1.5f;  // closer: 1.5× instead of 1.2×
+        float dist = m_modelScale * 1.5f;
         m_camera->setLookat({m_center[0],m_center[1],m_center[2]+dist},
                             {m_center[0],m_center[1],m_center[2]},{0,-1,0});
         m_camera->setWindowSize({(uint32_t)m_imgW,(uint32_t)m_imgH});

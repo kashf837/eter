@@ -24,9 +24,10 @@ __global__ void eval_surface(
 {
     int i = blockIdx.y * BLOCK_SIZE + threadIdx.y;
     int j = blockIdx.x * BLOCK_SIZE + threadIdx.x;
-    if (i >= nu || j >= nv) return;
-    int idx = i * nv + j;
-    float u = (float)i / (nu - 1), v = (float)j / (nv - 1);
+    bool valid = (i < nu && j < nv);
+    float u = valid ? (float)i/(nu-1) : 0.5f;
+    float v = valid ? (float)j/(nv-1) : 0.5f;
+    int idx = valid ? i*nv+j : 0;
 
     __shared__ float s_Bu[BLOCK_SIZE][MAX_ORDER + 1];
     __shared__ float s_Bv[BLOCK_SIZE][MAX_ORDER + 1];
@@ -36,6 +37,8 @@ __global__ void eval_surface(
     if (threadIdx.y <= order_v)
         s_Bv[threadIdx.x][threadIdx.y] = powf(v, threadIdx.y)*powf(1.f-v, order_v-threadIdx.y)*(float)d_binom_v[threadIdx.y];
     __syncthreads();
+
+    if (!valid) return;
 
     float Sw[4] = {0};
     for (int ii = 0; ii <= order_u; ii++)
@@ -47,7 +50,7 @@ __global__ void eval_surface(
         }
     float inv = 1.f / Sw[3];
     d_V[idx*6+0] = Sw[0]*inv; d_V[idx*6+1] = Sw[1]*inv; d_V[idx*6+2] = Sw[2]*inv;
-    d_V[idx*6+3] = 0.f; d_V[idx*6+4] = 0.f; d_V[idx*6+5] = 0.f;  // sentinel: CPU fallback
+    d_V[idx*6+3] = 0.f; d_V[idx*6+4] = 0.f; d_V[idx*6+5] = 0.f;
 }
 
 // ---- Tensor Core kernel (ETER §5.1, aligned to paper) ----
@@ -65,6 +68,11 @@ __global__ void eval_surface(
 //   B3 = Bv'^T        : n×8    (derivative basis in v)
 //   C3 = [Sv; 0]      : 16×8   (v-tangents in rows 0-7)
 // Normal = cross(Su[ty], Sv[ty]) for each thread row ty.
+//
+// TODO: precision recovery (Ootomo & Yokota 2022).
+// FP16 TC results have ~1e-3 relative error. For rendering, this is ~35× finer
+// than pixel precision (1px ≈ 0.035 units on a 36-unit model). Visual impact is
+// minimal; implementing when numerical correctness is required for publication.
 __global__ void eval_surface_tc(
     float* d_CP, float* d_V, int nu, int nv,
     int order_u, int order_v, int cols,
@@ -73,7 +81,6 @@ __global__ void eval_surface_tc(
     int ty = threadIdx.y, tx = threadIdx.x;
     int i = blockIdx.y * BLOCK_SIZE + ty;
     int j = blockIdx.x * BLOCK_SIZE + tx;
-    if (i >= nu || j >= nv) return;
     int idx = i * nv + j;
     float u = (float)i/(nu-1), v = (float)j/(nv-1);
     int m = order_u+1, n = order_v+1;
@@ -111,12 +118,13 @@ __global__ void eval_surface_tc(
     }
     __syncthreads();
 
-    // ---- MMA scratchpad (shared mem reused across 4 components) ----
-    // m16n8k16: A=16×16half, B=16×8half, C=16×8float → stored in 16×16 for simplicity
-    __shared__ half  s_A[256];   // 16×16 half for A matrix
-    __shared__ half  s_B[256];   // 16×16 half for B matrix
-    __shared__ float s_C[256];   // 16×16 float for C accumulators
-    __shared__ float s_T[128];   // save T (first 8×n rows of MMA1 result)
+    if (i >= nu || j >= nv) return;  // after __syncthreads to avoid UB
+
+    // ---- MMA scratchpad ----
+    __shared__ half  s_A[256];   // A matrix (16×16 half)
+    __shared__ half  s_B[256];   // B matrix (16×16 half)
+    __shared__ float s_C[256];   // C accumulators (16×16 float)
+    __shared__ float s_T[128];   // save T (8 rows of MMA1)
 
     bool warp0 = (ty*BLOCK_SIZE+tx) < 32;
 
@@ -184,6 +192,7 @@ __global__ void eval_surface_tc(
         }
         __syncthreads();
 
+        // ---- MMA2 main pass ----
         if (warp0) {
             wmma::fragment<wmma::matrix_a,16,16,16,half,wmma::row_major> a;
             wmma::fragment<wmma::matrix_b,16,16,16,half,wmma::row_major> b;

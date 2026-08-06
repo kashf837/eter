@@ -37,42 +37,31 @@ static NurbsSurf* read_surf(const char* path) {
     FILE* f = fopen(path, "r");
     if (!f) { fprintf(stderr, "  [SKIP] Cannot open %s\n", path); return NULL; }
     NurbsSurf* s = (NurbsSurf*)calloc(1, sizeof(NurbsSurf));
-    char line[4096];  // some STEP surfaces have very long knot lines
+    char line[4096];
 
     if (!next_line(f, line, sizeof(line))) { fclose(f); free(s); return NULL; }
     sscanf(line, "%d %d %d %d", &s->p_u, &s->p_v, &s->n_u, &s->n_v);
     if (s->p_u <= 0 || s->p_v <= 0 || s->n_u <= 0 || s->n_v <= 0 ||
         s->p_u > 20 || s->p_v > 20 || s->n_u > 10000 || s->n_v > 10000) {
-        fprintf(stderr, "  [SKIP] %s: bad dims p=(%d,%d) n=(%d,%d)\n",
-                path, s->p_u, s->p_v, s->n_u, s->n_v);
         fclose(f); free(s); return NULL;
     }
 
-    // U knot vector — count actual values, derive m_u from count
     if (!next_line(f, line, sizeof(line))) { fclose(f); free_surf(s); return NULL; }
     {   int n = count_floats(line); s->m_u = n - 1;
         s->U = (float*)malloc(n * sizeof(float)); parse_floats(line, s->U, n); }
 
-    // V knot vector
     if (!next_line(f, line, sizeof(line))) { fclose(f); free_surf(s); return NULL; }
     {   int n = count_floats(line); s->m_v = n - 1;
         s->V = (float*)malloc(n * sizeof(float)); parse_floats(line, s->V, n); }
 
-    // Control points
     s->Ps = new_cpgrid(s->n_u, s->n_v, 4);
     for (int i = 0; i <= s->n_u; i++)
         for (int j = 0; j <= s->n_v; j++) {
-            if (!next_line(f, line, sizeof(line))) {
-                fclose(f); free_surf(s); return NULL;
-            }
+            if (!next_line(f, line, sizeof(line))) { fclose(f); free_surf(s); return NULL; }
             int got = sscanf(line, "%f %f %f %f",
                    &s->Ps[i][j][0], &s->Ps[i][j][1],
                    &s->Ps[i][j][2], &s->Ps[i][j][3]);
-            if (got < 1) {
-                fprintf(stderr, "  [SKIP] %s: bad CP at (%d,%d) got=%d\n", path, i, j, got);
-                fclose(f); free_surf(s); return NULL;
-            }
-            // Pad missing coordinates: 1→xyz with y=z=0,w=1; 2→xyz with z=0,w=1; 3→w=1
+            if (got < 1) { fclose(f); free_surf(s); return NULL; }
             if (got < 3) { s->Ps[i][j][1] = 0; s->Ps[i][j][2] = 0; }
             if (got < 4) s->Ps[i][j][3] = 1.0f;
         }
@@ -127,7 +116,6 @@ float* nurbs_wireframe(const char* surf_path, int res,
             float* pv = (float*)malloc(res * res * 6 * sizeof(float));
             eval_bezier_patch(&bp, pv, res, res);
 
-            // Transpose: GPU output is x-major, we need y-major
             float* dst = verts + (pi * np_v + pj) * res * res * 6;
             for (int y = 0; y < res; y++)
                 for (int x = 0; x < res; x++)
@@ -138,4 +126,45 @@ float* nurbs_wireframe(const char* surf_path, int res,
     free(bp.CP);
     free_surf(s);
     return verts;
+}
+
+// ============================================================
+// Global adaptive resolution (ETER §4)
+// ============================================================
+
+int compute_adaptive_res(const char* surf_path, const CameraParams* cam) {
+    NurbsSurf* s = read_surf(surf_path);
+    if (!s) return 32;
+
+    nurbs_to_beziers(s);
+
+    int ru = s->p_u + 1, rv = s->p_v + 1;
+    int nu = (s->n_u + 1) / ru, nv = (s->n_v + 1) / rv;
+    BezierPatch bp = {s->p_u, s->p_v, (float*)malloc(ru * rv * 4 * sizeof(float))};
+    int g_tu = 8, g_tv = 8;
+
+    for (int i = 0; i < nu; i++) {
+        for (int j = 0; j < nv; j++) {
+            for (int ii = 0; ii < ru; ii++)
+                for (int jj = 0; jj < rv; jj++)
+                    memcpy(&bp.CP[(ii*rv+jj)*4],
+                           s->Ps[i*ru+ii][j*rv+jj], 4*sizeof(float));
+
+            float eps = compute_epsilon(&bp, cam);
+            int tu = 0, tv = 0;
+            compute_tess_factors(&bp, eps, &tu, &tv);
+            adapt_tess_factors(&tu, &tv);
+            if (tu < 2) tu = 2; if (tv < 2) tv = 2;
+            if (tu > 64) tu = 64; if (tv > 64) tv = 64;
+            if (tu > g_tu) g_tu = tu;
+            if (tv > g_tv) g_tv = tv;
+        }
+    }
+    free(bp.CP);
+    free_surf(s);
+
+    int res = (g_tu > g_tv) ? g_tu : g_tv;
+    printf("  [ADAPT] %s: %dx%d patches, max tu=%d tv=%d -> res=%d\n",
+           surf_path, nu, nv, g_tu, g_tv, res);
+    return res;
 }
