@@ -179,6 +179,7 @@ private:
     }
 
     static void addPatchGrid(Mesh& m, const float* verts, const float* cp, int nu, int nv, int res) {
+        m.patchCols = nv;  // for checkerboard decode in shader
         // Append CPs (pre-centering) for global indexing
         int cpBase = m.patchCount;
         if (cp) {

@@ -105,7 +105,10 @@ vec3 shadeNormal(vec3 N, vec3 L, float checker)
 
 float decodeChecker(uint pid)
 {
-    return ((pid & 1u) != 0u) ? 0.6 : 1.0;
+    int nv = max(int(lighting.patchCols), 1);
+    uint row = pid / uint(nv);
+    uint col = pid % uint(nv);
+    return (((row + col) & 1u) != 0u) ? 0.6 : 1.0;
 }
 
 vec3 shadeSSBO(uint patchID, vec2 uv, vec3 L)
