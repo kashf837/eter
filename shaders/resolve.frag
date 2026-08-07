@@ -100,8 +100,7 @@ vec3 shadeNormal(vec3 N, vec3 L, float checker)
 {
     float ambient = 0.4;
     float NdotL = dot(normalize(N), L);
-    // Two-sided: front faces get full diffuse, back faces get ~35% diffuse
-    float diffuse = max(NdotL, 0.0) + max(-NdotL, 0.0) * 0.35;
+    float diffuse = abs(NdotL);  // view-independent: front and back equally lit
     return vec3(0.85) * (ambient + diffuse * 0.6 * checker) * lighting.intensity;
 }
 
