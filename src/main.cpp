@@ -46,7 +46,7 @@ static std::vector<char> readFile(const std::string& fn) {
 // MVP matrices for visibility pass (set=0, binding=0 in visibility.vert)
 struct MVP { glm::mat4 model, view, proj; };
 // Lighting params for resolve pass (set=1, binding=0 in resolve.frag)
-struct Lighting { float intensity, lightAz, lightEl, checkerboard; };
+struct Lighting { float intensity, lightAz, lightEl, checkerboard, boundary; };
 
 // ============================================================
 // Mesh — host-side triangle mesh data
@@ -493,8 +493,15 @@ public:
     ImGui::SliderFloat("Light Azimuth", &m_lightAz, -3.14f, 3.14f);
     ImGui::SliderFloat("Light Elevation", &m_lightEl, 0.0f, 1.57f);
     ImGui::Checkbox("Checkerboard", &m_checkerboard);
+    ImGui::Checkbox("Show Boundaries", &m_showBoundary);
     if (ImGui::Checkbox("Conservative Raster", &m_useConservative)) {
-        if (!m_lastPath.empty()) { m_pendingLoad = m_lastPath; m_pendingIsDir = false; }
+        // Recreate vis pipeline with/without conservative raster
+        VkDevice dev = m_app->getDevice();
+        NVVK_CHECK(vkDeviceWaitIdle(dev));
+        vkDestroyPipeline(dev, m_pipelineVis, nullptr);
+        m_pipelineVis = VK_NULL_HANDLE;
+        createVisPipeline(dev);
+        LOGI("Conservative raster %s, vis pipeline recreated\n", m_useConservative ? "ON" : "OFF");
     }
     ImGui::Text("Triangles: %d", m_indexCount / 3);
     ImGui::TextDisabled("%d FPS / %.3fms",
@@ -577,6 +584,7 @@ private:
   float                         m_lightEl   = 0.8f;   // elevation (radians)
   bool                          m_useConservative = false;
   bool                          m_checkerboard    = true;
+  bool                          m_showBoundary    = false;
   nvapp::Application*           m_app{};
   nvvk::ResourceAllocator       m_alloc{};        // GPU memory manager (wraps VMA)
   nvvk::SamplerPool             m_samplerPool{};
@@ -1063,6 +1071,7 @@ private:
     light.lightAz      = m_lightAz;
     light.lightEl      = m_lightEl;
     light.checkerboard = m_checkerboard ? 1.0f : 0.0f;
+    light.boundary     = m_showBoundary   ? 1.0f : 0.0f;
     memcpy(m_lightUbo.mapping, &light, sizeof(Lighting));
   }
 };
