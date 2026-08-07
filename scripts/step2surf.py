@@ -164,7 +164,7 @@ def write_surf(path, s):
             for j in range(s['n_v'] + 1):
                 xyz = s['cp_grid'][i][j]
                 f.write(f"{xyz[0]:.6f} {xyz[1]:.6f} {xyz[2]:.6f} 1.0\n")
-    print(f"Wrote {path}: {s['n_u']+1}x{s['n_v']+1} CPs, order {s['p_u']}x{s['p_v']}")
+    # print(f"Wrote {path}: {s['n_u']+1}x{s['n_v']+1} CPs, order {s['p_u']}x{s['p_v']}")
 
 
 def main():
