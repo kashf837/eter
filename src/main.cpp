@@ -307,8 +307,10 @@ public:
     vkDestroyDescriptorPool(dev, m_visDsPool, nullptr);
 
     // Buffers & images
-    vmaDestroyBuffer((VmaAllocator)m_alloc, m_lightUbo.buffer, m_lightUbo.allocation);
-    vmaDestroyBuffer((VmaAllocator)m_alloc, m_visUbo.buffer, m_visUbo.allocation);
+    for (int i = 0; i < MAX_FIF; i++) {
+        vmaDestroyBuffer((VmaAllocator)m_alloc, m_lightUbo[i].buffer, m_lightUbo[i].allocation);
+        vmaDestroyBuffer((VmaAllocator)m_alloc, m_visUbo[i].buffer, m_visUbo[i].allocation);
+    }
     m_alloc.destroyBuffer(m_indexBuffer);
     m_alloc.destroyBuffer(m_vertexBuffer);
     m_alloc.destroyImage(m_gbufID);
@@ -417,7 +419,7 @@ public:
             vkCmdSetViewport(cmd, 0, 1, &vp);
             vkCmdSetScissor(cmd, 0, 1, &sc);
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineVis);
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_visPipelineLayout, 0, 1, &m_visDs, 0, nullptr);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_visPipelineLayout, 0, 1, &m_visDs[m_frameIndex], 0, nullptr);
             VkDeviceSize off = 0;
             vkCmdBindVertexBuffers(cmd, 0, 1, &m_vertexBuffer.buffer, &off);
             vkCmdBindIndexBuffer(cmd, m_indexBuffer.buffer, 0, VK_INDEX_TYPE_UINT32);
@@ -453,7 +455,7 @@ public:
         vkCmdSetViewport(cmd, 0, 1, &vp);
         vkCmdSetScissor(cmd, 0, 1, &sc);
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineResolve);
-        VkDescriptorSet rds[2] = {m_resolveDs, m_resolveDs1};
+        VkDescriptorSet rds[2] = {m_resolveDs, m_resolveDs1[m_frameIndex]};
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_resolvePipelineLayout, 0, 2, rds, 0, nullptr);
         vkCmdDraw(cmd, 3, 1, 0, 0);  // full-screen triangle: 3 vertices, no vertex buffer
 
@@ -481,6 +483,9 @@ public:
     // Transition images back for next frame
     nvvk::cmdImageMemoryBarrier(cmd, {m_renderTarget.image, src, color});
     nvvk::cmdImageMemoryBarrier(cmd, {m_viewportImage.image, dst, ro});
+
+    // Advance to next frame-in-flight slot after all rendering for this frame is recorded
+    m_frameIndex = (m_frameIndex + 1) % MAX_FIF;
   }
 
   // ============================================================
@@ -491,7 +496,7 @@ public:
     ImGui::Begin("Settings");
     ImGui::SliderFloat("Intensity", &m_intensity, 0.0f, 2.0f);
     ImGui::SliderFloat("Light Azimuth", &m_lightAz, -3.14f, 3.14f);
-    ImGui::SliderFloat("Light Elevation", &m_lightEl, 0.0f, 1.57f);
+    ImGui::SliderFloat("Light Elevation", &m_lightEl, -1.57f, 1.57f);
     ImGui::Checkbox("Checkerboard", &m_checkerboard);
     ImGui::Checkbox("Show Boundaries", &m_showBoundary);
     if (ImGui::Checkbox("Conservative Raster", &m_useConservative)) {
@@ -517,23 +522,36 @@ public:
 
   void onPreRender() override {
     m_profilerTimeline->frameAdvance();
-    // Check if camera moved enough to re-tessellate
+    // Adaptive re-tessellation (ETER §4): only rebuild when camera IDLE.
+    // Rebuilding during camera movement causes visible popping since each
+    // frame's mesh has slightly different vertex positions.
     if (!m_lastPath.empty() && m_indexCount > 0) {
         glm::dvec3 e = m_camera->getEye();
         float dx=(float)e.x-m_lastEye[0], dy=(float)e.y-m_lastEye[1], dz=(float)e.z-m_lastEye[2];
         float dist = sqrtf(dx*dx+dy*dy+dz*dz);
-        if (dist > m_modelScale * 0.2f) {  // moved >20% of model size
-            CameraParams cam;
-            cam.camX=(float)e.x; cam.camY=(float)e.y; cam.camZ=(float)e.z;
-            cam.fovY=60.f; cam.scrW=m_imgW; cam.scrH=m_imgH;
-            Mesh m = MeshBuilder::adaptive(m_lastPath.c_str(), &cam);
-            if (!m.empty()) {
-                if (m_indexCount > 0) { m_alloc.destroyBuffer(m_indexBuffer); m_alloc.destroyBuffer(m_vertexBuffer); m_indexCount = 0; }
-                uploadMesh(m);
-                m_modelScale = m.scale();
-                m_center[0]=m.cx(); m_center[1]=m.cy(); m_center[2]=m.cz();
-                m_lastEye[0]=(float)e.x; m_lastEye[1]=(float)e.y; m_lastEye[2]=(float)e.z;
-                LOGI("[Adaptive] camera moved, %d verts\n", m.verts());
+
+        if (dist > m_modelScale * 0.15f) {
+            // Camera moved enough: mark dirty, start/restart idle countdown
+            m_rebuildPending = true;
+            m_dirtyEye[0] = (float)e.x; m_dirtyEye[1] = (float)e.y; m_dirtyEye[2] = (float)e.z;
+            m_idleFrames = 0;
+        } else if (m_rebuildPending) {
+            m_idleFrames++;
+            if (m_idleFrames >= 30) {  // ~0.5s @60fps
+                CameraParams cam;
+                cam.camX = m_dirtyEye[0]; cam.camY = m_dirtyEye[1]; cam.camZ = m_dirtyEye[2];
+                cam.fovY = 60.f; cam.scrW = m_imgW; cam.scrH = m_imgH;
+                Mesh m = MeshBuilder::adaptive(m_lastPath.c_str(), &cam);
+                if (!m.empty()) {
+                    NVVK_CHECK(vkDeviceWaitIdle(m_app->getDevice()));
+                    if (m_indexCount > 0) { m_alloc.destroyBuffer(m_indexBuffer); m_alloc.destroyBuffer(m_vertexBuffer); m_indexCount = 0; }
+                    uploadMesh(m);
+                    m_modelScale = m.scale();
+                    m_center[0]=m.cx(); m_center[1]=m.cy(); m_center[2]=m.cz();
+                    m_lastEye[0] = m_dirtyEye[0]; m_lastEye[1] = m_dirtyEye[1]; m_lastEye[2] = m_dirtyEye[2];
+                    m_rebuildPending = false;
+                    LOGI("[Adaptive] camera idle, %d verts\n", m.verts());
+                }
             }
         }
     }
@@ -583,7 +601,7 @@ private:
   float                         m_lightAz   = 0.6f;   // azimuth (radians)
   float                         m_lightEl   = 0.8f;   // elevation (radians)
   bool                          m_useConservative = false;
-  bool                          m_checkerboard    = true;
+  bool                          m_checkerboard    = false;
   bool                          m_showBoundary    = false;
   nvapp::Application*           m_app{};
   nvvk::ResourceAllocator       m_alloc{};        // GPU memory manager (wraps VMA)
@@ -618,24 +636,30 @@ private:
   float m_center[3] = {0,0,0};
   float m_lastEye[3] = {0,0,0};
   std::string m_lastPath;
+  float m_dirtyEye[3] = {0,0,0};  // target eye for next rebuild
+  int   m_idleFrames = 0;         // consecutive frames with negligible camera movement
+  bool  m_rebuildPending = false; // true when waiting for camera to idle
 #pragma endregion
 
 #pragma region Graphics pipeline
+  static constexpr int MAX_FIF = 3;  // frames in flight (triple-buffered UBOs)
+
   // Visibility pass pipeline (mesh → G-buffer)
   VkPipeline            m_pipelineVis       = VK_NULL_HANDLE;
   VkPipelineLayout      m_visPipelineLayout = VK_NULL_HANDLE;
   VkDescriptorSetLayout m_visDsLayout       = VK_NULL_HANDLE;
   VkDescriptorPool      m_visDsPool         = VK_NULL_HANDLE;
-  VkDescriptorSet       m_visDs             = VK_NULL_HANDLE;
-  nvvk::Buffer          m_visUbo{};         // MVP matrices for visibility pass
+  VkDescriptorSet       m_visDs[MAX_FIF]    = {};
+  nvvk::Buffer          m_visUbo[MAX_FIF]{};    // MVP UBO, one per frame-in-flight
   // Resolve pass pipeline (G-buffer → lighting)
   VkPipeline            m_pipelineResolve   = VK_NULL_HANDLE;
   VkPipelineLayout      m_resolvePipelineLayout = VK_NULL_HANDLE;
   VkDescriptorSetLayout m_resolveDsLayout   = VK_NULL_HANDLE;
   VkDescriptorPool      m_resolveDsPool     = VK_NULL_HANDLE;
-  VkDescriptorSet       m_resolveDs         = VK_NULL_HANDLE;
-  VkDescriptorSet       m_resolveDs1        = VK_NULL_HANDLE;  // set=1: lighting UBO
-  nvvk::Buffer          m_lightUbo{};       // Lighting params for resolve pass
+  VkDescriptorSet       m_resolveDs         = VK_NULL_HANDLE;  // set=0: G-buffer (shared)
+  VkDescriptorSet       m_resolveDs1[MAX_FIF] = {};             // set=1: lighting UBO, per-frame
+  nvvk::Buffer          m_lightUbo[MAX_FIF]{};   // Lighting UBO, one per frame-in-flight
+  int                   m_frameIndex = 0;         // cycles 0..MAX_FIF-1 each frame
   bool                  m_conservativeRaster = false;  // extension support
 #pragma endregion
 
@@ -912,23 +936,28 @@ private:
 
   // Descriptor set for visibility pass: connects MVP UBO to the vertex shader.
   void createVisDescriptorSet(VkDevice dev) {
-    VkDescriptorPoolSize dps = {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1};
+    VkDescriptorPoolSize dps = {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, MAX_FIF};
     VkDescriptorPoolCreateInfo dpCI = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-    dpCI.maxSets = 1; dpCI.poolSizeCount = 1; dpCI.pPoolSizes = &dps;
+    dpCI.maxSets = MAX_FIF; dpCI.poolSizeCount = 1; dpCI.pPoolSizes = &dps;
     NVVK_CHECK(vkCreateDescriptorPool(dev, &dpCI, nullptr, &m_visDsPool));
+    VkDescriptorSetLayout layouts[MAX_FIF];
+    for (int i = 0; i < MAX_FIF; i++) layouts[i] = m_visDsLayout;
     VkDescriptorSetAllocateInfo dsa = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-    dsa.descriptorPool = m_visDsPool; dsa.descriptorSetCount = 1; dsa.pSetLayouts = &m_visDsLayout;
-    NVVK_CHECK(vkAllocateDescriptorSets(dev, &dsa, &m_visDs));
+    dsa.descriptorPool = m_visDsPool; dsa.descriptorSetCount = MAX_FIF; dsa.pSetLayouts = layouts;
+    NVVK_CHECK(vkAllocateDescriptorSets(dev, &dsa, m_visDs));
   }
 
   // Descriptor set for resolve pass: binds 3 G-buffer textures (set=0) + lighting UBO (set=1).
+  // set=0 is shared across all frames (G-buffer images don't change).
+  // set=1 is triple-buffered (one per frame-in-flight) for UBO coherency.
   void createResolveDescriptorSet(VkDevice dev) {
+    int totalSets = 1 + MAX_FIF;  // 1×set0 + MAX_FIF×set1
     VkDescriptorPoolSize dps[2] = {
         {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 3},
-        {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1},
+        {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, (uint32_t)MAX_FIF},
     };
     VkDescriptorPoolCreateInfo dpCI = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-    dpCI.maxSets = 2; dpCI.poolSizeCount = 2; dpCI.pPoolSizes = dps;
+    dpCI.maxSets = (uint32_t)totalSets; dpCI.poolSizeCount = 2; dpCI.pPoolSizes = dps;
     NVVK_CHECK(vkCreateDescriptorPool(dev, &dpCI, nullptr, &m_resolveDsPool));
 
     // Re-create temp set layouts for allocation (pipeline layout was already created with matching layouts)
@@ -950,15 +979,20 @@ private:
     VkDescriptorSetLayout set1Layout;
     NVVK_CHECK(vkCreateDescriptorSetLayout(dev, &dslCI1, nullptr, &set1Layout));
 
-    VkDescriptorSetLayout setLayouts[2] = {set0Layout, set1Layout};
-    VkDescriptorSetAllocateInfo dsa = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-    dsa.descriptorPool = m_resolveDsPool; dsa.descriptorSetCount = 2; dsa.pSetLayouts = setLayouts;
-    VkDescriptorSet dsSets[2];
-    NVVK_CHECK(vkAllocateDescriptorSets(dev, &dsa, dsSets));
-    m_resolveDs  = dsSets[0]; // set=0: G-buffer textures
-    m_resolveDs1 = dsSets[1]; // set=1: lighting UBO
+    // Allocate: 1×set0 + MAX_FIF×set1
+    VkDescriptorSetLayout set0Layouts[1] = {set0Layout};
+    VkDescriptorSetLayout set1Layouts[MAX_FIF];
+    for (int i = 0; i < MAX_FIF; i++) set1Layouts[i] = set1Layout;
 
-    // Write set=0: bind 3 G-buffer images as combined image samplers
+    VkDescriptorSetAllocateInfo dsa = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    dsa.descriptorPool = m_resolveDsPool;
+    dsa.descriptorSetCount = 1; dsa.pSetLayouts = set0Layouts;
+    NVVK_CHECK(vkAllocateDescriptorSets(dev, &dsa, &m_resolveDs));
+
+    dsa.descriptorSetCount = MAX_FIF; dsa.pSetLayouts = set1Layouts;
+    NVVK_CHECK(vkAllocateDescriptorSets(dev, &dsa, m_resolveDs1));
+
+    // Write set=0: bind 3 G-buffer images as combined image samplers (shared)
     VkDescriptorImageInfo imgInfo[3] = {
         {m_gbufPos.descriptor.sampler,  m_gbufPos.descriptor.imageView,  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
         {m_gbufNorm.descriptor.sampler, m_gbufNorm.descriptor.imageView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
@@ -967,7 +1001,7 @@ private:
     VkWriteDescriptorSet wds[3] = {};
     for (int i = 0; i < 3; i++) {
         wds[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        wds[i].dstSet = dsSets[0];
+        wds[i].dstSet = m_resolveDs;
         wds[i].dstBinding = i;
         wds[i].descriptorCount = 1;
         wds[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
@@ -977,45 +1011,49 @@ private:
 
     vkDestroyDescriptorSetLayout(dev, set0Layout, nullptr);
     vkDestroyDescriptorSetLayout(dev, set1Layout, nullptr);
-    LOGI("Resolve descriptor set created\n");
+    LOGI("Resolve descriptor set created (%d FIF)\n", MAX_FIF);
   }
 
   // Uniform buffers: persistent-mapped CPU→GPU memory for per-frame data.
-  //   m_visUbo   — MVP matrices (visibility pass, set=0 binding=0)
-  //   m_lightUbo — lighting params (resolve pass, set=1 binding=0)
+  // Triple-buffered: one copy per frame-in-flight so CPU never overwrites
+  // UBO data that the GPU is still reading from a previous frame.
   void createUniformBuffers(VkDevice dev) {
-    // --- Visibility UBO (MVP matrices) ---
     VkBufferCreateInfo bci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-    bci.size = sizeof(MVP);
     bci.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
     VmaAllocationCreateInfo aci = {};
     aci.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
               | VMA_ALLOCATION_CREATE_MAPPED_BIT;
     aci.usage = VMA_MEMORY_USAGE_AUTO;
     VmaAllocationInfo ai;
-    vmaCreateBuffer((VmaAllocator)m_alloc, &bci, &aci,
-                    &m_visUbo.buffer, &m_visUbo.allocation, &ai);
-    m_visUbo.mapping   = (uint8_t*)ai.pMappedData;
-    m_visUbo.bufferSize = sizeof(MVP);
 
-    VkDescriptorBufferInfo dbiVis = {m_visUbo.buffer, 0, sizeof(MVP)};
-    VkWriteDescriptorSet wdsVis = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-    wdsVis.dstSet = m_visDs; wdsVis.dstBinding = 0; wdsVis.descriptorCount = 1;
-    wdsVis.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER; wdsVis.pBufferInfo = &dbiVis;
-    vkUpdateDescriptorSets(dev, 1, &wdsVis, 0, nullptr);
+    for (int i = 0; i < MAX_FIF; i++) {
+        // Visibility UBO (MVP matrices)
+        bci.size = sizeof(MVP);
+        vmaCreateBuffer((VmaAllocator)m_alloc, &bci, &aci,
+                        &m_visUbo[i].buffer, &m_visUbo[i].allocation, &ai);
+        m_visUbo[i].mapping   = (uint8_t*)ai.pMappedData;
+        m_visUbo[i].bufferSize = sizeof(MVP);
 
-    // --- Lighting UBO (resolve pass) ---
-    bci.size = sizeof(Lighting);
-    vmaCreateBuffer((VmaAllocator)m_alloc, &bci, &aci,
-                    &m_lightUbo.buffer, &m_lightUbo.allocation, &ai);
-    m_lightUbo.mapping   = (uint8_t*)ai.pMappedData;
-    m_lightUbo.bufferSize = sizeof(Lighting);
+        VkDescriptorBufferInfo dbiVis = {m_visUbo[i].buffer, 0, sizeof(MVP)};
+        VkWriteDescriptorSet wdsVis = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        wdsVis.dstSet = m_visDs[i]; wdsVis.dstBinding = 0; wdsVis.descriptorCount = 1;
+        wdsVis.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER; wdsVis.pBufferInfo = &dbiVis;
 
-    VkDescriptorBufferInfo dbiLight = {m_lightUbo.buffer, 0, sizeof(Lighting)};
-    VkWriteDescriptorSet wdsLight = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-    wdsLight.dstSet = m_resolveDs1; wdsLight.dstBinding = 0; wdsLight.descriptorCount = 1;
-    wdsLight.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER; wdsLight.pBufferInfo = &dbiLight;
-    vkUpdateDescriptorSets(dev, 1, &wdsLight, 0, nullptr);
+        // Lighting UBO (resolve pass)
+        bci.size = sizeof(Lighting);
+        vmaCreateBuffer((VmaAllocator)m_alloc, &bci, &aci,
+                        &m_lightUbo[i].buffer, &m_lightUbo[i].allocation, &ai);
+        m_lightUbo[i].mapping   = (uint8_t*)ai.pMappedData;
+        m_lightUbo[i].bufferSize = sizeof(Lighting);
+
+        VkDescriptorBufferInfo dbiLight = {m_lightUbo[i].buffer, 0, sizeof(Lighting)};
+        VkWriteDescriptorSet wdsLight = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        wdsLight.dstSet = m_resolveDs1[i]; wdsLight.dstBinding = 0; wdsLight.descriptorCount = 1;
+        wdsLight.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER; wdsLight.pBufferInfo = &dbiLight;
+
+        VkWriteDescriptorSet wds[2] = {wdsVis, wdsLight};
+        vkUpdateDescriptorSets(dev, 2, wds, 0, nullptr);
+    }
   }
 
   void uploadMesh(const Mesh& m) {
@@ -1063,7 +1101,7 @@ private:
     if (nearP < 0.001f) nearP = 0.001f;
     mvp.proj  = glm::perspective(glm::radians(60.f), asp, nearP, farP);
     mvp.proj[1][1] *= -1.f; // Vulkan Y flip
-    memcpy(m_visUbo.mapping, &mvp, sizeof(MVP));
+    memcpy(m_visUbo[m_frameIndex].mapping, &mvp, sizeof(MVP));
 
     // Lighting for resolve pass
     Lighting light;
@@ -1072,7 +1110,7 @@ private:
     light.lightEl      = m_lightEl;
     light.checkerboard = m_checkerboard ? 1.0f : 0.0f;
     light.boundary     = m_showBoundary   ? 1.0f : 0.0f;
-    memcpy(m_lightUbo.mapping, &light, sizeof(Lighting));
+    memcpy(m_lightUbo[m_frameIndex].mapping, &light, sizeof(Lighting));
   }
 };
 
