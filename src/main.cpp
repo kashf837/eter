@@ -1,6 +1,7 @@
-// ETER — NURBS real-time rendering
+// ETER — NURBS real-time rendering (ETER §6.1 Visibility Buffer)
 // Architecture: NURBS .surf → knot insertion → Bezier patches → GPU eval
-//              → Vulkan triangle mesh → dynamic rendering → ImGui display
+//   → Vulkan triangle mesh → [Pass 1: G-buffer] → [Pass 2: Resolve] → ImGui display
+// G-buffer stores per-pixel (worldPos, worldNormal, patchID) for deferred lighting.
 #define VMA_IMPLEMENTATION
 
 #pragma region Includes
@@ -42,15 +43,16 @@ static std::vector<char> readFile(const std::string& fn) {
     return buf;
 }
 
-// MVP matrices passed to vertex shader via uniform buffer
-// (matches layout(set=0, binding=0) in mesh.vert)
-struct MVP { glm::mat4 model, view, proj; float intensity, lightAz, lightEl, checkerboard; };
+// MVP matrices for visibility pass (set=0, binding=0 in visibility.vert)
+struct MVP { glm::mat4 model, view, proj; };
+// Lighting params for resolve pass (set=1, binding=0 in resolve.frag)
+struct Lighting { float intensity, lightAz, lightEl, checkerboard; };
 
 // ============================================================
 // Mesh — host-side triangle mesh data
 // ============================================================
 struct Mesh {
-    std::vector<float>    v;  // interleaved xyz + nxnynz (6 floats/vertex)
+    std::vector<float>    v;  // interleaved xyz + nxnynz + patchID (7 floats/vertex)
     std::vector<uint32_t> i;  // triangle indices
     float bbMin[3], bbMax[3];
     bool   empty() const { return i.empty(); }
@@ -74,20 +76,15 @@ public:
         PatchInfo* info;
         float* verts = nurbs_adaptive_eval(path, cam, &nu, &nv, &info, &total);
         if (!verts) { fprintf(stderr, "  [SKIP] %s\n", path); return m; }
-        // Build cumulative grid offsets so checkerboard crosses patch boundaries
-        std::vector<int> gx0(nu*nv), gy0(nu*nv);
-        for (int pj = 0; pj < nv; pj++) { gx0[pj] = 0; for (int pi = 1; pi < nu; pi++) gx0[pi*nv+pj] = gx0[(pi-1)*nv+pj] + info[(pi-1)*nv+pj].tu; }
-        for (int pi = 0; pi < nu; pi++) { gy0[pi*nv] = 0; for (int pj = 1; pj < nv; pj++) gy0[pi*nv+pj] = gy0[pi*nv+pj-1] + info[pi*nv+pj-1].tv; }
         for (int pi = 0; pi < nu; pi++)
             for (int pj = 0; pj < nv; pj++) {
                 PatchInfo* p = &info[pi*nv+pj];
                 float* patch = verts + p->offset * 6;
                 uint32_t base = (uint32_t)m.v.size() / 7;
-                int gox = gx0[pi*nv+pj], goy = gy0[pi*nv+pj];
+                float patchID = (float)((pi << 12) | pj);  // encode (pi,pj) for 2D checkerboard
                 for (int y = 0; y < p->tv; y++)
                     for (int x = 0; x < p->tu; x++) {
                         int k = y*p->tu + x;
-                        float checker = ((((gox+x)/2) + ((goy+y)/2)) & 1) ? 0.0f : 1.0f;
                         float px=patch[k*6+0], py=patch[k*6+1], pz=patch[k*6+2];
                         float nx=patch[k*6+3], ny=patch[k*6+4], nz=patch[k*6+5];
                         float nl=nx*nx+ny*ny+nz*nz;
@@ -100,7 +97,7 @@ public:
                             nl=nx*nx+ny*ny+nz*nz;
                         }
                         float inv=1.f/(sqrtf(nl)+1e-10f);
-                        m.v.insert(m.v.end(),{px,py,pz,nx*inv,ny*inv,nz*inv,checker});
+                        m.v.insert(m.v.end(),{px,py,pz,nx*inv,ny*inv,nz*inv,patchID});
                         if(px<m.bbMin[0])m.bbMin[0]=px;if(py<m.bbMin[1])m.bbMin[1]=py;if(pz<m.bbMin[2])m.bbMin[2]=pz;
                         if(px>m.bbMax[0])m.bbMax[0]=px;if(py>m.bbMax[1])m.bbMax[1]=py;if(pz>m.bbMax[2])m.bbMax[2]=pz;
                     }
@@ -158,10 +155,9 @@ private:
             for (int pj = 0; pj < nv; pj++) {
                 uint32_t base = (uint32_t)m.v.size() / 7;
                 const float* p = verts + (pi*nv+pj)*res*res*6;
+                float patchID = (float)((pi << 12) | pj);  // encode (pi,pj) for 2D checkerboard
                 for (int y = 0; y < res; y++)
                     for (int x = 0; x < res; x++) {
-                        int gx = pi*res + x, gy = pj*res + y;
-                        float checker = (((gx/2) + (gy/2)) & 1) ? 0.0f : 1.0f;
                         int idx = y*res+x;
                         float px=p[idx*6+0], py=p[idx*6+1], pz=p[idx*6+2];
                         float gnx=p[idx*6+3], gny=p[idx*6+4], gnz=p[idx*6+5];
@@ -175,7 +171,7 @@ private:
                             gnLen = gnx*gnx+gny*gny+gnz*gnz;
                         }
                         float inv=1.f/(sqrtf(gnLen)+1e-10f);
-                        m.v.insert(m.v.end(),{px,py,pz, gnx*inv,gny*inv,gnz*inv, checker});
+                        m.v.insert(m.v.end(),{px,py,pz, gnx*inv,gny*inv,gnz*inv, patchID});
                         if(px<m.bbMin[0])m.bbMin[0]=px; if(py<m.bbMin[1])m.bbMin[1]=py; if(pz<m.bbMin[2])m.bbMin[2]=pz;
                         if(px>m.bbMax[0])m.bbMax[0]=px; if(py>m.bbMax[1])m.bbMax[1]=py; if(pz>m.bbMax[2])m.bbMax[2]=pz;
                     }
@@ -256,17 +252,20 @@ public:
 
     // 1. Create images that we render into and display
     createViewportImage(dev);   // ImGui shows this texture
-    createRenderTarget(dev);    // we draw 3D mesh here, then blit→viewport
-    createDepthBuffer(dev);     // for correct occlusion (Z-buffer)
+    createRenderTarget(dev);    // resolve pass output → blit source
+    createDepthBuffer(dev);     // Z-buffer (shared by both passes)
+    createGbuffer(dev);         // G-buffer: pos + normal + patchID
 
-    // 2. Create Vulkan graphics pipeline (shaders + state)
-    createPipeline(dev);
+    // 2. Create Vulkan graphics pipelines
+    createVisPipeline(dev);     // pass 1: mesh → G-buffer
+    createResolvePipeline(dev); // pass 2: G-buffer → render target
 
-    // 3. Create descriptor set — connects UBO (MVP matrix) to shader
-    createDescriptorSet(dev);
+    // 3. Create descriptor sets
+    createVisDescriptorSet(dev);
+    createResolveDescriptorSet(dev);
 
-    // 4. Upload MVP matrix (updated per-frame by camera)
-    createUniformBuffer(dev);
+    // 4. Upload uniform buffers (MVP for vis pass, lighting for resolve pass)
+    createUniformBuffers(dev);
 
     // 5. Register viewport image with ImGui (so onUIRender can display it)
     initViewportForImGui(dev);
@@ -297,16 +296,24 @@ public:
     VkDevice dev = m_app->getDevice();
     ImGui_ImplVulkan_RemoveTexture(m_imguiImage);
 
-    // Pipeline
-    vkDestroyPipeline(dev, m_pipeline, nullptr);
-    vkDestroyPipelineLayout(dev, m_pipelineLayout, nullptr);
-    vkDestroyDescriptorSetLayout(dev, m_dsLayout, nullptr);
-    vkDestroyDescriptorPool(dev, m_dsPool, nullptr);
+    // Pipelines
+    vkDestroyPipeline(dev, m_pipelineResolve, nullptr);
+    vkDestroyPipeline(dev, m_pipelineVis, nullptr);
+    vkDestroyPipelineLayout(dev, m_resolvePipelineLayout, nullptr);
+    vkDestroyPipelineLayout(dev, m_visPipelineLayout, nullptr);
+    vkDestroyDescriptorSetLayout(dev, m_resolveDsLayout, nullptr);
+    vkDestroyDescriptorSetLayout(dev, m_visDsLayout, nullptr);
+    vkDestroyDescriptorPool(dev, m_resolveDsPool, nullptr);
+    vkDestroyDescriptorPool(dev, m_visDsPool, nullptr);
 
     // Buffers & images
-    vmaDestroyBuffer((VmaAllocator)m_alloc, m_ubo.buffer, m_ubo.allocation);
+    vmaDestroyBuffer((VmaAllocator)m_alloc, m_lightUbo.buffer, m_lightUbo.allocation);
+    vmaDestroyBuffer((VmaAllocator)m_alloc, m_visUbo.buffer, m_visUbo.allocation);
     m_alloc.destroyBuffer(m_indexBuffer);
     m_alloc.destroyBuffer(m_vertexBuffer);
+    m_alloc.destroyImage(m_gbufID);
+    m_alloc.destroyImage(m_gbufNorm);
+    m_alloc.destroyImage(m_gbufPos);
     m_alloc.destroyImage(m_depthImage);
     m_alloc.destroyImage(m_renderTarget);
     m_alloc.destroyImage(m_viewportImage);
@@ -320,7 +327,10 @@ public:
   }
 
   // ============================================================
-  // onRender — called every frame: draw 3D mesh → blit→ viewport
+  // onRender — ETER §6.1 Visibility Buffer: two-pass rendering
+  //   Pass 1 (visibility): mesh → G-buffer (pos + normal + patchID) + depth
+  //   Pass 2 (resolve):     full-screen tri reads G-buffer → lighting → render target
+  //   Then blit render target → viewport image for ImGui display.
   // ============================================================
   void onRender(VkCommandBuffer cmd) override
   {
@@ -328,84 +338,149 @@ public:
     if (!m_pendingLoad.empty()) {
         doReload(m_pendingLoad, m_pendingIsDir);
         m_pendingLoad.clear();
-        return;  // skip rendering this frame (buffers were recreated)
+        return;
     }
-    // Upload latest camera matrices to GPU
-    updateCameraUBO();
+    updateUniforms();
 
-    // Step A: transition render target + depth to writable layouts
-    VkImageLayout rtOld = m_firstFrame ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    m_firstFrame = false;
-    if (rtOld == VK_IMAGE_LAYOUT_UNDEFINED) {
-        nvvk::cmdImageMemoryBarrier(cmd, {m_renderTarget.image,
-            VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL});
+    VkImageLayout undef = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkImageLayout color = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    VkImageLayout depth = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+    VkImageLayout ro    = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    VkImageLayout src   = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    VkImageLayout dst   = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+
+    // --- First frame: transition all images from UNDEFINED to their initial layouts ---
+    if (m_firstFrame) {
+        m_firstFrame = false;
+        // G-buffer images → COLOR_ATTACHMENT_OPTIMAL
+        nvvk::cmdImageMemoryBarrier(cmd, {m_gbufPos.image,  undef, color});
+        nvvk::cmdImageMemoryBarrier(cmd, {m_gbufNorm.image, undef, color});
+        nvvk::cmdImageMemoryBarrier(cmd, {m_gbufID.image,   undef, color});
+        // Depth → DEPTH_ATTACHMENT_OPTIMAL
         VkImageMemoryBarrier2 db = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
         db.srcStageMask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
         db.dstStageMask = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT;
-        db.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        db.newLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+        db.oldLayout = undef; db.newLayout = depth;
         db.image = m_depthImage.image;
         db.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
         VkDependencyInfo di = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
         di.imageMemoryBarrierCount = 1; di.pImageMemoryBarriers = &db;
         vkCmdPipelineBarrier2(cmd, &di);
+        // Render target → COLOR_ATTACHMENT_OPTIMAL
+        nvvk::cmdImageMemoryBarrier(cmd, {m_renderTarget.image, undef, color});
     }
 
-    // Step B: begin dynamic rendering (Vulkan 1.3 core feature — no render pass object needed)
-    VkRenderingAttachmentInfo ca = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
-    ca.imageView   = m_renderTarget.descriptor.imageView;
-    ca.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    ca.loadOp      = VK_ATTACHMENT_LOAD_OP_CLEAR;
-    ca.storeOp     = VK_ATTACHMENT_STORE_OP_STORE;
-    ca.clearValue.color = {0.1f, 0.1f, 0.15f, 1.f};
+    // ==============================================
+    // PASS 1: Visibility — mesh → G-buffer + depth
+    // ==============================================
+    {
+        VkRenderingAttachmentInfo gb[3] = {};
+        // gbufPos: world-space position
+        gb[0].sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+        gb[0].imageView = m_gbufPos.descriptor.imageView;
+        gb[0].imageLayout = color;
+        gb[0].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        gb[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        gb[0].clearValue.color = {0.f, 0.f, 0.f, 0.f};
+        // gbufNorm: world-space normal
+        gb[1].sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+        gb[1].imageView = m_gbufNorm.descriptor.imageView;
+        gb[1].imageLayout = color;
+        gb[1].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        gb[1].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        gb[1].clearValue.color = {0.f, 0.f, 0.f, 0.f};
+        // gbufID: patch index
+        gb[2].sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+        gb[2].imageView = m_gbufID.descriptor.imageView;
+        gb[2].imageLayout = color;
+        gb[2].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        gb[2].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        gb[2].clearValue.color = {0.f, 0.f, 0.f, 0.f};
 
-    VkRenderingAttachmentInfo da = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
-    da.imageView   = m_depthImage.descriptor.imageView;
-    da.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
-    da.loadOp      = VK_ATTACHMENT_LOAD_OP_CLEAR;
-    da.storeOp     = VK_ATTACHMENT_STORE_OP_STORE;
-    da.clearValue.depthStencil = {1.f, 0};
+        VkRenderingAttachmentInfo da = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+        da.imageView = m_depthImage.descriptor.imageView;
+        da.imageLayout = depth;
+        da.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        da.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        da.clearValue.depthStencil = {1.f, 0};
 
-    VkRenderingInfo ri = {VK_STRUCTURE_TYPE_RENDERING_INFO};
-    ri.renderArea = {{0, 0}, {(uint32_t)m_imgW, (uint32_t)m_imgH}};
-    ri.layerCount = 1;
-    ri.colorAttachmentCount = 1; ri.pColorAttachments = &ca;
-    ri.pDepthAttachment = &da;
-    vkCmdBeginRendering(cmd, &ri);
+        VkRenderingInfo ri = {VK_STRUCTURE_TYPE_RENDERING_INFO};
+        ri.renderArea = {{0, 0}, {(uint32_t)m_imgW, (uint32_t)m_imgH}};
+        ri.layerCount = 1;
+        ri.colorAttachmentCount = 3; ri.pColorAttachments = gb;
+        ri.pDepthAttachment = &da;
+        vkCmdBeginRendering(cmd, &ri);
 
-    // Step C: draw the mesh (skip if nothing loaded)
-    if (m_indexCount > 0) {
-    VkViewport vp = {0, (float)m_imgH, (float)m_imgW, -(float)m_imgH, 0, 1}; // Vulkan Y-flip
-    VkRect2D   sc = {{0, 0}, {(uint32_t)m_imgW, (uint32_t)m_imgH}};
-    vkCmdSetViewport(cmd, 0, 1, &vp);
-    vkCmdSetScissor(cmd, 0, 1, &sc);
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipeline);
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout, 0, 1, &m_ds, 0, nullptr);
-    VkDeviceSize off = 0;
-    vkCmdBindVertexBuffers(cmd, 0, 1, &m_vertexBuffer.buffer, &off);
-    vkCmdBindIndexBuffer(cmd, m_indexBuffer.buffer, 0, VK_INDEX_TYPE_UINT32);
-    vkCmdDrawIndexed(cmd, m_indexCount, 1, 0, 0, 0);
-    } // m_indexCount > 0
-    vkCmdEndRendering(cmd);
+        if (m_indexCount > 0) {
+            VkViewport vp = {0, (float)m_imgH, (float)m_imgW, -(float)m_imgH, 0, 1};
+            VkRect2D   sc = {{0, 0}, {(uint32_t)m_imgW, (uint32_t)m_imgH}};
+            vkCmdSetViewport(cmd, 0, 1, &vp);
+            vkCmdSetScissor(cmd, 0, 1, &sc);
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineVis);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_visPipelineLayout, 0, 1, &m_visDs, 0, nullptr);
+            VkDeviceSize off = 0;
+            vkCmdBindVertexBuffers(cmd, 0, 1, &m_vertexBuffer.buffer, &off);
+            vkCmdBindIndexBuffer(cmd, m_indexBuffer.buffer, 0, VK_INDEX_TYPE_UINT32);
+            vkCmdDrawIndexed(cmd, m_indexCount, 1, 0, 0, 0);
+        }
+        vkCmdEndRendering(cmd);
+    }
 
-    // Step D: blit (copy) render target → viewport image for ImGui display
-    nvvk::cmdImageMemoryBarrier(cmd, {m_renderTarget.image,
-        VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL});
-    nvvk::cmdImageMemoryBarrier(cmd, {m_viewportImage.image,
-        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL});
+    // --- Transition G-buffer: COLOR_ATTACHMENT → SHADER_READ_ONLY for resolve pass ---
+    nvvk::cmdImageMemoryBarrier(cmd, {m_gbufPos.image,  color, ro});
+    nvvk::cmdImageMemoryBarrier(cmd, {m_gbufNorm.image, color, ro});
+    nvvk::cmdImageMemoryBarrier(cmd, {m_gbufID.image,   color, ro});
+
+    // ==============================================
+    // PASS 2: Resolve — full-screen tri → render target
+    // ==============================================
+    {
+        VkRenderingAttachmentInfo ca = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+        ca.imageView = m_renderTarget.descriptor.imageView;
+        ca.imageLayout = color;
+        ca.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        ca.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        ca.clearValue.color = {0.1f, 0.1f, 0.15f, 1.f};
+
+        VkRenderingInfo ri = {VK_STRUCTURE_TYPE_RENDERING_INFO};
+        ri.renderArea = {{0, 0}, {(uint32_t)m_imgW, (uint32_t)m_imgH}};
+        ri.layerCount = 1;
+        ri.colorAttachmentCount = 1; ri.pColorAttachments = &ca;
+        vkCmdBeginRendering(cmd, &ri);
+
+        VkViewport vp = {0, (float)m_imgH, (float)m_imgW, -(float)m_imgH, 0, 1};
+        VkRect2D   sc = {{0, 0}, {(uint32_t)m_imgW, (uint32_t)m_imgH}};
+        vkCmdSetViewport(cmd, 0, 1, &vp);
+        vkCmdSetScissor(cmd, 0, 1, &sc);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineResolve);
+        VkDescriptorSet rds[2] = {m_resolveDs, m_resolveDs1};
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_resolvePipelineLayout, 0, 2, rds, 0, nullptr);
+        vkCmdDraw(cmd, 3, 1, 0, 0);  // full-screen triangle: 3 vertices, no vertex buffer
+
+        vkCmdEndRendering(cmd);
+    }
+
+    // --- Transition G-buffer back to COLOR_ATTACHMENT for next frame's visibility pass ---
+    nvvk::cmdImageMemoryBarrier(cmd, {m_gbufPos.image,  ro, color});
+    nvvk::cmdImageMemoryBarrier(cmd, {m_gbufNorm.image, ro, color});
+    nvvk::cmdImageMemoryBarrier(cmd, {m_gbufID.image,   ro, color});
+
+    // ==============================================
+    // Blit render target → viewport image for ImGui
+    // ==============================================
+    nvvk::cmdImageMemoryBarrier(cmd, {m_renderTarget.image, color, src});
+    nvvk::cmdImageMemoryBarrier(cmd, {m_viewportImage.image, ro, dst});
     VkImageBlit blit = {};
     blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     blit.srcOffsets[1]  = {m_imgW, m_imgH, 1};
     blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     blit.dstOffsets[1]  = {m_imgW, m_imgH, 1};
-    vkCmdBlitImage(cmd, m_renderTarget.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                   m_viewportImage.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_NEAREST);
+    vkCmdBlitImage(cmd, m_renderTarget.image, src,
+                   m_viewportImage.image, dst, 1, &blit, VK_FILTER_NEAREST);
 
-    // Step E: transition images back for next frame
-    nvvk::cmdImageMemoryBarrier(cmd, {m_renderTarget.image,
-        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL});
-    nvvk::cmdImageMemoryBarrier(cmd, {m_viewportImage.image,
-        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL});
+    // Transition images back for next frame
+    nvvk::cmdImageMemoryBarrier(cmd, {m_renderTarget.image, src, color});
+    nvvk::cmdImageMemoryBarrier(cmd, {m_viewportImage.image, dst, ro});
   }
 
   // ============================================================
@@ -511,11 +586,14 @@ private:
 #pragma endregion
 
 #pragma region Display images
-  // Rendering pipeline:  mesh → m_renderTarget → blit → m_viewportImage → ImGui → screen
+  // Rendering pipeline:  mesh → G-buffer (visPass) → resolve → m_renderTarget → blit → m_viewportImage → ImGui
   int            m_imgW = 1024, m_imgH = 1024;
   nvvk::Image    m_viewportImage{};   // R32G32B32A32, ImGui display texture
-  nvvk::Image    m_renderTarget{};    // R8G8B8A8, color attachment
-  nvvk::Image    m_depthImage{};      // D32_SFLOAT, depth attachment (Z-buffer)
+  nvvk::Image    m_renderTarget{};    // R8G8B8A8, resolve pass output → blit source
+  nvvk::Image    m_depthImage{};      // D32_SFLOAT, depth attachment (Z-buffer, shared by both passes)
+  nvvk::Image    m_gbufPos{};         // R32G32B32A32_SFLOAT: world-space position (xyz)
+  nvvk::Image    m_gbufNorm{};        // R32G32B32A32_SFLOAT: world-space normal (xyz)
+  nvvk::Image    m_gbufID{};          // R32_UINT: patch index
   VkDescriptorSet m_imguiImage{};
   bool           m_firstFrame = true;
 #pragma endregion
@@ -535,14 +613,22 @@ private:
 #pragma endregion
 
 #pragma region Graphics pipeline
-  // Pipeline = shaders + rasterization state + blend state + depth state
-  VkPipeline            m_pipeline       = VK_NULL_HANDLE;
-  VkPipelineLayout      m_pipelineLayout = VK_NULL_HANDLE;
+  // Visibility pass pipeline (mesh → G-buffer)
+  VkPipeline            m_pipelineVis       = VK_NULL_HANDLE;
+  VkPipelineLayout      m_visPipelineLayout = VK_NULL_HANDLE;
+  VkDescriptorSetLayout m_visDsLayout       = VK_NULL_HANDLE;
+  VkDescriptorPool      m_visDsPool         = VK_NULL_HANDLE;
+  VkDescriptorSet       m_visDs             = VK_NULL_HANDLE;
+  nvvk::Buffer          m_visUbo{};         // MVP matrices for visibility pass
+  // Resolve pass pipeline (G-buffer → lighting)
+  VkPipeline            m_pipelineResolve   = VK_NULL_HANDLE;
+  VkPipelineLayout      m_resolvePipelineLayout = VK_NULL_HANDLE;
+  VkDescriptorSetLayout m_resolveDsLayout   = VK_NULL_HANDLE;
+  VkDescriptorPool      m_resolveDsPool     = VK_NULL_HANDLE;
+  VkDescriptorSet       m_resolveDs         = VK_NULL_HANDLE;
+  VkDescriptorSet       m_resolveDs1        = VK_NULL_HANDLE;  // set=1: lighting UBO
+  nvvk::Buffer          m_lightUbo{};       // Lighting params for resolve pass
   bool                  m_conservativeRaster = false;  // extension support
-  VkDescriptorSetLayout m_dsLayout       = VK_NULL_HANDLE;
-  VkDescriptorPool      m_dsPool         = VK_NULL_HANDLE;
-  VkDescriptorSet       m_ds             = VK_NULL_HANDLE;
-  nvvk::Buffer          m_ubo{};  // Uniform Buffer Object — holds MVP matrix for shader
 #pragma endregion
 
   // ============================================================
@@ -600,10 +686,32 @@ private:
     NVVK_CHECK(m_alloc.createImage(m_depthImage, ii, vi));
   }
 
-  // Build Vulkan graphics pipeline from SPIR-V shaders.
-  // The pipeline encapsulates: vertex shader, fragment shader, rasterization,
-  // depth testing, blending, and dynamic rendering format info.
-  void createPipeline(VkDevice dev) {
+  // G-buffer: three attachments for the visibility pass (ETER §6.1).
+  //   gbufPos  — world-space position (R32G32B32A32_SFLOAT)
+  //   gbufNorm — world-space normal   (R32G32B32A32_SFLOAT)
+  //   gbufID   — patch index          (R32_UINT)
+  // All must be SAMPLED so the resolve pass can read them as textures.
+  void createGbuffer(VkDevice dev) {
+    VkImageCreateInfo ii = DEFAULT_VkImageCreateInfo;
+    ii.extent = {(uint32_t)m_imgW, (uint32_t)m_imgH, 1};
+    ii.usage  = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    VkImageViewCreateInfo vi = DEFAULT_VkImageViewCreateInfo;
+
+    ii.format = VK_FORMAT_R32G32B32A32_SFLOAT;
+    NVVK_CHECK(m_alloc.createImage(m_gbufPos, ii, vi));
+    NVVK_CHECK(m_samplerPool.acquireSampler(m_gbufPos.descriptor.sampler));
+
+    NVVK_CHECK(m_alloc.createImage(m_gbufNorm, ii, vi));
+    NVVK_CHECK(m_samplerPool.acquireSampler(m_gbufNorm.descriptor.sampler));
+
+    ii.format = VK_FORMAT_R32_UINT;
+    NVVK_CHECK(m_alloc.createImage(m_gbufID, ii, vi));
+    NVVK_CHECK(m_samplerPool.acquireSampler(m_gbufID.descriptor.sampler));
+  }
+
+  // Visibility pass pipeline (ETER §6.1 Pass 1): mesh → G-buffer.
+  // Outputs worldPos, worldNormal, and patchID to 3 color attachments.
+  void createVisPipeline(VkDevice dev) {
     // Check conservative rasterization support
     VkPhysicalDeviceConservativeRasterizationPropertiesEXT crProps = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONSERVATIVE_RASTERIZATION_PROPERTIES_EXT};
     VkPhysicalDeviceProperties2 props2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &crProps};
@@ -612,8 +720,8 @@ private:
     LOGI("Conservative rasterization: %s\n", m_conservativeRaster ? "available" : "N/A");
 
     // Load compiled SPIR-V binaries
-    auto vCode = readFile("shaders/spv/mesh.vert.spv");
-    auto fCode = readFile("shaders/spv/mesh.frag.spv");
+    auto vCode = readFile("shaders/spv/visibility.vert.spv");
+    auto fCode = readFile("shaders/spv/visibility.frag.spv");
     if (vCode.empty() || fCode.empty()) { LOGE("Shader load failed\n"); return; }
 
     // Create temporary shader modules (destroyed after pipeline creation)
@@ -623,23 +731,23 @@ private:
     sm.codeSize = fCode.size(); sm.pCode = (const uint32_t*)fCode.data();
     VkShaderModule fs; vkCreateShaderModule(dev, &sm, nullptr, &fs);
 
-    // Descriptor set layout: tells shader WHAT resources it can access.
-    // Here: just one uniform buffer (MVP matrix) at set=0, binding=0.
-    VkDescriptorSetLayoutBinding dslb = {0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT};
+    // Descriptor set layout: just one UBO (MVP matrix) at set=0, binding=0.
+    // Only the vertex shader uses it; fragment shader writes to G-buffer.
+    VkDescriptorSetLayoutBinding dslb = {0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT};
     VkDescriptorSetLayoutCreateInfo dslCI = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     dslCI.bindingCount = 1; dslCI.pBindings = &dslb;
-    NVVK_CHECK(vkCreateDescriptorSetLayout(dev, &dslCI, nullptr, &m_dsLayout));
+    NVVK_CHECK(vkCreateDescriptorSetLayout(dev, &dslCI, nullptr, &m_visDsLayout));
 
     VkPipelineLayoutCreateInfo plCI = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-    plCI.setLayoutCount = 1; plCI.pSetLayouts = &m_dsLayout;
-    NVVK_CHECK(vkCreatePipelineLayout(dev, &plCI, nullptr, &m_pipelineLayout));
+    plCI.setLayoutCount = 1; plCI.pSetLayouts = &m_visDsLayout;
+    NVVK_CHECK(vkCreatePipelineLayout(dev, &plCI, nullptr, &m_visPipelineLayout));
 
-    // Vertex input: 7 floats per vertex (x,y,z + nx,ny,nz + checker)
+    // Vertex input: 7 floats per vertex (x,y,z + nx,ny,nz + patchID)
     VkVertexInputBindingDescription vib = {0, 7 * sizeof(float), VK_VERTEX_INPUT_RATE_VERTEX};
     VkVertexInputAttributeDescription via[3] = {
         {0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0},           // location=0: position
         {1, 0, VK_FORMAT_R32G32B32_SFLOAT, 3*sizeof(float)}, // location=1: normal
-        {2, 0, VK_FORMAT_R32_SFLOAT,        6*sizeof(float)}, // location=2: checker
+        {2, 0, VK_FORMAT_R32_SFLOAT,        6*sizeof(float)}, // location=2: patchID
     };
     VkPipelineVertexInputStateCreateInfo vi = {VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
     vi.vertexBindingDescriptionCount = 1; vi.pVertexBindingDescriptions = &vib;
@@ -658,9 +766,10 @@ private:
     VkPipelineMultisampleStateCreateInfo ms = {VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
     ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
 
-    VkPipelineColorBlendAttachmentState cba = {}; cba.colorWriteMask = 0xF; // RGBA all channels
+    VkPipelineColorBlendAttachmentState cba[3] = {};
+    for (int i = 0; i < 3; i++) cba[i].colorWriteMask = 0xF; // all channels for gbufPos/Norm; R only used for gbufID but mask all is fine
     VkPipelineColorBlendStateCreateInfo cb = {VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
-    cb.attachmentCount = 1; cb.pAttachments = &cba;
+    cb.attachmentCount = 3; cb.pAttachments = cba;
 
     // Depth test: enable Z-buffer (closer pixels occlude farther ones)
     VkPipelineDepthStencilStateCreateInfo dss = {VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
@@ -678,11 +787,11 @@ private:
         {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, 0, 0, VK_SHADER_STAGE_FRAGMENT_BIT, fs, "main"},
     };
 
-    // Dynamic rendering (Vulkan 1.3+): no VkRenderPass needed → simpler setup
-    VkFormat cf = VK_FORMAT_R8G8B8A8_UNORM;
+    // Dynamic rendering (Vulkan 1.3+): 3 color attachments (G-buffer) + depth
+    VkFormat cf[3] = {VK_FORMAT_R32G32B32A32_SFLOAT, VK_FORMAT_R32G32B32A32_SFLOAT, VK_FORMAT_R32_UINT};
     VkFormat df = VK_FORMAT_D32_SFLOAT;
     VkPipelineRenderingCreateInfo pr = {VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
-    pr.colorAttachmentCount = 1; pr.pColorAttachmentFormats = &cf;
+    pr.colorAttachmentCount = 3; pr.pColorAttachmentFormats = cf;
     pr.depthAttachmentFormat = df;
 
     VkGraphicsPipelineCreateInfo pi = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &pr};
@@ -691,50 +800,214 @@ private:
     pi.pViewportState = &vp; pi.pRasterizationState = &rs;
     pi.pMultisampleState = &ms; pi.pColorBlendState = &cb;
     pi.pDepthStencilState = &dss; pi.pDynamicState = &ds;
-    pi.layout = m_pipelineLayout;
+    pi.layout = m_visPipelineLayout;
 
-    NVVK_CHECK(vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &pi, nullptr, &m_pipeline));
+    NVVK_CHECK(vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &pi, nullptr, &m_pipelineVis));
     vkDestroyShaderModule(dev, vs, nullptr);
     vkDestroyShaderModule(dev, fs, nullptr);
-    LOGI("Pipeline created\n");
+    LOGI("Visibility pipeline created\n");
   }
 
-  // Descriptor set: connects GPU resources (like the UBO) to shader bindings.
-  // Think of it as "wiring" — the shader says "I need a UBO at binding 0",
-  // and the descriptor set provides the actual buffer handle.
-  void createDescriptorSet(VkDevice dev) {
+  // Resolve pass pipeline (ETER §6.1 Pass 2): full-screen triangle → render target.
+  // Reads G-buffer textures as combined image samplers, applies lighting.
+  void createResolvePipeline(VkDevice dev) {
+    auto vCode = readFile("shaders/spv/resolve.vert.spv");
+    auto fCode = readFile("shaders/spv/resolve.frag.spv");
+    if (vCode.empty() || fCode.empty()) { LOGE("Resolve shader load failed\n"); return; }
+
+    VkShaderModuleCreateInfo sm = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    sm.codeSize = vCode.size(); sm.pCode = (const uint32_t*)vCode.data();
+    VkShaderModule vs; vkCreateShaderModule(dev, &sm, nullptr, &vs);
+    sm.codeSize = fCode.size(); sm.pCode = (const uint32_t*)fCode.data();
+    VkShaderModule fs; vkCreateShaderModule(dev, &sm, nullptr, &fs);
+
+    // Descriptor set layouts:
+    //   set=0: 3 combined image samplers (gbufPos, gbufNorm, gbufID)
+    //   set=1: 1 UBO (lighting params)
+    VkDescriptorSetLayoutBinding bindings0[3] = {};
+    for (int i = 0; i < 3; i++) {
+        bindings0[i].binding = i;
+        bindings0[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        bindings0[i].descriptorCount = 1;
+        bindings0[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    }
+    VkDescriptorSetLayoutCreateInfo dslCI0 = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    dslCI0.bindingCount = 3; dslCI0.pBindings = bindings0;
+
+    VkDescriptorSetLayoutBinding binding1 = {0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT};
+    VkDescriptorSetLayoutCreateInfo dslCI1 = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    dslCI1.bindingCount = 1; dslCI1.pBindings = &binding1;
+
+    VkDescriptorSetLayout layouts[2];
+    NVVK_CHECK(vkCreateDescriptorSetLayout(dev, &dslCI0, nullptr, &layouts[0]));
+    NVVK_CHECK(vkCreateDescriptorSetLayout(dev, &dslCI1, nullptr, &layouts[1]));
+    m_resolveDsLayout = layouts[0]; // save set=0 for pool creation ref
+
+    VkPipelineLayoutCreateInfo plCI = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    plCI.setLayoutCount = 2; plCI.pSetLayouts = layouts;
+    NVVK_CHECK(vkCreatePipelineLayout(dev, &plCI, nullptr, &m_resolvePipelineLayout));
+
+    // No vertex input — full-screen triangle uses gl_VertexIndex
+    VkPipelineVertexInputStateCreateInfo vi = {VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    vi.vertexBindingDescriptionCount = 0;
+    vi.vertexAttributeDescriptionCount = 0;
+
+    VkPipelineInputAssemblyStateCreateInfo ia = {VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+    VkPipelineViewportStateCreateInfo vp = {VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, 0, 0, 1, nullptr, 1, nullptr};
+    VkPipelineRasterizationStateCreateInfo rs = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    rs.lineWidth = 1.f;
+
+    VkPipelineMultisampleStateCreateInfo ms = {VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+    VkPipelineColorBlendAttachmentState cba = {}; cba.colorWriteMask = 0xF;
+    VkPipelineColorBlendStateCreateInfo cb = {VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+    cb.attachmentCount = 1; cb.pAttachments = &cba;
+
+    // No depth test for full-screen quad
+    VkPipelineDepthStencilStateCreateInfo dss = {VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+    dss.depthTestEnable = VK_FALSE;
+    dss.depthWriteEnable = VK_FALSE;
+
+    VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo ds = {VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+    ds.dynamicStateCount = 2; ds.pDynamicStates = dyn;
+
+    VkPipelineShaderStageCreateInfo ss[] = {
+        {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, 0, 0, VK_SHADER_STAGE_VERTEX_BIT, vs, "main"},
+        {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, 0, 0, VK_SHADER_STAGE_FRAGMENT_BIT, fs, "main"},
+    };
+
+    VkFormat cf = VK_FORMAT_R8G8B8A8_UNORM;
+    VkPipelineRenderingCreateInfo pr = {VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+    pr.colorAttachmentCount = 1; pr.pColorAttachmentFormats = &cf;
+
+    VkGraphicsPipelineCreateInfo pi = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &pr};
+    pi.stageCount = 2; pi.pStages = ss;
+    pi.pVertexInputState = &vi; pi.pInputAssemblyState = &ia;
+    pi.pViewportState = &vp; pi.pRasterizationState = &rs;
+    pi.pMultisampleState = &ms; pi.pColorBlendState = &cb;
+    pi.pDepthStencilState = &dss; pi.pDynamicState = &ds;
+    pi.layout = m_resolvePipelineLayout;
+
+    NVVK_CHECK(vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &pi, nullptr, &m_pipelineResolve));
+    vkDestroyShaderModule(dev, vs, nullptr);
+    vkDestroyShaderModule(dev, fs, nullptr);
+
+    // Don't need set=1 layout reference after pipeline layout creation; save set=0 for pool
+    // But we need to save set=1 layout reference too for pool creation. Use a local.
+    vkDestroyDescriptorSetLayout(dev, layouts[1], nullptr);
+    LOGI("Resolve pipeline created\n");
+  }
+
+  // Descriptor set for visibility pass: connects MVP UBO to the vertex shader.
+  void createVisDescriptorSet(VkDevice dev) {
     VkDescriptorPoolSize dps = {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1};
     VkDescriptorPoolCreateInfo dpCI = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     dpCI.maxSets = 1; dpCI.poolSizeCount = 1; dpCI.pPoolSizes = &dps;
-    NVVK_CHECK(vkCreateDescriptorPool(dev, &dpCI, nullptr, &m_dsPool));
+    NVVK_CHECK(vkCreateDescriptorPool(dev, &dpCI, nullptr, &m_visDsPool));
     VkDescriptorSetAllocateInfo dsa = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-    dsa.descriptorPool = m_dsPool; dsa.descriptorSetCount = 1; dsa.pSetLayouts = &m_dsLayout;
-    NVVK_CHECK(vkAllocateDescriptorSets(dev, &dsa, &m_ds));
+    dsa.descriptorPool = m_visDsPool; dsa.descriptorSetCount = 1; dsa.pSetLayouts = &m_visDsLayout;
+    NVVK_CHECK(vkAllocateDescriptorSets(dev, &dsa, &m_visDs));
   }
 
-  // Uniform buffer (UBO): GPU-visible memory holding the MVP matrices.
-  // Created as host-visible + mapped, so we can memcpy() new values each frame
-  // without any staging upload pipeline.
-  void createUniformBuffer(VkDevice dev) {
+  // Descriptor set for resolve pass: binds 3 G-buffer textures (set=0) + lighting UBO (set=1).
+  void createResolveDescriptorSet(VkDevice dev) {
+    VkDescriptorPoolSize dps[2] = {
+        {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 3},
+        {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1},
+    };
+    VkDescriptorPoolCreateInfo dpCI = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    dpCI.maxSets = 2; dpCI.poolSizeCount = 2; dpCI.pPoolSizes = dps;
+    NVVK_CHECK(vkCreateDescriptorPool(dev, &dpCI, nullptr, &m_resolveDsPool));
+
+    // Re-create temp set layouts for allocation (pipeline layout was already created with matching layouts)
+    VkDescriptorSetLayoutBinding bindings0[3] = {};
+    for (int i = 0; i < 3; i++) {
+        bindings0[i].binding = i;
+        bindings0[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        bindings0[i].descriptorCount = 1;
+        bindings0[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    }
+    VkDescriptorSetLayoutCreateInfo dslCI0 = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    dslCI0.bindingCount = 3; dslCI0.pBindings = bindings0;
+    VkDescriptorSetLayout set0Layout;
+    NVVK_CHECK(vkCreateDescriptorSetLayout(dev, &dslCI0, nullptr, &set0Layout));
+
+    VkDescriptorSetLayoutBinding binding1 = {0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT};
+    VkDescriptorSetLayoutCreateInfo dslCI1 = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    dslCI1.bindingCount = 1; dslCI1.pBindings = &binding1;
+    VkDescriptorSetLayout set1Layout;
+    NVVK_CHECK(vkCreateDescriptorSetLayout(dev, &dslCI1, nullptr, &set1Layout));
+
+    VkDescriptorSetLayout setLayouts[2] = {set0Layout, set1Layout};
+    VkDescriptorSetAllocateInfo dsa = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    dsa.descriptorPool = m_resolveDsPool; dsa.descriptorSetCount = 2; dsa.pSetLayouts = setLayouts;
+    VkDescriptorSet dsSets[2];
+    NVVK_CHECK(vkAllocateDescriptorSets(dev, &dsa, dsSets));
+    m_resolveDs  = dsSets[0]; // set=0: G-buffer textures
+    m_resolveDs1 = dsSets[1]; // set=1: lighting UBO
+
+    // Write set=0: bind 3 G-buffer images as combined image samplers
+    VkDescriptorImageInfo imgInfo[3] = {
+        {m_gbufPos.descriptor.sampler,  m_gbufPos.descriptor.imageView,  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+        {m_gbufNorm.descriptor.sampler, m_gbufNorm.descriptor.imageView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+        {m_gbufID.descriptor.sampler,   m_gbufID.descriptor.imageView,   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+    };
+    VkWriteDescriptorSet wds[3] = {};
+    for (int i = 0; i < 3; i++) {
+        wds[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        wds[i].dstSet = dsSets[0];
+        wds[i].dstBinding = i;
+        wds[i].descriptorCount = 1;
+        wds[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        wds[i].pImageInfo = &imgInfo[i];
+    }
+    vkUpdateDescriptorSets(dev, 3, wds, 0, nullptr);
+
+    vkDestroyDescriptorSetLayout(dev, set0Layout, nullptr);
+    vkDestroyDescriptorSetLayout(dev, set1Layout, nullptr);
+    LOGI("Resolve descriptor set created\n");
+  }
+
+  // Uniform buffers: persistent-mapped CPU→GPU memory for per-frame data.
+  //   m_visUbo   — MVP matrices (visibility pass, set=0 binding=0)
+  //   m_lightUbo — lighting params (resolve pass, set=1 binding=0)
+  void createUniformBuffers(VkDevice dev) {
+    // --- Visibility UBO (MVP matrices) ---
     VkBufferCreateInfo bci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     bci.size = sizeof(MVP);
     bci.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
     VmaAllocationCreateInfo aci = {};
     aci.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
-              | VMA_ALLOCATION_CREATE_MAPPED_BIT;  // persistent CPU mapping
+              | VMA_ALLOCATION_CREATE_MAPPED_BIT;
     aci.usage = VMA_MEMORY_USAGE_AUTO;
     VmaAllocationInfo ai;
     vmaCreateBuffer((VmaAllocator)m_alloc, &bci, &aci,
-                    &m_ubo.buffer, &m_ubo.allocation, &ai);
-    m_ubo.mapping    = (uint8_t*)ai.pMappedData;  // CPU can write here anytime
-    m_ubo.bufferSize  = sizeof(MVP);
+                    &m_visUbo.buffer, &m_visUbo.allocation, &ai);
+    m_visUbo.mapping   = (uint8_t*)ai.pMappedData;
+    m_visUbo.bufferSize = sizeof(MVP);
 
-    // Write descriptor: tell shader "UBO is in this buffer at offset 0"
-    VkDescriptorBufferInfo dbi = {m_ubo.buffer, 0, sizeof(MVP)};
-    VkWriteDescriptorSet wds = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-    wds.dstSet = m_ds; wds.dstBinding = 0; wds.descriptorCount = 1;
-    wds.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER; wds.pBufferInfo = &dbi;
-    vkUpdateDescriptorSets(dev, 1, &wds, 0, nullptr);
+    VkDescriptorBufferInfo dbiVis = {m_visUbo.buffer, 0, sizeof(MVP)};
+    VkWriteDescriptorSet wdsVis = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    wdsVis.dstSet = m_visDs; wdsVis.dstBinding = 0; wdsVis.descriptorCount = 1;
+    wdsVis.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER; wdsVis.pBufferInfo = &dbiVis;
+    vkUpdateDescriptorSets(dev, 1, &wdsVis, 0, nullptr);
+
+    // --- Lighting UBO (resolve pass) ---
+    bci.size = sizeof(Lighting);
+    vmaCreateBuffer((VmaAllocator)m_alloc, &bci, &aci,
+                    &m_lightUbo.buffer, &m_lightUbo.allocation, &ai);
+    m_lightUbo.mapping   = (uint8_t*)ai.pMappedData;
+    m_lightUbo.bufferSize = sizeof(Lighting);
+
+    VkDescriptorBufferInfo dbiLight = {m_lightUbo.buffer, 0, sizeof(Lighting)};
+    VkWriteDescriptorSet wdsLight = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    wdsLight.dstSet = m_resolveDs1; wdsLight.dstBinding = 0; wdsLight.descriptorCount = 1;
+    wdsLight.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER; wdsLight.pBufferInfo = &dbiLight;
+    vkUpdateDescriptorSets(dev, 1, &wdsLight, 0, nullptr);
   }
 
   void uploadMesh(const Mesh& m) {
@@ -770,23 +1043,27 @@ private:
 
   // Copy current camera view/proj matrices to GPU uniform buffer.
   // Called at the start of every onRender, before draw commands.
-  void updateCameraUBO() {
+  void updateUniforms() {
+    // MVP for visibility pass
     MVP mvp;
     mvp.model = glm::mat4(1.f);
     mvp.view  = m_camera->getViewMatrix();
-    // Projection with viewport aspect ratio, not render-target aspect
     auto vsz  = m_app->getViewportSize();
     float asp = vsz.width / (float)vsz.height;
-    float nearP = m_modelScale * 0.001f;  // auto-scale: near = 0.1% of model size
-    float farP  = m_modelScale * 5.0f;     // far = 5× model size, plenty of room
+    float nearP = m_modelScale * 0.001f;
+    float farP  = m_modelScale * 5.0f;
     if (nearP < 0.001f) nearP = 0.001f;
     mvp.proj  = glm::perspective(glm::radians(60.f), asp, nearP, farP);
     mvp.proj[1][1] *= -1.f; // Vulkan Y flip
-    mvp.intensity = m_intensity;
-    mvp.lightAz   = m_lightAz;
-    mvp.lightEl   = m_lightEl;
-    mvp.checkerboard = m_checkerboard ? 1.0f : 0.0f;
-    memcpy(m_ubo.mapping, &mvp, sizeof(MVP));
+    memcpy(m_visUbo.mapping, &mvp, sizeof(MVP));
+
+    // Lighting for resolve pass
+    Lighting light;
+    light.intensity    = m_intensity;
+    light.lightAz      = m_lightAz;
+    light.lightEl      = m_lightEl;
+    light.checkerboard = m_checkerboard ? 1.0f : 0.0f;
+    memcpy(m_lightUbo.mapping, &light, sizeof(Lighting));
   }
 };
 
