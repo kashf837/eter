@@ -30,8 +30,69 @@ def parse_step_file(path):
         while len(xyz) < 3: xyz.append(0.0)  # pad 1D/2D to 3D
         cart_points[cid] = xyz
 
+    # Parse DIRECTION entities (needed for AXIS2_PLACEMENT_3D → PLANE)
+    directions = {}
+    for m in re.finditer(r'#(\d+)\s*=\s*DIRECTION\s*\(\s*\'[^\']*\'\s*,\s*\(\s*([^)]+)\s*\)\s*\)\s*;', text):
+        did = int(m.group(1))
+        xyz = [float(v.strip()) for v in m.group(2).split(',')]
+        while len(xyz) < 3: xyz.append(0.0)
+        # Normalize (STEP directions may or may not be unit-length)
+        mag = (xyz[0]*xyz[0] + xyz[1]*xyz[1] + xyz[2]*xyz[2]) ** 0.5
+        if mag > 0: xyz = [v/mag for v in xyz]
+        directions[did] = xyz
+
+    # Parse AXIS2_PLACEMENT_3D entities (origin, Z-axis/normal, X-axis/ref_dir)
+    axises = {}
+    for m in re.finditer(
+        r'#(\d+)\s*=\s*AXIS2_PLACEMENT_3D\s*\(\s*\'[^\']*\'\s*,\s*#(\d+)\s*,\s*#(\d+)\s*,\s*#(\d+)\s*\)\s*;', text):
+        aid = int(m.group(1))
+        oid, zid, xid = int(m.group(2)), int(m.group(3)), int(m.group(4))
+        if oid in cart_points and zid in directions and xid in directions:
+            axises[aid] = (cart_points[oid], directions[zid], directions[xid])
+
     surfaces = []
+    plane_surfaces = []  # collected separately to not interfere with Format B fallback
     skipped_fmts = {}  # track skipped surface types for diagnostics
+
+    # Compute model bounding box from CARTESIAN_POINTs for default plane sizing
+    bbox_min = [float('inf')] * 3
+    bbox_max = [float('-inf')] * 3
+    for cid, xyz in cart_points.items():
+        for i in range(3):
+            if xyz[i] < bbox_min[i]: bbox_min[i] = xyz[i]
+            if xyz[i] > bbox_max[i]: bbox_max[i] = xyz[i]
+    from math import sqrt
+    bbox_diag = sqrt(sum((bbox_max[i] - bbox_min[i])**2 for i in range(3)))
+    plane_half = bbox_diag * 0.002  # 0.2% of model diagonal per half-extent
+
+    # --- PLANE surfaces → degree-1×1 B-spline patches ---
+    for m in re.finditer(r'#(\d+)\s*=\s*PLANE\s*\(\s*\'[^\']*\'\s*,\s*#(\d+)\s*\)\s*;', text):
+        aid = int(m.group(2))
+        if aid not in axises: continue
+        origin, normal, x_dir = axises[aid]
+        # Compute orthonormal basis on the plane
+        ux, uy, uz = x_dir  # U axis = X direction (already normalized)
+        # V axis = cross(normal, x_dir)
+        n = normal
+        vx = n[1]*uz - n[2]*uy
+        vy = n[2]*ux - n[0]*uz
+        vz = n[0]*uy - n[1]*ux
+        # 4 CPs for a rectangular plane patch centered at origin
+        def corner(su, sv):
+            return [origin[0] + su*plane_half*ux + sv*plane_half*vx,
+                    origin[1] + su*plane_half*uy + sv*plane_half*vy,
+                    origin[2] + su*plane_half*uz + sv*plane_half*vz]
+        surf = {
+            'p_u': 1, 'p_v': 1,
+            'n_u': 1, 'n_v': 1,
+            'U': [0.0, 0.0, 1.0, 1.0],
+            'V': [0.0, 0.0, 1.0, 1.0],
+            'cp_grid': [
+                [corner(-1, -1), corner(-1, 1)],
+                [corner( 1, -1), corner( 1, 1)],
+            ]
+        }
+        plane_surfaces.append(surf)
 
     # --- Format A: standalone B_SPLINE_SURFACE_WITH_KNOTS entities ---
     for m in re.finditer(r'#(\d+)\s*=\s*B_SPLINE_SURFACE_WITH_KNOTS\s*\((.*?)\)\s*;', text, re.DOTALL):
@@ -92,6 +153,9 @@ def parse_step_file(path):
             except Exception as e:
                 pass
 
+    # Prepend plane surfaces (after Format A/B detection to preserve B-spline fallback)
+    surfaces = plane_surfaces + surfaces
+
     # --- Diagnostic: count all surface types in the STEP file ---
     all_surf_types = {}
     for m in re.finditer(r'#\d+\s*=\s*(\w+)\s*\(', text):
@@ -102,10 +166,13 @@ def parse_step_file(path):
     if all_surf_types:
         print(f"STEP surface types found: {dict(sorted(all_surf_types.items()))}")
         bsp_total = all_surf_types.get('B_SPLINE_SURFACE', 0) + all_surf_types.get('B_SPLINE_SURFACE_WITH_KNOTS', 0)
+        plane_total = all_surf_types.get('PLANE', 0)
         non_bsp = sum(v for k,v in all_surf_types.items()
-                      if k not in ('B_SPLINE_SURFACE','B_SPLINE_SURFACE_WITH_KNOTS'))
+                      if k not in ('B_SPLINE_SURFACE','B_SPLINE_SURFACE_WITH_KNOTS','PLANE'))
         if non_bsp > 0:
-            print(f"WARNING: {non_bsp} non-B-spline surfaces were SKIPPED ({len(surfaces)} B-splines loaded)")
+            print(f"WARNING: {non_bsp} non-B-spline/non-PLANE surfaces SKIPPED ({len(surfaces)} surfaces loaded)")
+        else:
+            print(f"Loaded {len(surfaces)} surfaces ({bsp_total} B-splines + {plane_total} planes)")
 
     return surfaces
 
@@ -126,7 +193,7 @@ def parse_standalone_surface(body, cart_points):
         if row_pts: cp_grid.append(row_pts)
 
     knot_section = ','.join(parts[4:])
-    lists = re.findall(r'\(([0-9.,\s]+)\)', knot_section)
+    lists = re.findall(r'\(([0-9eE.\-+,\s]+)\)', knot_section)
     if len(lists) < 4:
         return None
     u_mult  = [int(float(v.strip())) for v in lists[0].split(',') if v.strip()]
@@ -175,6 +242,13 @@ def main():
         return
 
     infile = args[0]
+
+    # Safety: refuse to overwrite the input file
+    if not all_flag and len(args) < 2:
+        print("ERROR: single-file mode requires an output path (to avoid overwriting input)")
+        print("Usage: python step2surf.py [--all] <input.STEP> <output.surf>")
+        return
+
     surfaces = parse_step_file(infile)
 
     if not surfaces:
@@ -184,12 +258,12 @@ def main():
     print(f"Found {len(surfaces)} surfaces")
 
     if all_flag:
-        base = args[1] if len(args) > 1 else infile.replace('.STEP', '').replace('.step', '')
+        base = args[1] if len(args) > 1 else re.sub(r'(?i)\.(STEP|STP)$', '', infile)
         os.makedirs(os.path.dirname(base) or '.', exist_ok=True)
         for idx, s in enumerate(surfaces):
             write_surf(f"{base}_{idx:04d}.surf", s)
     else:
-        out = args[1] if len(args) > 1 else infile.replace('.STEP', '.surf').replace('.step', '.surf')
+        out = args[1]
         write_surf(out, surfaces[0])
 
 
