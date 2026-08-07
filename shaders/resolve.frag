@@ -1,13 +1,10 @@
 #version 450
 // ETER §6.2 Crack Filling — Pass 2 (resolve) fragment shader
 //
-// All valid pixels:      SSBO Bézier evaluation (pure, no G-buffer blend).
-//                        CPs are centered per-patch before upload, so FP32
-//                        precision is safe even for large STP models.
-//                        Normals are pixel-accurate and consistent across
-//                        all patch boundaries → no visible seams.
-// Conservative ON:       G-buffer + 4-neighbor normal blend (stability).
-// Crack pixels:          SSBO Bézier from nearest valid neighbor.
+// All valid pixels:  SSBO Bézier evaluation (pure, pixel-accurate normals).
+//                    CPs are centered per-patch → FP32-safe at any scale.
+//                    Consistent across all patch boundaries → no seams.
+// Crack pixels:      SSBO Bézier from nearest valid neighbor.
 
 layout(location = 0) out vec4 outColor;
 
@@ -22,9 +19,9 @@ layout(std140, set = 1, binding = 0) uniform Lighting {
     float lightEl;
     float checkerboard;
     float boundary;
-    float conservative;
     float patchCols;
     float _pad;
+    float _pad2;
 } lighting;
 
 layout(std430, set = 2, binding = 0) buffer BezierData {
@@ -142,8 +139,6 @@ void main()
     if (isFg) {
         uint patchID = texelFetch(gbufID, coord, 0).r;
         vec2 paramUV = texelFetch(gbufUV, coord, 0).rg;
-        vec3 N = texelFetch(gbufNorm, coord, 0).xyz;
-        float checker = mix(1.0, decodeChecker(patchID), lighting.checkerboard);
 
         // Detect patch boundary
         uint n0 = texelFetchOffset(gbufID, coord, 0, ivec2( 1,  0)).r;
@@ -152,25 +147,9 @@ void main()
         uint n3 = texelFetchOffset(gbufID, coord, 0, ivec2( 0, -1)).r;
         bool isBoundary = (n0 != patchID || n1 != patchID || n2 != patchID || n3 != patchID);
 
-        vec3 colorOut;
-        if (lighting.conservative > 0.5) {
-            // Conservative ON: blend with all valid neighbors
-            vec3 Nn = N; float w = 1.0;
-            vec4 np = texelFetchOffset(gbufPos, coord, 0, ivec2( 1,  0));
-            vec4 nn = texelFetchOffset(gbufPos, coord, 0, ivec2(-1,  0));
-            vec4 nt = texelFetchOffset(gbufPos, coord, 0, ivec2( 0,  1));
-            vec4 nb = texelFetchOffset(gbufPos, coord, 0, ivec2( 0, -1));
-            if (np.a >= 0.5) { Nn += texelFetchOffset(gbufNorm, coord, 0, ivec2( 1,  0)).xyz; w += 1.0; }
-            if (nn.a >= 0.5) { Nn += texelFetchOffset(gbufNorm, coord, 0, ivec2(-1,  0)).xyz; w += 1.0; }
-            if (nt.a >= 0.5) { Nn += texelFetchOffset(gbufNorm, coord, 0, ivec2( 0,  1)).xyz; w += 1.0; }
-            if (nb.a >= 0.5) { Nn += texelFetchOffset(gbufNorm, coord, 0, ivec2( 0, -1)).xyz; w += 1.0; }
-            N = Nn / w;
-            colorOut = shadeNormal(N, lightDir, checker);
-        } else {
-            // SSBO Bézier for all pixels → pixel-accurate, boundary-consistent normals.
-            // CPs are centered per-patch so FP32 precision is safe at any model scale.
-            colorOut = shadeSSBO(patchID, paramUV, lightDir);
-        }
+        // SSBO Bézier for all pixels → pixel-accurate, boundary-consistent normals.
+        // CPs are centered per-patch so FP32 precision is safe at any model scale.
+        vec3 colorOut = shadeSSBO(patchID, paramUV, lightDir);
 
         // Boundary debug overlay
         outColor = (lighting.boundary > 0.5 && isBoundary)

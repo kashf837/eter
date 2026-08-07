@@ -46,7 +46,7 @@ static std::vector<char> readFile(const std::string& fn) {
 // MVP matrices for visibility pass (set=0, binding=0 in visibility.vert)
 struct MVP { glm::mat4 model, view, proj; };
 // Lighting params for resolve pass (set=1, binding=0 in resolve.frag)
-struct Lighting { float intensity, lightAz, lightEl, checkerboard, boundary, conservative, patchCols, _pad; };
+struct Lighting { float intensity, lightAz, lightEl, checkerboard, boundary, patchCols, _pad, _pad2; };
 static_assert(sizeof(Lighting) == 32, "Lighting must be 32 bytes (2 vec4)");
 
 // ============================================================
@@ -560,15 +560,6 @@ public:
     ImGui::SliderFloat("Light Elevation", &m_lightEl, -1.57f, 1.57f);
     ImGui::Checkbox("Checkerboard", &m_checkerboard);
     ImGui::Checkbox("Show Boundaries", &m_showBoundary);
-    if (ImGui::Checkbox("Conservative Raster", &m_useConservative)) {
-        // Recreate vis pipeline with/without conservative raster
-        VkDevice dev = m_app->getDevice();
-        NVVK_CHECK(vkDeviceWaitIdle(dev));
-        vkDestroyPipeline(dev, m_pipelineVis, nullptr);
-        m_pipelineVis = VK_NULL_HANDLE;
-        createVisPipeline(dev);
-        LOGI("Conservative raster %s, vis pipeline recreated\n", m_useConservative ? "ON" : "OFF");
-    }
     ImGui::Text("Triangles: %d", m_indexCount / 3);
     ImGui::TextDisabled("%d FPS / %.3fms",
         static_cast<int>(ImGui::GetIO().Framerate), 1000.f / ImGui::GetIO().Framerate);
@@ -661,7 +652,6 @@ private:
   float                         m_intensity = 1.0f;
   float                         m_lightAz   = 0.6f;   // azimuth (radians)
   float                         m_lightEl   = 0.8f;   // elevation (radians)
-  bool                          m_useConservative = false;
   bool                          m_checkerboard    = false;
   bool                          m_showBoundary    = false;
   nvapp::Application*           m_app{};
@@ -727,7 +717,6 @@ private:
   VkDescriptorSet       m_resolveDs2        = VK_NULL_HANDLE;     // set=2: SSBO (shared)
   nvvk::Buffer          m_lightUbo[MAX_FIF]{};   // Lighting UBO, one per frame-in-flight
   int                   m_frameIndex = 0;         // cycles 0..MAX_FIF-1 each frame
-  bool                  m_conservativeRaster = false;  // extension support
 #pragma endregion
 
   // ============================================================
@@ -816,12 +805,6 @@ private:
   // Visibility pass pipeline (ETER §6.1 Pass 1): mesh → G-buffer.
   // Outputs worldPos, worldNormal, and patchID to 3 color attachments.
   void createVisPipeline(VkDevice dev) {
-    // Check conservative rasterization support
-    VkPhysicalDeviceConservativeRasterizationPropertiesEXT crProps = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONSERVATIVE_RASTERIZATION_PROPERTIES_EXT};
-    VkPhysicalDeviceProperties2 props2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &crProps};
-    vkGetPhysicalDeviceProperties2(m_app->getPhysicalDevice(), &props2);
-    m_conservativeRaster = (crProps.primitiveOverestimationSize > 0.0f);
-    LOGI("Conservative rasterization: %s\n", m_conservativeRaster ? "available" : "N/A");
 
     // Load compiled SPIR-V binaries
     auto vCode = readFile("shaders/spv/visibility.vert.spv");
@@ -864,10 +847,6 @@ private:
     VkPipelineViewportStateCreateInfo vp = {VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, 0, 0, 1, nullptr, 1, nullptr};
     VkPipelineRasterizationStateCreateInfo rs = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
     rs.lineWidth = 1.f;
-    VkPipelineRasterizationConservativeStateCreateInfoEXT cr = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_CONSERVATIVE_STATE_CREATE_INFO_EXT};
-    cr.conservativeRasterizationMode = VK_CONSERVATIVE_RASTERIZATION_MODE_OVERESTIMATE_EXT;
-    cr.extraPrimitiveOverestimationSize = 0.0f;
-    if (m_useConservative) rs.pNext = &cr;
     VkPipelineMultisampleStateCreateInfo ms = {VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
     ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
 
@@ -1236,7 +1215,6 @@ private:
     light.lightEl      = m_lightEl;
     light.checkerboard = m_checkerboard ? 1.0f : 0.0f;
     light.boundary     = m_showBoundary   ? 1.0f : 0.0f;
-    light.conservative = m_useConservative ? 1.0f : 0.0f;
     light.patchCols    = (float)m_patchCols;
     memcpy(m_lightUbo[m_frameIndex].mapping, &light, sizeof(Lighting));
   }
@@ -1265,7 +1243,7 @@ int main(int argc, char** argv)
   // Vulkan context: instance + device + queues
   nvvk::ContextInitInfo vkSetup;
   vkSetup.instanceExtensions = {VK_EXT_DEBUG_UTILS_EXTENSION_NAME};
-  vkSetup.deviceExtensions   = {{VK_KHR_SWAPCHAIN_EXTENSION_NAME}, {VK_EXT_CONSERVATIVE_RASTERIZATION_EXTENSION_NAME, nullptr, true}};
+  vkSetup.deviceExtensions   = {{VK_KHR_SWAPCHAIN_EXTENSION_NAME}};
   parameterRegistry.add({"validation"}, &vkSetup.enableValidationLayers);
   parameterRegistry.add({"verbose"},   &vkSetup.verbose);
   parameterRegistry.add({"forcedevice"}, &vkSetup.forceGPU);
