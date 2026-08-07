@@ -296,7 +296,8 @@ public:
              m_center[0],m_center[1],m_center[2],m_modelScale,dist);
       glm::dvec3 e = m_camera->getEye();
       m_lastEye[0]=(float)e.x; m_lastEye[1]=(float)e.y; m_lastEye[2]=(float)e.z;
-      m_lastPath = path;
+      // Adaptive re-tessellation only for single .surf files, not STP directories
+      m_lastPath = isDir ? "" : path;
     }
     if (isDir) std::filesystem::remove_all(path);
   }
@@ -603,7 +604,7 @@ public:
             m_idleFrames = 0;
         } else if (m_rebuildPending) {
             m_idleFrames++;
-            if (m_idleFrames >= 30) {  // ~0.5s @60fps
+            if (m_idleFrames >= 30 && !m_lastPath.empty()) {  // ~0.5s @60fps
                 CameraParams cam;
                 cam.camX = m_dirtyEye[0]; cam.camY = m_dirtyEye[1]; cam.camZ = m_dirtyEye[2];
                 cam.fovY = 60.f; cam.scrW = m_imgW; cam.scrH = m_imgH;
