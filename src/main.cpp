@@ -9,6 +9,7 @@
 #include <fstream>
 #include <filesystem>
 #include <algorithm>
+#include <cctype>
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 #include <backends/imgui_impl_vulkan.h>
@@ -619,7 +620,10 @@ public:
             auto path = nvgui::windowOpenFileDialog(m_app->getWindowHandle(), "Open SURF / STEP", "*.surf;*.stp;*.step");
             if (!path.empty()) {
                 std::string sp = path.string();
-                if (sp.ends_with(".stp") || sp.ends_with(".step")) {
+                // Case-insensitive extension check
+                std::string lower = sp;
+                for (auto& c : lower) c = (char)tolower((unsigned char)c);
+                if (lower.ends_with(".stp") || lower.ends_with(".step")) {
                     auto stem = path.stem().string();
                     m_tempDir = (path.parent_path() / (stem + "_parts")).string();
                     std::filesystem::create_directory(m_tempDir);
