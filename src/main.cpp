@@ -44,7 +44,7 @@ static std::vector<char> readFile(const std::string& fn) {
 
 // MVP matrices passed to vertex shader via uniform buffer
 // (matches layout(set=0, binding=0) in mesh.vert)
-struct MVP { glm::mat4 model, view, proj; float intensity, lightAz, lightEl; float _pad; };
+struct MVP { glm::mat4 model, view, proj; float intensity, lightAz, lightEl, checkerboard; };
 
 // ============================================================
 // Mesh — host-side triangle mesh data
@@ -54,7 +54,7 @@ struct Mesh {
     std::vector<uint32_t> i;  // triangle indices
     float bbMin[3], bbMax[3];
     bool   empty() const { return i.empty(); }
-    int    verts() const { return (int)(v.size()/6); }
+    int    verts() const { return (int)(v.size()/7); }
     float  scale() const { float dx=bbMax[0]-bbMin[0],dy=bbMax[1]-bbMin[1],dz=bbMax[2]-bbMin[2];
                            float s=dx>dy?dx:dy; s=s>dz?s:dz; return s<1.f?1.f:s; }
     float  cx() const { return (bbMin[0]+bbMax[0])*0.5f; }
@@ -74,14 +74,20 @@ public:
         PatchInfo* info;
         float* verts = nurbs_adaptive_eval(path, cam, &nu, &nv, &info, &total);
         if (!verts) { fprintf(stderr, "  [SKIP] %s\n", path); return m; }
+        // Build cumulative grid offsets so checkerboard crosses patch boundaries
+        std::vector<int> gx0(nu*nv), gy0(nu*nv);
+        for (int pj = 0; pj < nv; pj++) { gx0[pj] = 0; for (int pi = 1; pi < nu; pi++) gx0[pi*nv+pj] = gx0[(pi-1)*nv+pj] + info[(pi-1)*nv+pj].tu; }
+        for (int pi = 0; pi < nu; pi++) { gy0[pi*nv] = 0; for (int pj = 1; pj < nv; pj++) gy0[pi*nv+pj] = gy0[pi*nv+pj-1] + info[pi*nv+pj-1].tv; }
         for (int pi = 0; pi < nu; pi++)
             for (int pj = 0; pj < nv; pj++) {
                 PatchInfo* p = &info[pi*nv+pj];
                 float* patch = verts + p->offset * 6;
-                uint32_t base = (uint32_t)m.v.size() / 6;
+                uint32_t base = (uint32_t)m.v.size() / 7;
+                int gox = gx0[pi*nv+pj], goy = gy0[pi*nv+pj];
                 for (int y = 0; y < p->tv; y++)
                     for (int x = 0; x < p->tu; x++) {
                         int k = y*p->tu + x;
+                        float checker = ((((gox+x)/2) + ((goy+y)/2)) & 1) ? 0.0f : 1.0f;
                         float px=patch[k*6+0], py=patch[k*6+1], pz=patch[k*6+2];
                         float nx=patch[k*6+3], ny=patch[k*6+4], nz=patch[k*6+5];
                         float nl=nx*nx+ny*ny+nz*nz;
@@ -94,7 +100,7 @@ public:
                             nl=nx*nx+ny*ny+nz*nz;
                         }
                         float inv=1.f/(sqrtf(nl)+1e-10f);
-                        m.v.insert(m.v.end(),{px,py,pz,nx*inv,ny*inv,nz*inv});
+                        m.v.insert(m.v.end(),{px,py,pz,nx*inv,ny*inv,nz*inv,checker});
                         if(px<m.bbMin[0])m.bbMin[0]=px;if(py<m.bbMin[1])m.bbMin[1]=py;if(pz<m.bbMin[2])m.bbMin[2]=pz;
                         if(px>m.bbMax[0])m.bbMax[0]=px;if(py>m.bbMax[1])m.bbMax[1]=py;if(pz>m.bbMax[2])m.bbMax[2]=pz;
                     }
@@ -150,10 +156,12 @@ private:
     static void addPatchGrid(Mesh& m, const float* verts, int nu, int nv, int res) {
         for (int pi = 0; pi < nu; pi++)
             for (int pj = 0; pj < nv; pj++) {
-                uint32_t base = (uint32_t)m.v.size() / 6;
+                uint32_t base = (uint32_t)m.v.size() / 7;
                 const float* p = verts + (pi*nv+pj)*res*res*6;
                 for (int y = 0; y < res; y++)
                     for (int x = 0; x < res; x++) {
+                        int gx = pi*res + x, gy = pj*res + y;
+                        float checker = (((gx/2) + (gy/2)) & 1) ? 0.0f : 1.0f;
                         int idx = y*res+x;
                         float px=p[idx*6+0], py=p[idx*6+1], pz=p[idx*6+2];
                         float gnx=p[idx*6+3], gny=p[idx*6+4], gnz=p[idx*6+5];
@@ -167,7 +175,7 @@ private:
                             gnLen = gnx*gnx+gny*gny+gnz*gnz;
                         }
                         float inv=1.f/(sqrtf(gnLen)+1e-10f);
-                        m.v.insert(m.v.end(),{px,py,pz, gnx*inv,gny*inv,gnz*inv});
+                        m.v.insert(m.v.end(),{px,py,pz, gnx*inv,gny*inv,gnz*inv, checker});
                         if(px<m.bbMin[0])m.bbMin[0]=px; if(py<m.bbMin[1])m.bbMin[1]=py; if(pz<m.bbMin[2])m.bbMin[2]=pz;
                         if(px>m.bbMax[0])m.bbMax[0]=px; if(py>m.bbMax[1])m.bbMax[1]=py; if(pz>m.bbMax[2])m.bbMax[2]=pz;
                     }
@@ -409,6 +417,7 @@ public:
     ImGui::SliderFloat("Intensity", &m_intensity, 0.0f, 2.0f);
     ImGui::SliderFloat("Light Azimuth", &m_lightAz, -3.14f, 3.14f);
     ImGui::SliderFloat("Light Elevation", &m_lightEl, 0.0f, 1.57f);
+    ImGui::Checkbox("Checkerboard", &m_checkerboard);
     if (ImGui::Checkbox("Conservative Raster", &m_useConservative)) {
         if (!m_lastPath.empty()) { m_pendingLoad = m_lastPath; m_pendingIsDir = false; }
     }
@@ -435,15 +444,14 @@ public:
             CameraParams cam;
             cam.camX=(float)e.x; cam.camY=(float)e.y; cam.camZ=(float)e.z;
             cam.fovY=60.f; cam.scrW=m_imgW; cam.scrH=m_imgH;
-            int res = compute_adaptive_res(m_lastPath.c_str(), &cam);
-            Mesh m = MeshBuilder::single(m_lastPath.c_str(), res);
+            Mesh m = MeshBuilder::adaptive(m_lastPath.c_str(), &cam);
             if (!m.empty()) {
                 if (m_indexCount > 0) { m_alloc.destroyBuffer(m_indexBuffer); m_alloc.destroyBuffer(m_vertexBuffer); m_indexCount = 0; }
                 uploadMesh(m);
                 m_modelScale = m.scale();
                 m_center[0]=m.cx(); m_center[1]=m.cy(); m_center[2]=m.cz();
                 m_lastEye[0]=(float)e.x; m_lastEye[1]=(float)e.y; m_lastEye[2]=(float)e.z;
-                LOGI("[Adaptive] camera moved, res=%d\n", res);
+                LOGI("[Adaptive] camera moved, %d verts\n", m.verts());
             }
         }
     }
@@ -493,6 +501,7 @@ private:
   float                         m_lightAz   = 0.6f;   // azimuth (radians)
   float                         m_lightEl   = 0.8f;   // elevation (radians)
   bool                          m_useConservative = false;
+  bool                          m_checkerboard    = true;
   nvapp::Application*           m_app{};
   nvvk::ResourceAllocator       m_alloc{};        // GPU memory manager (wraps VMA)
   nvvk::SamplerPool             m_samplerPool{};
@@ -625,15 +634,16 @@ private:
     plCI.setLayoutCount = 1; plCI.pSetLayouts = &m_dsLayout;
     NVVK_CHECK(vkCreatePipelineLayout(dev, &plCI, nullptr, &m_pipelineLayout));
 
-    // Vertex input: 6 floats per vertex (x,y,z + nx,ny,nz)
-    VkVertexInputBindingDescription vib = {0, 6 * sizeof(float), VK_VERTEX_INPUT_RATE_VERTEX};
-    VkVertexInputAttributeDescription via[2] = {
-        {0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0},           // location=0: position (offset 0)
-        {1, 0, VK_FORMAT_R32G32B32_SFLOAT, 3*sizeof(float)}, // location=1: normal (offset 12)
+    // Vertex input: 7 floats per vertex (x,y,z + nx,ny,nz + checker)
+    VkVertexInputBindingDescription vib = {0, 7 * sizeof(float), VK_VERTEX_INPUT_RATE_VERTEX};
+    VkVertexInputAttributeDescription via[3] = {
+        {0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0},           // location=0: position
+        {1, 0, VK_FORMAT_R32G32B32_SFLOAT, 3*sizeof(float)}, // location=1: normal
+        {2, 0, VK_FORMAT_R32_SFLOAT,        6*sizeof(float)}, // location=2: checker
     };
     VkPipelineVertexInputStateCreateInfo vi = {VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
     vi.vertexBindingDescriptionCount = 1; vi.pVertexBindingDescriptions = &vib;
-    vi.vertexAttributeDescriptionCount = 2; vi.pVertexAttributeDescriptions = via;
+    vi.vertexAttributeDescriptionCount = 3; vi.pVertexAttributeDescriptions = via;
 
     // Standard pipeline state: triangle list, 1 viewport, no blending
     VkPipelineInputAssemblyStateCreateInfo ia = {VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
@@ -775,6 +785,7 @@ private:
     mvp.intensity = m_intensity;
     mvp.lightAz   = m_lightAz;
     mvp.lightEl   = m_lightEl;
+    mvp.checkerboard = m_checkerboard ? 1.0f : 0.0f;
     memcpy(m_ubo.mapping, &mvp, sizeof(MVP));
   }
 };
