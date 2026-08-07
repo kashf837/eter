@@ -99,7 +99,9 @@ void evalBezier(uint seqID, vec2 uv, out vec3 pos, out vec3 norm)
 vec3 shadeNormal(vec3 N, vec3 L, float checker)
 {
     float ambient = 0.4;
-    float diffuse = max(dot(normalize(N), L), 0.0);
+    float NdotL = dot(normalize(N), L);
+    // Two-sided: front faces get full diffuse, back faces get ~35% diffuse
+    float diffuse = max(NdotL, 0.0) + max(-NdotL, 0.0) * 0.35;
     return vec3(0.85) * (ambient + diffuse * 0.6 * checker) * lighting.intensity;
 }
 
