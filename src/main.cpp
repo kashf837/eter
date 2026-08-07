@@ -157,7 +157,8 @@ public:
         Mesh m; resetBBox(m);
         std::vector<std::string> files;
         for (auto& e : fs::directory_iterator(dirPath))
-            if (e.path().extension() == ".surf") files.push_back(e.path().string());
+            if (e.is_regular_file() && e.path().extension() == ".surf")
+                files.push_back(e.path().string());
         std::sort(files.begin(), files.end());
         LOGI("Loading %zu surf files (res=%d)...\n", files.size(), res);
         int skipped = 0;
@@ -389,10 +390,14 @@ public:
   // ============================================================
   void onRender(VkCommandBuffer cmd) override
   {
-    // Process pending mesh reload (deferred from menu callback)
+    // Process pending mesh reload (deferred from menu callback).
+    // Save+clear before processing: if doReload throws (e.g. OOM), we
+    // don't retry every frame.
     if (!m_pendingLoad.empty()) {
-        doReload(m_pendingLoad, m_pendingIsDir);
+        std::string loadPath = m_pendingLoad;
+        bool        loadDir  = m_pendingIsDir;
         m_pendingLoad.clear();
+        doReload(loadPath, loadDir);
         return;
     }
     updateUniforms();
@@ -628,8 +633,19 @@ public:
                     m_tempDir = (path.parent_path() / (stem + "_parts")).string();
                     std::filesystem::create_directory(m_tempDir);
                     std::string cmd = "python scripts/step2surf.py --all \"" + sp + "\" \"" + m_tempDir + "/out\"";
-                    LOGI("Converting STEP...\n"); system(cmd.c_str());
-                    m_pendingLoad = m_tempDir; m_pendingIsDir = true;
+                    LOGI("Converting STEP...\n");
+                    int ret = system(cmd.c_str());
+                    // Verify conversion succeeded and produced .surf files
+                    bool hasFiles = false;
+                    if (ret == 0) {
+                        for (auto& e : std::filesystem::directory_iterator(m_tempDir))
+                            if (e.is_regular_file() && e.path().extension() == ".surf") { hasFiles = true; break; }
+                    }
+                    if (hasFiles) {
+                        m_pendingLoad = m_tempDir; m_pendingIsDir = true;
+                    } else {
+                        LOGI("STEP conversion failed (ret=%d, hasFiles=%d)\n", ret, (int)hasFiles);
+                    }
                 } else { m_pendingLoad = sp; m_pendingIsDir = false; }
             }
         }
