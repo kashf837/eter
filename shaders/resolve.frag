@@ -15,13 +15,13 @@ layout(set = 0, binding = 3) uniform sampler2D gbufUV;
 
 layout(std140, set = 1, binding = 0) uniform Lighting {
     float intensity;
-    float lightAz;
-    float lightEl;
+    float lightDirX;
+    float lightDirY;
+    float lightDirZ;
     float checkerboard;
     float boundary;
     float patchCols;
     float _pad;
-    float _pad2;
 } lighting;
 
 layout(std430, set = 2, binding = 0) buffer BezierData {
@@ -130,11 +130,7 @@ void main()
     vec4 posSample = texelFetch(gbufPos, coord, 0);
     bool isFg = (posSample.a >= 0.5);
 
-    vec3 lightDir = vec3(
-        cos(lighting.lightEl) * sin(lighting.lightAz),
-        sin(lighting.lightEl),
-        cos(lighting.lightEl) * cos(lighting.lightAz)
-    );
+    vec3 lightDir = normalize(vec3(lighting.lightDirX, lighting.lightDirY, lighting.lightDirZ));
 
     // ============================================================
     // Valid pixel

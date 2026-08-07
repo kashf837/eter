@@ -46,7 +46,7 @@ static std::vector<char> readFile(const std::string& fn) {
 // MVP matrices for visibility pass (set=0, binding=0 in visibility.vert)
 struct MVP { glm::mat4 model, view, proj; };
 // Lighting params for resolve pass (set=1, binding=0 in resolve.frag)
-struct Lighting { float intensity, lightAz, lightEl, checkerboard, boundary, patchCols, _pad, _pad2; };
+struct Lighting { float intensity, lightDirX, lightDirY, lightDirZ, checkerboard, boundary, patchCols, _pad; };
 static_assert(sizeof(Lighting) == 32, "Lighting must be 32 bytes (2 vec4)");
 
 // ============================================================
@@ -557,8 +557,6 @@ public:
   {
     ImGui::Begin("Settings");
     ImGui::SliderFloat("Intensity", &m_intensity, 0.0f, 2.0f);
-    ImGui::SliderFloat("Light Azimuth", &m_lightAz, -3.14f, 3.14f);
-    ImGui::SliderFloat("Light Elevation", &m_lightEl, -1.57f, 1.57f);
     ImGui::Checkbox("Checkerboard", &m_checkerboard);
     ImGui::Checkbox("Show Boundaries", &m_showBoundary);
     ImGui::Text("Triangles: %d", m_indexCount / 3);
@@ -651,8 +649,6 @@ private:
   std::string                   m_tempDir;
   bool                          m_pendingIsDir = false;  // set by menu, processed next frame
   float                         m_intensity = 1.0f;
-  float                         m_lightAz   = 0.6f;   // azimuth (radians)
-  float                         m_lightEl   = 0.8f;   // elevation (radians)
   bool                          m_checkerboard    = false;
   bool                          m_showBoundary    = false;
   nvapp::Application*           m_app{};
@@ -1209,14 +1205,20 @@ private:
     mvp.proj[1][1] *= -1.f; // Vulkan Y flip
     memcpy(m_visUbo[m_frameIndex].mapping, &mvp, sizeof(MVP));
 
-    // Lighting for resolve pass
+    // Lighting for resolve pass — light comes from camera (headlight model)
     Lighting light = {};
     light.intensity    = m_intensity;
-    light.lightAz      = m_lightAz;
-    light.lightEl      = m_lightEl;
     light.checkerboard = m_checkerboard ? 1.0f : 0.0f;
     light.boundary     = m_showBoundary   ? 1.0f : 0.0f;
     light.patchCols    = (float)m_patchCols;
+    // Camera-view lighting: direction from model center toward camera eye
+    glm::dvec3 eye = m_camera->getEye();
+    glm::vec3 lightDir = glm::normalize(glm::vec3(eye.x - m_center[0],
+                                                   eye.y - m_center[1],
+                                                   eye.z - m_center[2]));
+    light.lightDirX = lightDir.x;
+    light.lightDirY = lightDir.y;
+    light.lightDirZ = lightDir.z;
     memcpy(m_lightUbo[m_frameIndex].mapping, &light, sizeof(Lighting));
   }
 };
