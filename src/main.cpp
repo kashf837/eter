@@ -169,7 +169,7 @@ public:
             if ((i+1) % 500 == 0) LOGI("  [%zu/%zu] ...\n", i+1, files.size());
             int nu, nv; float* cp = nullptr;
             float* verts = nurbs_wireframe(files[i].c_str(), res, &nu, &nv, &cp);
-            if (!verts) { skipped++; free(cp); continue; }
+            if (!verts) { skipped++; free(cp); fprintf(stderr, "  [SKIP %d] %s\n", skipped, files[i].c_str()); continue; }
             addPatchGrid(m, verts, cp, nu, nv, res);
             free(verts); free(cp);
         }
