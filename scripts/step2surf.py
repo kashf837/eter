@@ -33,6 +33,143 @@ def parse_step_file(path):
     surfaces = []
     skipped_fmts = {}  # track skipped surface types for diagnostics
 
+    # ================================================================
+    # PLANE → trimmed triangle patches (boundary chain + triangulation)
+    # ================================================================
+
+    # Parse DIRECTION entities (for AXIS2_PLACEMENT_3D)
+    directions = {}
+    for m in re.finditer(r'#(\d+)\s*=\s*DIRECTION\s*\(\s*\'[^\']*\'\s*,\s*\(\s*([^)]+)\s*\)\s*\)\s*;', text):
+        xyz = [float(v.strip()) for v in m.group(2).split(',')]
+        while len(xyz) < 3: xyz.append(0.0)
+        mag = (xyz[0]*xyz[0] + xyz[1]*xyz[1] + xyz[2]*xyz[2]) ** 0.5
+        if mag > 0: xyz = [v/mag for v in xyz]
+        directions[int(m.group(1))] = xyz
+
+    # Parse AXIS2_PLACEMENT_3D entities
+    axises = {}
+    for m in re.finditer(
+        r'#(\d+)\s*=\s*AXIS2_PLACEMENT_3D\s*\(\s*\'[^\']*\'\s*,\s*#(\d+)\s*,\s*#(\d+)\s*,\s*#(\d+)\s*\)\s*;', text):
+        aid, oid, zid, xid = int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4))
+        if oid in cart_points and zid in directions and xid in directions:
+            axises[aid] = (cart_points[oid], directions[zid], directions[xid])
+
+    # Boundary chain: VERTEX_POINT → EDGE_CURVE → ORIENTED_EDGE → EDGE_LOOP → FACE_OUTER_BOUND
+    vertex_points = {}
+    for m in re.finditer(
+        r'#(\d+)\s*=\s*VERTEX_POINT\s*\(\s*\'[^\']*\'\s*,\s*#(\d+)\s*\)\s*;', text):
+        vertex_points[int(m.group(1))] = int(m.group(2))
+
+    # EDGE_CURVE: id → (vp1, vp2)
+    edge_curves = {}
+    for m in re.finditer(
+        r'#(\d+)\s*=\s*EDGE_CURVE\s*\(\s*\'[^\']*\'\s*,\s*#(\d+)\s*,\s*#(\d+)\s*,', text):
+        edge_curves[int(m.group(1))] = (int(m.group(2)), int(m.group(3)))
+
+    # ORIENTED_EDGE: id → (edge_curve_id, orientation)  orientation=True means forward
+    oriented_edges = {}
+    for m in re.finditer(
+        r'#(\d+)\s*=\s*ORIENTED_EDGE\s*\(\s*\'[^\']*\'\s*,\s*\*\s*,\s*\*\s*,\s*#(\d+)\s*,\s*(\.\w\.)\s*\)', text):
+        oriented_edges[int(m.group(1))] = (int(m.group(2)), m.group(3) == '.T.')
+
+    # EDGE_LOOP: id → [oriented_edge_ids]
+    edge_loops = {}
+    for m in re.finditer(
+        r'#(\d+)\s*=\s*EDGE_LOOP\s*\(\s*\'[^\']*\'\s*,\s*\(([^)]+)\)', text):
+        el_id = int(m.group(1))
+        edge_loops[el_id] = [int(s.strip().lstrip('#')) for s in m.group(2).split(',') if s.strip()]
+
+    # FACE_OUTER_BOUND: id → edge_loop_id
+    face_outer_bounds = {}
+    for m in re.finditer(
+        r'#(\d+)\s*=\s*FACE_OUTER_BOUND\s*\(\s*\'[^\']*\'\s*,\s*#(\d+)\s*,', text):
+        face_outer_bounds[int(m.group(1))] = int(m.group(2))
+
+    # ADVANCED_FACE: surface_id → [bound_ids]
+    surface_to_bounds = {}
+    for m in re.finditer(
+        r'#\d+\s*=\s*ADVANCED_FACE\s*\(\s*\'[^\']*\'\s*,\s*\(([^)]+)\)\s*,\s*#(\d+)\s*,', text):
+        surface_id = int(m.group(2))
+        surface_to_bounds[surface_id] = [int(s.strip().lstrip('#'))
+            for s in m.group(1).split(',') if s.strip()]
+
+    # For each PLANE: trace boundary → ordered vertices → triangulate → degree-elevate
+    # Degree elevation coefficients: degree 1 → 3 (for Bézier basis)
+    elev = [
+        [1.0, 0.0],
+        [2.0/3.0, 1.0/3.0],
+        [1.0/3.0, 2.0/3.0],
+        [0.0, 1.0],
+    ]
+
+    def elev_cp(P, k, l):
+        """Elevate bilinear CP grid P[2][2] to bicubic at (k,l), k,l=0..3"""
+        r = [0.0, 0.0, 0.0, 1.0]
+        for i in range(2):
+            for j in range(2):
+                w = elev[k][i] * elev[l][j]
+                for d in range(3):
+                    r[d] += w * P[i][j][d]
+        return r
+
+    plane_tri_count = 0
+    for m in re.finditer(r'#(\d+)\s*=\s*PLANE\s*\(\s*\'[^\']*\'\s*,\s*#(\d+)\s*\)\s*;', text):
+        plane_id = int(m.group(1))
+        aid = int(m.group(2))
+        if aid not in axises: continue
+        origin, normal, x_dir = axises[aid]
+
+        # Collect vertices in EDGE_LOOP order
+        ordered_pts = []
+        if plane_id in surface_to_bounds:
+            for bound_id in surface_to_bounds[plane_id]:
+                if bound_id not in face_outer_bounds: continue
+                el_id = face_outer_bounds[bound_id]
+                if el_id not in edge_loops: continue
+                for oe_id in edge_loops[el_id]:
+                    if oe_id not in oriented_edges: continue
+                    ec_id, forward = oriented_edges[oe_id]
+                    if ec_id not in edge_curves: continue
+                    vp1, vp2 = edge_curves[ec_id]
+                    cp1 = vertex_points.get(vp1)
+                    cp2 = vertex_points.get(vp2)
+                    if cp1 and cp2 and cp1 in cart_points and cp2 in cart_points:
+                        if forward:
+                            pts = [cart_points[cp1], cart_points[cp2]]
+                        else:
+                            pts = [cart_points[cp2], cart_points[cp1]]
+                        for pt in pts:
+                            if not ordered_pts or ordered_pts[-1] != pt:
+                                ordered_pts.append(pt)
+                break  # only first FACE_OUTER_BOUND (outer loop)
+
+        # Remove duplicate close (last == first)
+        if ordered_pts and ordered_pts[-1] == ordered_pts[0]:
+            ordered_pts.pop()
+
+        if len(ordered_pts) < 3: continue
+
+        # Fan triangulation from first vertex
+        v0 = ordered_pts[0]
+        for i in range(1, len(ordered_pts) - 1):
+            A, B, C = v0, ordered_pts[i], ordered_pts[i + 1]
+            # Bilinear CPs: [A, B; C, C] → triangle ABC
+            P = [[A, B], [C, C]]
+            # Degree-elevate 1→3 so resolve shader's cubic Bernstein works correctly
+            cp4 = [[elev_cp(P, k, l) for l in range(4)] for k in range(4)]
+            surfaces.append({
+                'p_u': 3, 'p_v': 3,
+                'n_u': 3, 'n_v': 3,
+                'U': [0,0,0,0, 1,1,1,1],
+                'V': [0,0,0,0, 1,1,1,1],
+                'cp_grid': cp4,
+            })
+            plane_tri_count += 1
+
+    if plane_tri_count > 0:
+        n_planes = len([1 for m in re.finditer(r'#(\d+)\s*=\s*PLANE\s*\(', text)])
+        print(f"  [PLANE] {n_planes} planes -> {plane_tri_count} triangles")
+
     # --- Format A: standalone B_SPLINE_SURFACE_WITH_KNOTS entities ---
     for m in re.finditer(r'#(\d+)\s*=\s*B_SPLINE_SURFACE_WITH_KNOTS\s*\((.*?)\)\s*;', text, re.DOTALL):
         try:
@@ -100,13 +237,18 @@ def parse_step_file(path):
             'EXTRUSION','REVOLUTION','SWEPT','BLEND','OFFSET','TRIMMED'):
             all_surf_types[t] = all_surf_types.get(t, 0) + 1
     if all_surf_types:
+        bsp_cnt = sum(v for k,v in all_surf_types.items()
+                      if k in ('B_SPLINE_SURFACE','B_SPLINE_SURFACE_WITH_KNOTS'))
+        plane_cnt = all_surf_types.get('PLANE', 0)
+        other = sum(v for k,v in all_surf_types.items()
+                    if k not in ('B_SPLINE_SURFACE','B_SPLINE_SURFACE_WITH_KNOTS','PLANE'))
         print(f"STEP surface types found: {dict(sorted(all_surf_types.items()))}")
-        non_bsp = sum(v for k,v in all_surf_types.items()
-                      if k not in ('B_SPLINE_SURFACE','B_SPLINE_SURFACE_WITH_KNOTS'))
-        if non_bsp > 0:
-            print(f"WARNING: {non_bsp} non-B-spline surfaces SKIPPED ({len(surfaces)} B-splines loaded)")
-        else:
-            print(f"Loaded {len(surfaces)} B-spline surfaces")
+        parts = [f"{len(surfaces)} total"]
+        if bsp_cnt: parts.append(f"{bsp_cnt} B-splines")
+        if plane_cnt: parts.append(f"{plane_cnt} planes -> {plane_tri_count if plane_cnt else 0} tris (deg-3 elevated)")
+        print(f"Loaded: {', '.join(parts)}")
+        if other > 0:
+            print(f"WARNING: {other} other surface types SKIPPED")
 
     return surfaces
 
