@@ -46,7 +46,8 @@ static std::vector<char> readFile(const std::string& fn) {
 // MVP matrices for visibility pass (set=0, binding=0 in visibility.vert)
 struct MVP { glm::mat4 model, view, proj; };
 // Lighting params for resolve pass (set=1, binding=0 in resolve.frag)
-struct Lighting { float intensity, lightAz, lightEl, checkerboard, boundary; };
+struct Lighting { float intensity, lightAz, lightEl, checkerboard, boundary, conservative, patchCols, _pad; };
+static_assert(sizeof(Lighting) == 32, "Lighting must be 32 bytes (2 vec4)");
 
 // ============================================================
 // Mesh — host-side triangle mesh data
@@ -57,6 +58,7 @@ struct Mesh {
     std::vector<float>    cp; // Bézier CPs: 64 floats per patch (xyz+w × 16)
     float bbMin[3], bbMax[3];
     int   patchCount = 0;
+    int   patchCols  = 0;  // nv: patches per row, for SSBO index decoding
     bool  empty() const { return i.empty(); }
     int   verts() const { return (int)(v.size()/9); }
     float scale() const { float dx=bbMax[0]-bbMin[0],dy=bbMax[1]-bbMin[1],dz=bbMax[2]-bbMin[2];
@@ -80,17 +82,32 @@ public:
         float* verts = nurbs_adaptive_eval(path, cam, &nu, &nv, &info, &total, &bezierCPs);
         if (!verts) { fprintf(stderr, "  [SKIP] %s\n", path); return m; }
         m.patchCount = nu * nv;
+        m.patchCols  = nv;
         if (bezierCPs) {
             int cpFloats = m.patchCount * 64;
             m.cp.assign(bezierCPs, bezierCPs + cpFloats);
             free(bezierCPs);
+            // Center each patch's CPs for FP32 precision in SSBO eval.
+            // Translating all CPs by the same offset cancels in du/dv
+            // (derivative of constant = 0), so normals are unchanged.
+            for (int p = 0; p < m.patchCount; p++) {
+                float* cp = m.cp.data() + p * 64;
+                float cx = 0, cy = 0, cz = 0;
+                for (int k = 0; k < 16; k++) {
+                    cx += cp[k*4+0]; cy += cp[k*4+1]; cz += cp[k*4+2];
+                }
+                cx /= 16.0f; cy /= 16.0f; cz /= 16.0f;
+                for (int k = 0; k < 16; k++) {
+                    cp[k*4+0] -= cx; cp[k*4+1] -= cy; cp[k*4+2] -= cz;
+                }
+            }
         }
         for (int pi = 0; pi < nu; pi++)
             for (int pj = 0; pj < nv; pj++) {
                 PatchInfo* p = &info[pi*nv+pj];
                 float* patch = verts + p->offset * 6;
                 uint32_t base = (uint32_t)m.v.size() / 9;  // stride 9
-                float patchID = (float)((pi << 12) | pj);
+                float patchID = (float)(pi * nv + pj);  // global sequential index
                 for (int y = 0; y < p->tv; y++)
                     for (int x = 0; x < p->tu; x++) {
                         int k = y*p->tu + x;
@@ -125,11 +142,11 @@ public:
 
     static Mesh single(const char* path, int res = 32) {
         Mesh m; resetBBox(m);
-        int nu, nv;
-        float* verts = nurbs_wireframe(path, res, &nu, &nv);
+        int nu, nv; float* cp = nullptr;
+        float* verts = nurbs_wireframe(path, res, &nu, &nv, &cp);
         if (!verts) { fprintf(stderr, "  [SKIP] %s\n", path); return m; }
-        addPatchGrid(m, verts, nu, nv, res);
-        free(verts);
+        addPatchGrid(m, verts, cp, nu, nv, res);
+        free(verts); free(cp);
         LOGI("Loaded %s: %d verts, %d tris\n", path, m.verts(), (int)(m.i.size()/3));
         return m;
     }
@@ -145,11 +162,11 @@ public:
         int skipped = 0;
         for (size_t i = 0; i < files.size(); i++) {
             if ((i+1) % 500 == 0) LOGI("  [%zu/%zu] ...\n", i+1, files.size());
-            int nu, nv;
-            float* verts = nurbs_wireframe(files[i].c_str(), res, &nu, &nv);
-            if (!verts) { skipped++; continue; }
-            addPatchGrid(m, verts, nu, nv, res);
-            free(verts);
+            int nu, nv; float* cp = nullptr;
+            float* verts = nurbs_wireframe(files[i].c_str(), res, &nu, &nv, &cp);
+            if (!verts) { skipped++; free(cp); continue; }
+            addPatchGrid(m, verts, cp, nu, nv, res);
+            free(verts); free(cp);
         }
         LOGI("Done: %d verts, %d tris, %d skipped\n", m.verts(), (int)(m.i.size()/3), skipped);
         return m;
@@ -161,12 +178,17 @@ private:
         m.bbMax[0]=m.bbMax[1]=m.bbMax[2]=-1e30f;
     }
 
-    static void addPatchGrid(Mesh& m, const float* verts, int nu, int nv, int res) {
+    static void addPatchGrid(Mesh& m, const float* verts, const float* cp, int nu, int nv, int res) {
+        // Append CPs (pre-centering) for global indexing
+        int cpBase = m.patchCount;
+        if (cp) {
+            m.cp.insert(m.cp.end(), cp, cp + nu * nv * 64);
+        }
         for (int pi = 0; pi < nu; pi++)
             for (int pj = 0; pj < nv; pj++) {
                 uint32_t base = (uint32_t)m.v.size() / 9;  // stride 9
                 const float* p = verts + (pi*nv+pj)*res*res*6;
-                float patchID = (float)((pi << 12) | pj);
+                float patchID = (float)(m.patchCount++);  // global sequential ID
                 for (int y = 0; y < res; y++)
                     for (int x = 0; x < res; x++) {
                         int idx = y*res+x;
@@ -193,6 +215,20 @@ private:
                         m.i.insert(m.i.end(),{a,b,c, b,d,c});
                     }
             }
+        // Center CPs per patch for FP32 precision in SSBO eval
+        if (cp) {
+            for (int p = cpBase; p < m.patchCount; p++) {
+                float* cpp = m.cp.data() + p * 64;
+                float cx = 0, cy = 0, cz = 0;
+                for (int k = 0; k < 16; k++) {
+                    cx += cpp[k*4+0]; cy += cpp[k*4+1]; cz += cpp[k*4+2];
+                }
+                cx /= 16.0f; cy /= 16.0f; cz /= 16.0f;
+                for (int k = 0; k < 16; k++) {
+                    cpp[k*4+0] -= cx; cpp[k*4+1] -= cy; cpp[k*4+2] -= cz;
+                }
+            }
+        }
     }
 };
 
@@ -326,7 +362,7 @@ public:
     }
     m_alloc.destroyBuffer(m_indexBuffer);
     m_alloc.destroyBuffer(m_vertexBuffer);
-    if (m_hasSSBO) m_alloc.destroyBuffer(m_bezierSSBO);
+    m_alloc.destroyBuffer(m_bezierSSBO);  // always exists (dummy or real)
     m_alloc.destroyImage(m_gbufUV);
     m_alloc.destroyImage(m_gbufID);
     m_alloc.destroyImage(m_gbufNorm);
@@ -648,6 +684,7 @@ private:
   nvvk::Image    m_gbufUV{};          // R32G32_SFLOAT: parametric (u,v) coordinates
   nvvk::Buffer   m_bezierSSBO{};      // SSBO: Bézier CPs (64 floats/patch, 16×vec4)
   bool           m_hasSSBO = false;   // true when SSBO is uploaded (adaptive path)
+  int            m_patchCols = 1;     // nv: patches per row, for SSBO index decoding
   VkDescriptorSet m_imguiImage{};
   bool           m_firstFrame = true;
 #pragma endregion
@@ -1133,7 +1170,7 @@ private:
     // Upload Bézier CP SSBO if available (adaptive path with ETER §6.2)
     if (!m.cp.empty() && m.patchCount > 0) {
         VkDeviceSize cpsz = m.cp.size() * sizeof(float);
-        if (m_hasSSBO) m_alloc.destroyBuffer(m_bezierSSBO);
+        m_alloc.destroyBuffer(m_bezierSSBO);  // always exists (dummy or real)
         m_alloc.createBuffer(m_bezierSSBO, cpsz,
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
             VMA_MEMORY_USAGE_GPU_ONLY);
@@ -1157,6 +1194,7 @@ private:
     m_app->submitAndWaitTempCmdBuffer(c);
     m_stagingUploader.releaseStaging();
     m_indexCount = (uint32_t)m.i.size();
+    m_patchCols  = m.patchCols > 0 ? m.patchCols : 1;
     LOGI("Uploaded: %d verts, %d tris, %d CPs\n", m.verts(), (int)(m.i.size()/3), (int)m.cp.size());
   }
 
@@ -1192,12 +1230,14 @@ private:
     memcpy(m_visUbo[m_frameIndex].mapping, &mvp, sizeof(MVP));
 
     // Lighting for resolve pass
-    Lighting light;
+    Lighting light = {};
     light.intensity    = m_intensity;
     light.lightAz      = m_lightAz;
     light.lightEl      = m_lightEl;
     light.checkerboard = m_checkerboard ? 1.0f : 0.0f;
     light.boundary     = m_showBoundary   ? 1.0f : 0.0f;
+    light.conservative = m_useConservative ? 1.0f : 0.0f;
+    light.patchCols    = (float)m_patchCols;
     memcpy(m_lightUbo[m_frameIndex].mapping, &light, sizeof(Lighting));
   }
 };

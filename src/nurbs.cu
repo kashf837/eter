@@ -91,7 +91,8 @@ static void nurbs_to_beziers(NurbsSurf* s) {
 }
 
 float* nurbs_wireframe(const char* surf_path, int res,
-                       int* np_u_out, int* np_v_out)
+                       int* np_u_out, int* np_v_out,
+                       float** cp_out)
 {
     NurbsSurf* s = read_surf(surf_path);
     if (!s) return NULL;
@@ -101,9 +102,16 @@ float* nurbs_wireframe(const char* surf_path, int res,
     int ru = s->p_u + 1, rv = s->p_v + 1;
     int np_u = (s->n_u + 1) / ru, np_v = (s->n_v + 1) / rv;
     *np_u_out = np_u; *np_v_out = np_v;
+    int np = np_u * np_v;
+    int cpsPerPatch = ru * rv * 4;  // 64 for bicubic
 
-    float* verts = (float*)malloc(np_u * np_v * res * res * 6 * sizeof(float));
-    BezierPatch bp = {s->p_u, s->p_v, (float*)malloc(ru * rv * 4 * sizeof(float))};
+    float* verts = (float*)malloc(np * res * res * 6 * sizeof(float));
+    BezierPatch bp = {s->p_u, s->p_v, (float*)malloc(cpsPerPatch * sizeof(float))};
+
+    // Allocate CP output if requested (ETER §6.2 SSBO)
+    if (cp_out) {
+        *cp_out = (float*)malloc(np * cpsPerPatch * sizeof(float));
+    }
 
     for (int pi = 0; pi < np_u; pi++) {
         for (int pj = 0; pj < np_v; pj++) {
@@ -111,6 +119,12 @@ float* nurbs_wireframe(const char* surf_path, int res,
                 for (int j = 0; j < rv; j++)
                     memcpy(&bp.CP[(i * rv + j) * 4],
                            s->Ps[pi * ru + i][pj * rv + j], 4 * sizeof(float));
+
+            // Copy CPs if requested
+            if (cp_out) {
+                memcpy(*cp_out + (pi * np_v + pj) * cpsPerPatch,
+                       bp.CP, cpsPerPatch * sizeof(float));
+            }
 
             float* pv = (float*)malloc(res * res * 6 * sizeof(float));
             eval_bezier_patch(&bp, pv, res, res);
@@ -214,4 +228,3 @@ float* nurbs_adaptive_eval(const char* surf_path, const CameraParams* cam,
            nu, nv, tu_min, tu_max, tv_min, tv_max, offset);
     return verts;
 }
-

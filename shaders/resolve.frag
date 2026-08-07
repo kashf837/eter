@@ -1,8 +1,13 @@
 #version 450
 // ETER §6.2 Crack Filling — Pass 2 (resolve) fragment shader
-// Valid pixels: lighting from G-buffer pos/norm (fast path).
-// Crack pixels (rasterizer missed): SSBO Bézier evaluation on neighbor patch
-// to fill the gap with pixel-accurate surface position and normal.
+//
+// All valid pixels:      SSBO Bézier evaluation (pure, no G-buffer blend).
+//                        CPs are centered per-patch before upload, so FP32
+//                        precision is safe even for large STP models.
+//                        Normals are pixel-accurate and consistent across
+//                        all patch boundaries → no visible seams.
+// Conservative ON:       G-buffer + 4-neighbor normal blend (stability).
+// Crack pixels:          SSBO Bézier from nearest valid neighbor.
 
 layout(location = 0) out vec4 outColor;
 
@@ -11,21 +16,31 @@ layout(set = 0, binding = 1) uniform sampler2D gbufNorm;
 layout(set = 0, binding = 2) uniform usampler2D gbufID;
 layout(set = 0, binding = 3) uniform sampler2D gbufUV;
 
-layout(set = 1, binding = 0) uniform Lighting {
+layout(std140, set = 1, binding = 0) uniform Lighting {
     float intensity;
     float lightAz;
     float lightEl;
     float checkerboard;
     float boundary;
+    float conservative;
+    float patchCols;
+    float _pad;
 } lighting;
 
-// Bézier control points: flat array, 16×vec4 per patch (xyz + w)
 layout(std430, set = 2, binding = 0) buffer BezierData {
     vec4 bezierCP[];
 };
 
 // ============================================================
-// Cubic Bernstein polynomials and derivatives
+// Patch ID decoding
+// ============================================================
+uint decodeSeqID(uint patchID)
+{
+    return patchID;  // patchID is the global sequential index
+}
+
+// ============================================================
+// Cubic Bernstein polynomials
 // ============================================================
 void bernstein(float t, out float B[4])
 {
@@ -45,17 +60,18 @@ void bernsteinDeriv(float t, out float dB[4])
     dB[3] =  3.0 * t * t;
 }
 
-// Evaluate rational bicubic Bézier patch at (u,v).
-// Returns surface position and normal via SSBO control points.
-void evalBezier(uint patchID, vec2 uv, out vec3 pos, out vec3 norm)
+void evalBezier(uint seqID, vec2 uv, out vec3 pos, out vec3 norm)
 {
-    float Bu[4], Bv[4], dBu[4], dBv[4];
-    bernstein(uv.x, Bu);
-    bernstein(uv.y, Bv);
-    bernsteinDeriv(uv.x, dBu);
-    bernsteinDeriv(uv.y, dBv);
+    float u = clamp(uv.x, 0.0, 1.0);
+    float v = clamp(uv.y, 0.0, 1.0);
 
-    uint base = patchID * 16u;
+    float Bu[4], Bv[4], dBu[4], dBv[4];
+    bernstein(u, Bu);
+    bernstein(v, Bv);
+    bernsteinDeriv(u, dBu);
+    bernsteinDeriv(v, dBv);
+
+    uint base = seqID * 16u;
     vec4 Sw  = vec4(0.0);
     vec4 dSu = vec4(0.0);
     vec4 dSv = vec4(0.0);
@@ -74,7 +90,6 @@ void evalBezier(uint patchID, vec2 uv, out vec3 pos, out vec3 norm)
 
     pos = Sw.xyz / Sw.w;
 
-    // Rational surface derivatives (quotient rule)
     float invW2 = 1.0 / (Sw.w * Sw.w);
     vec3 du = (dSu.xyz * Sw.w - Sw.xyz * dSu.w) * invW2;
     vec3 dv = (dSv.xyz * Sw.w - Sw.xyz * dSv.w) * invW2;
@@ -84,18 +99,25 @@ void evalBezier(uint patchID, vec2 uv, out vec3 pos, out vec3 norm)
 // ============================================================
 // Lighting
 // ============================================================
-vec3 evalLighting(vec3 worldNorm, vec3 lightDir)
+vec3 shadeNormal(vec3 N, vec3 L, float checker)
 {
-    float ambient  = 0.4;
-    float diffuse  = max(dot(normalize(worldNorm), lightDir), 0.0);
-    return vec3(0.85) * (ambient + diffuse * 0.6) * lighting.intensity;
+    float ambient = 0.4;
+    float diffuse = max(dot(normalize(N), L), 0.0);
+    return vec3(0.85) * (ambient + diffuse * 0.6 * checker) * lighting.intensity;
 }
 
 float decodeChecker(uint pid)
 {
-    uint pi = pid >> 12;
-    uint pj = pid & 0xFFFu;
-    return (((pi + pj) & 1u) != 0u) ? 0.6 : 1.0;
+    return ((pid & 1u) != 0u) ? 0.6 : 1.0;
+}
+
+vec3 shadeSSBO(uint patchID, vec2 uv, vec3 L)
+{
+    uint seqID = decodeSeqID(patchID);
+    vec3 pos, norm;
+    evalBezier(seqID, uv, pos, norm);
+    float checker = mix(1.0, decodeChecker(patchID), lighting.checkerboard);
+    return shadeNormal(norm, L, checker);
 }
 
 // ============================================================
@@ -103,9 +125,9 @@ float decodeChecker(uint pid)
 // ============================================================
 void main()
 {
-    ivec2 uv = ivec2(gl_FragCoord.xy);
+    ivec2 coord = ivec2(gl_FragCoord.xy);
 
-    vec4 posSample = texelFetch(gbufPos, uv, 0);
+    vec4 posSample = texelFetch(gbufPos, coord, 0);
     bool isFg = (posSample.a >= 0.5);
 
     vec3 lightDir = vec3(
@@ -115,23 +137,42 @@ void main()
     );
 
     // ============================================================
-    // Fast path: valid pixel → G-buffer lighting directly
+    // Valid pixel
     // ============================================================
     if (isFg) {
-        vec3 worldPos   = posSample.xyz;
-        vec3 worldNorm  = texelFetch(gbufNorm, uv, 0).xyz;
-        uint patchID    = texelFetch(gbufID,   uv, 0).r;
+        uint patchID = texelFetch(gbufID, coord, 0).r;
+        vec2 paramUV = texelFetch(gbufUV, coord, 0).rg;
+        vec3 N = texelFetch(gbufNorm, coord, 0).xyz;
+        float checker = mix(1.0, decodeChecker(patchID), lighting.checkerboard);
 
-        vec3 colorOut = evalLighting(worldNorm, lightDir)
-                      * mix(1.0, decodeChecker(patchID), lighting.checkerboard);
-
-        // Boundary debug overlay (checks neighbors for different patchID)
-        uint n0 = texelFetchOffset(gbufID, uv, 0, ivec2( 1,  0)).r;
-        uint n1 = texelFetchOffset(gbufID, uv, 0, ivec2(-1,  0)).r;
-        uint n2 = texelFetchOffset(gbufID, uv, 0, ivec2( 0,  1)).r;
-        uint n3 = texelFetchOffset(gbufID, uv, 0, ivec2( 0, -1)).r;
+        // Detect patch boundary
+        uint n0 = texelFetchOffset(gbufID, coord, 0, ivec2( 1,  0)).r;
+        uint n1 = texelFetchOffset(gbufID, coord, 0, ivec2(-1,  0)).r;
+        uint n2 = texelFetchOffset(gbufID, coord, 0, ivec2( 0,  1)).r;
+        uint n3 = texelFetchOffset(gbufID, coord, 0, ivec2( 0, -1)).r;
         bool isBoundary = (n0 != patchID || n1 != patchID || n2 != patchID || n3 != patchID);
 
+        vec3 colorOut;
+        if (lighting.conservative > 0.5) {
+            // Conservative ON: blend with all valid neighbors
+            vec3 Nn = N; float w = 1.0;
+            vec4 np = texelFetchOffset(gbufPos, coord, 0, ivec2( 1,  0));
+            vec4 nn = texelFetchOffset(gbufPos, coord, 0, ivec2(-1,  0));
+            vec4 nt = texelFetchOffset(gbufPos, coord, 0, ivec2( 0,  1));
+            vec4 nb = texelFetchOffset(gbufPos, coord, 0, ivec2( 0, -1));
+            if (np.a >= 0.5) { Nn += texelFetchOffset(gbufNorm, coord, 0, ivec2( 1,  0)).xyz; w += 1.0; }
+            if (nn.a >= 0.5) { Nn += texelFetchOffset(gbufNorm, coord, 0, ivec2(-1,  0)).xyz; w += 1.0; }
+            if (nt.a >= 0.5) { Nn += texelFetchOffset(gbufNorm, coord, 0, ivec2( 0,  1)).xyz; w += 1.0; }
+            if (nb.a >= 0.5) { Nn += texelFetchOffset(gbufNorm, coord, 0, ivec2( 0, -1)).xyz; w += 1.0; }
+            N = Nn / w;
+            colorOut = shadeNormal(N, lightDir, checker);
+        } else {
+            // SSBO Bézier for all pixels → pixel-accurate, boundary-consistent normals.
+            // CPs are centered per-patch so FP32 precision is safe at any model scale.
+            colorOut = shadeSSBO(patchID, paramUV, lightDir);
+        }
+
+        // Boundary debug overlay
         outColor = (lighting.boundary > 0.5 && isBoundary)
             ? vec4(mix(colorOut, vec3(1.0, 0.0, 0.0), 0.6), 1.0)
             : vec4(colorOut, 1.0);
@@ -139,57 +180,28 @@ void main()
     }
 
     // ============================================================
-    // Crack pixel: fill via SSBO Bézier evaluation on neighbor
+    // Crack pixel: fill via SSBO Bézier from nearest valid neighbor
     // ============================================================
-    // Check 4 neighbors for a valid pixel to borrow patchID and (u,v) from
-    vec4  np  = texelFetchOffset(gbufPos, uv, 0, ivec2( 1,  0));
-    vec4  nn  = texelFetchOffset(gbufPos, uv, 0, ivec2(-1,  0));
-    vec4  nt  = texelFetchOffset(gbufPos, uv, 0, ivec2( 0,  1));
-    vec4  nb  = texelFetchOffset(gbufPos, uv, 0, ivec2( 0, -1));
+    vec4 np = texelFetchOffset(gbufPos, coord, 0, ivec2( 1,  0));
+    vec4 nn = texelFetchOffset(gbufPos, coord, 0, ivec2(-1,  0));
+    vec4 nt = texelFetchOffset(gbufPos, coord, 0, ivec2( 0,  1));
+    vec4 nb = texelFetchOffset(gbufPos, coord, 0, ivec2( 0, -1));
 
     uint  selID  = 0u;
     vec2  selUV  = vec2(0.0);
-    float bestDist = 1e10;
 
-    // Right neighbor: map crack's position to left edge of neighbor patch
-    if (np.a >= 0.5) {
-        uint  nid = texelFetchOffset(gbufID, uv, 0, ivec2( 1,  0)).r;
-        vec2  nuv = texelFetchOffset(gbufUV, uv, 0, ivec2( 1,  0)).rg;
-        // Crack is to the LEFT of the neighbor → u ≈ 0 on neighbor
-        float d = abs(nuv.x);
-        if (d < bestDist) { bestDist = d; selID = nid; selUV = vec2(0.0, nuv.y); }
-    }
-    // Left neighbor
-    if (nn.a >= 0.5) {
-        uint  nid = texelFetchOffset(gbufID, uv, 0, ivec2(-1,  0)).r;
-        vec2  nuv = texelFetchOffset(gbufUV, uv, 0, ivec2(-1,  0)).rg;
-        float d = abs(1.0 - nuv.x);
-        if (d < bestDist) { bestDist = d; selID = nid; selUV = vec2(1.0, nuv.y); }
-    }
-    // Top neighbor
-    if (nt.a >= 0.5) {
-        uint  nid = texelFetchOffset(gbufID, uv, 0, ivec2( 0,  1)).r;
-        vec2  nuv = texelFetchOffset(gbufUV, uv, 0, ivec2( 0,  1)).rg;
-        float d = abs(nuv.y);
-        if (d < bestDist) { bestDist = d; selID = nid; selUV = vec2(nuv.x, 0.0); }
-    }
-    // Bottom neighbor
-    if (nb.a >= 0.5) {
-        uint  nid = texelFetchOffset(gbufID, uv, 0, ivec2( 0, -1)).r;
-        vec2  nuv = texelFetchOffset(gbufUV, uv, 0, ivec2( 0, -1)).rg;
-        float d = abs(1.0 - nuv.y);
-        if (d < bestDist) { bestDist = d; selID = nid; selUV = vec2(nuv.x, 1.0); }
-    }
+    if (np.a >= 0.5) { selID = texelFetchOffset(gbufID, coord, 0, ivec2( 1,  0)).r; selUV = vec2(0.0, texelFetchOffset(gbufUV, coord, 0, ivec2( 1,  0)).rg.y); }
+    else if (nn.a >= 0.5) { selID = texelFetchOffset(gbufID, coord, 0, ivec2(-1,  0)).r; selUV = vec2(1.0, texelFetchOffset(gbufUV, coord, 0, ivec2(-1,  0)).rg.y); }
+    else if (nt.a >= 0.5) { selID = texelFetchOffset(gbufID, coord, 0, ivec2( 0,  1)).r; selUV = vec2(texelFetchOffset(gbufUV, coord, 0, ivec2( 0,  1)).rg.x, 0.0); }
+    else if (nb.a >= 0.5) { selID = texelFetchOffset(gbufID, coord, 0, ivec2( 0, -1)).r; selUV = vec2(texelFetchOffset(gbufUV, coord, 0, ivec2( 0, -1)).rg.x, 1.0); }
 
     if (selID != 0u) {
-        // Pixel-accurate surface evaluation via SSBO
+        uint seqID = decodeSeqID(selID);
         vec3 pos, norm;
-        evalBezier(selID, selUV, pos, norm);
-        vec3 col = evalLighting(norm, lightDir)
-                 * mix(1.0, decodeChecker(selID), lighting.checkerboard);
-        outColor = vec4(col, 1.0);
+        evalBezier(seqID, selUV, pos, norm);
+        float checker = mix(1.0, decodeChecker(selID), lighting.checkerboard);
+        outColor = vec4(shadeNormal(norm, lightDir, checker), 1.0);
     } else {
-        // No valid neighbor — true background
         outColor = vec4(0.1, 0.1, 0.15, 1.0);
     }
 }
