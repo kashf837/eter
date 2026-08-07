@@ -263,7 +263,7 @@ public:
         m_indexCount = 0;
     }
     Mesh m;
-    if (isDir) { m = MeshBuilder::directory(path.c_str(), 32); }
+    if (isDir) { m = MeshBuilder::directory(path.c_str(), 16); }  // lower res for multi-file STP
     else {
         CameraParams cam;
         glm::dvec3 eye = m_camera->getEye();
