@@ -31,6 +31,7 @@ def parse_step_file(path):
         cart_points[cid] = xyz
 
     surfaces = []
+    skipped_fmts = {}  # track skipped surface types for diagnostics
 
     # --- Format A: standalone B_SPLINE_SURFACE_WITH_KNOTS entities ---
     for m in re.finditer(r'#(\d+)\s*=\s*B_SPLINE_SURFACE_WITH_KNOTS\s*\((.*?)\)\s*;', text, re.DOTALL):
@@ -90,6 +91,21 @@ def parse_step_file(path):
                     surfaces.append(surf)
             except Exception as e:
                 pass
+
+    # --- Diagnostic: count all surface types in the STEP file ---
+    all_surf_types = {}
+    for m in re.finditer(r'#\d+\s*=\s*(\w+)\s*\(', text):
+        t = m.group(1)
+        if 'SURFACE' in t or 'SURF' in t or t in ('PLANE','CYLINDRICAL','SPHERICAL','CONICAL','TOROIDAL',
+            'EXTRUSION','REVOLUTION','SWEPT','BLEND','OFFSET','TRIMMED'):
+            all_surf_types[t] = all_surf_types.get(t, 0) + 1
+    if all_surf_types:
+        print(f"STEP surface types found: {dict(sorted(all_surf_types.items()))}")
+        bsp_total = all_surf_types.get('B_SPLINE_SURFACE', 0) + all_surf_types.get('B_SPLINE_SURFACE_WITH_KNOTS', 0)
+        non_bsp = sum(v for k,v in all_surf_types.items()
+                      if k not in ('B_SPLINE_SURFACE','B_SPLINE_SURFACE_WITH_KNOTS'))
+        if non_bsp > 0:
+            print(f"WARNING: {non_bsp} non-B-spline surfaces were SKIPPED ({len(surfaces)} B-splines loaded)")
 
     return surfaces
 
