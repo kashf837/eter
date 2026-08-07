@@ -161,6 +161,9 @@ public:
                 files.push_back(e.path().string());
         std::sort(files.begin(), files.end());
         LOGI("Loading %zu surf files (res=%d)...\n", files.size(), res);
+        if (files.empty()) {
+            LOGI("WARNING: no .surf files in %s — STEP conversion may have failed\n", dirPath);
+        }
         int skipped = 0;
         for (size_t i = 0; i < files.size(); i++) {
             if ((i+1) % 500 == 0) LOGI("  [%zu/%zu] ...\n", i+1, files.size());
@@ -257,6 +260,12 @@ public:
 
   // Reload mesh from a single file or directory (STEP temp)
   void doReload(const std::string& path, bool isDir = false) {
+    // If path is a directory on disk, override isDir regardless of what the
+    // menu handler guessed — prevents trying to fopen a directory as a file.
+    if (!isDir && std::filesystem::is_directory(path)) {
+        LOGI("doReload: path is a directory, forcing isDir=true\n");
+        isDir = true;
+    }
     LOGI("doReload: %s (dir=%d)\n", path.c_str(), isDir);
     NVVK_CHECK(vkDeviceWaitIdle(m_app->getDevice()));
     if (m_indexCount > 0) {
