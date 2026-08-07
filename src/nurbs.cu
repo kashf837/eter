@@ -132,7 +132,8 @@ float* nurbs_wireframe(const char* surf_path, int res,
 // ============================================================
 
 float* nurbs_adaptive_eval(const char* surf_path, const CameraParams* cam,
-                           int* np_u, int* np_v, PatchInfo** info_out, int* total_verts)
+                           int* np_u, int* np_v, PatchInfo** info_out, int* total_verts,
+                           float** cp_out)
 {
     NurbsSurf* s = read_surf(surf_path);
     if (!s) return NULL;
@@ -143,10 +144,16 @@ float* nurbs_adaptive_eval(const char* surf_path, const CameraParams* cam,
     int nu = (s->n_u + 1) / ru, nv = (s->n_v + 1) / rv;
     *np_u = nu; *np_v = nv;
     int np = nu * nv;
+    int cpsPerPatch = ru * rv * 4;  // 64 for bicubic
 
     PatchInfo* info = (PatchInfo*)malloc(np * sizeof(PatchInfo));
-    BezierPatch bp = {s->p_u, s->p_v, (float*)malloc(ru * rv * 4 * sizeof(float))};
+    BezierPatch bp = {s->p_u, s->p_v, (float*)malloc(cpsPerPatch * sizeof(float))};
     int offset = 0;
+
+    // Allocate CP output if requested (ETER §6.2 SSBO)
+    if (cp_out) {
+        *cp_out = (float*)malloc(np * cpsPerPatch * sizeof(float));
+    }
 
     // First pass: compute tess factors and offsets
     for (int i = 0; i < nu; i++) {
@@ -176,6 +183,12 @@ float* nurbs_adaptive_eval(const char* surf_path, const CameraParams* cam,
                 for (int jj = 0; jj < rv; jj++)
                     memcpy(&bp.CP[(ii*rv+jj)*4],
                            s->Ps[i*ru+ii][j*rv+jj], 4*sizeof(float));
+
+            // Save original CPs before eval_bezier_patch offsets them
+            if (cp_out) {
+                int cpBase = (i*nv+j) * cpsPerPatch;
+                memcpy(*cp_out + cpBase, bp.CP, cpsPerPatch * sizeof(float));
+            }
 
             int idx = i*nv+j;
             int tu = info[idx].tu, tv = info[idx].tv;

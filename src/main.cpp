@@ -52,16 +52,18 @@ struct Lighting { float intensity, lightAz, lightEl, checkerboard, boundary; };
 // Mesh — host-side triangle mesh data
 // ============================================================
 struct Mesh {
-    std::vector<float>    v;  // interleaved xyz + nxnynz + patchID (7 floats/vertex)
+    std::vector<float>    v;  // interleaved xyz+nxnynz+uv+patchID (9 floats/vertex)
     std::vector<uint32_t> i;  // triangle indices
+    std::vector<float>    cp; // Bézier CPs: 64 floats per patch (xyz+w × 16)
     float bbMin[3], bbMax[3];
-    bool   empty() const { return i.empty(); }
-    int    verts() const { return (int)(v.size()/7); }
-    float  scale() const { float dx=bbMax[0]-bbMin[0],dy=bbMax[1]-bbMin[1],dz=bbMax[2]-bbMin[2];
+    int   patchCount = 0;
+    bool  empty() const { return i.empty(); }
+    int   verts() const { return (int)(v.size()/9); }
+    float scale() const { float dx=bbMax[0]-bbMin[0],dy=bbMax[1]-bbMin[1],dz=bbMax[2]-bbMin[2];
                            float s=dx>dy?dx:dy; s=s>dz?s:dz; return s<1.f?1.f:s; }
-    float  cx() const { return (bbMin[0]+bbMax[0])*0.5f; }
-    float  cy() const { return (bbMin[1]+bbMax[1])*0.5f; }
-    float  cz() const { return (bbMin[2]+bbMax[2])*0.5f; }
+    float cx() const { return (bbMin[0]+bbMax[0])*0.5f; }
+    float cy() const { return (bbMin[1]+bbMax[1])*0.5f; }
+    float cz() const { return (bbMin[2]+bbMax[2])*0.5f; }
 };
 
 // ============================================================
@@ -74,14 +76,21 @@ public:
         Mesh m; resetBBox(m);
         int nu, nv, total;
         PatchInfo* info;
-        float* verts = nurbs_adaptive_eval(path, cam, &nu, &nv, &info, &total);
+        float* bezierCPs = nullptr;
+        float* verts = nurbs_adaptive_eval(path, cam, &nu, &nv, &info, &total, &bezierCPs);
         if (!verts) { fprintf(stderr, "  [SKIP] %s\n", path); return m; }
+        m.patchCount = nu * nv;
+        if (bezierCPs) {
+            int cpFloats = m.patchCount * 64;
+            m.cp.assign(bezierCPs, bezierCPs + cpFloats);
+            free(bezierCPs);
+        }
         for (int pi = 0; pi < nu; pi++)
             for (int pj = 0; pj < nv; pj++) {
                 PatchInfo* p = &info[pi*nv+pj];
                 float* patch = verts + p->offset * 6;
-                uint32_t base = (uint32_t)m.v.size() / 7;
-                float patchID = (float)((pi << 12) | pj);  // encode (pi,pj) for 2D checkerboard
+                uint32_t base = (uint32_t)m.v.size() / 9;  // stride 9
+                float patchID = (float)((pi << 12) | pj);
                 for (int y = 0; y < p->tv; y++)
                     for (int x = 0; x < p->tu; x++) {
                         int k = y*p->tu + x;
@@ -97,7 +106,9 @@ public:
                             nl=nx*nx+ny*ny+nz*nz;
                         }
                         float inv=1.f/(sqrtf(nl)+1e-10f);
-                        m.v.insert(m.v.end(),{px,py,pz,nx*inv,ny*inv,nz*inv,patchID});
+                        float u = p->tu > 1 ? (float)x / (float)(p->tu - 1) : 0.5f;
+                        float v = p->tv > 1 ? (float)y / (float)(p->tv - 1) : 0.5f;
+                        m.v.insert(m.v.end(),{px,py,pz,nx*inv,ny*inv,nz*inv,u,v,patchID});
                         if(px<m.bbMin[0])m.bbMin[0]=px;if(py<m.bbMin[1])m.bbMin[1]=py;if(pz<m.bbMin[2])m.bbMin[2]=pz;
                         if(px>m.bbMax[0])m.bbMax[0]=px;if(py>m.bbMax[1])m.bbMax[1]=py;if(pz>m.bbMax[2])m.bbMax[2]=pz;
                     }
@@ -108,7 +119,7 @@ public:
                     }
             }
         free(verts); free(info);
-        LOGI("Adaptive %s: %d verts, %d tris\n", path, m.verts(), (int)(m.i.size()/3));
+        LOGI("Adaptive %s: %d verts, %d tris, %d patches\n", path, m.verts(), (int)(m.i.size()/3), m.patchCount);
         return m;
     }
 
@@ -153,9 +164,9 @@ private:
     static void addPatchGrid(Mesh& m, const float* verts, int nu, int nv, int res) {
         for (int pi = 0; pi < nu; pi++)
             for (int pj = 0; pj < nv; pj++) {
-                uint32_t base = (uint32_t)m.v.size() / 7;
+                uint32_t base = (uint32_t)m.v.size() / 9;  // stride 9
                 const float* p = verts + (pi*nv+pj)*res*res*6;
-                float patchID = (float)((pi << 12) | pj);  // encode (pi,pj) for 2D checkerboard
+                float patchID = (float)((pi << 12) | pj);
                 for (int y = 0; y < res; y++)
                     for (int x = 0; x < res; x++) {
                         int idx = y*res+x;
@@ -163,7 +174,6 @@ private:
                         float gnx=p[idx*6+3], gny=p[idx*6+4], gnz=p[idx*6+5];
                         float gnLen = gnx*gnx+gny*gny+gnz*gnz;
                         if(gnLen < 1e-6f) {
-                            // CPU fallback (shared-memory kernel)
                             int xR=(x+1<res)?x+1:x,xL=xR>0?xR-1:0, yD=(y+1<res)?y+1:y,yU=yD>0?yD-1:0;
                             float du[3]={p[(y*res+xR)*6+0]-p[(y*res+xL)*6+0],p[(y*res+xR)*6+1]-p[(y*res+xL)*6+1],p[(y*res+xR)*6+2]-p[(y*res+xL)*6+2]};
                             float dv[3]={p[(yD*res+x)*6+0]-p[(yU*res+x)*6+0],p[(yD*res+x)*6+1]-p[(yU*res+x)*6+1],p[(yD*res+x)*6+2]-p[(yU*res+x)*6+2]};
@@ -171,7 +181,9 @@ private:
                             gnLen = gnx*gnx+gny*gny+gnz*gnz;
                         }
                         float inv=1.f/(sqrtf(gnLen)+1e-10f);
-                        m.v.insert(m.v.end(),{px,py,pz, gnx*inv,gny*inv,gnz*inv, patchID});
+                        float u = res > 1 ? (float)x / (float)(res - 1) : 0.5f;
+                        float v = res > 1 ? (float)y / (float)(res - 1) : 0.5f;
+                        m.v.insert(m.v.end(),{px,py,pz, gnx*inv,gny*inv,gnz*inv, u,v, patchID});
                         if(px<m.bbMin[0])m.bbMin[0]=px; if(py<m.bbMin[1])m.bbMin[1]=py; if(pz<m.bbMin[2])m.bbMin[2]=pz;
                         if(px>m.bbMax[0])m.bbMax[0]=px; if(py>m.bbMax[1])m.bbMax[1]=py; if(pz>m.bbMax[2])m.bbMax[2]=pz;
                     }
@@ -301,6 +313,7 @@ public:
     vkDestroyPipeline(dev, m_pipelineVis, nullptr);
     vkDestroyPipelineLayout(dev, m_resolvePipelineLayout, nullptr);
     vkDestroyPipelineLayout(dev, m_visPipelineLayout, nullptr);
+    vkDestroyDescriptorSetLayout(dev, m_resolveSsboLayout, nullptr);
     vkDestroyDescriptorSetLayout(dev, m_resolveDsLayout, nullptr);
     vkDestroyDescriptorSetLayout(dev, m_visDsLayout, nullptr);
     vkDestroyDescriptorPool(dev, m_resolveDsPool, nullptr);
@@ -313,6 +326,8 @@ public:
     }
     m_alloc.destroyBuffer(m_indexBuffer);
     m_alloc.destroyBuffer(m_vertexBuffer);
+    if (m_hasSSBO) m_alloc.destroyBuffer(m_bezierSSBO);
+    m_alloc.destroyImage(m_gbufUV);
     m_alloc.destroyImage(m_gbufID);
     m_alloc.destroyImage(m_gbufNorm);
     m_alloc.destroyImage(m_gbufPos);
@@ -358,6 +373,7 @@ public:
         nvvk::cmdImageMemoryBarrier(cmd, {m_gbufPos.image,  undef, color});
         nvvk::cmdImageMemoryBarrier(cmd, {m_gbufNorm.image, undef, color});
         nvvk::cmdImageMemoryBarrier(cmd, {m_gbufID.image,   undef, color});
+        nvvk::cmdImageMemoryBarrier(cmd, {m_gbufUV.image,   undef, color});
         // Depth → DEPTH_ATTACHMENT_OPTIMAL
         VkImageMemoryBarrier2 db = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
         db.srcStageMask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
@@ -376,7 +392,7 @@ public:
     // PASS 1: Visibility — mesh → G-buffer + depth
     // ==============================================
     {
-        VkRenderingAttachmentInfo gb[3] = {};
+        VkRenderingAttachmentInfo gb[4] = {};
         // gbufPos: world-space position
         gb[0].sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
         gb[0].imageView = m_gbufPos.descriptor.imageView;
@@ -398,6 +414,13 @@ public:
         gb[2].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
         gb[2].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
         gb[2].clearValue.color = {0.f, 0.f, 0.f, 0.f};
+        // gbufUV: parametric (u,v)
+        gb[3].sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+        gb[3].imageView = m_gbufUV.descriptor.imageView;
+        gb[3].imageLayout = color;
+        gb[3].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        gb[3].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        gb[3].clearValue.color = {0.f, 0.f, 0.f, 0.f};
 
         VkRenderingAttachmentInfo da = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
         da.imageView = m_depthImage.descriptor.imageView;
@@ -409,7 +432,7 @@ public:
         VkRenderingInfo ri = {VK_STRUCTURE_TYPE_RENDERING_INFO};
         ri.renderArea = {{0, 0}, {(uint32_t)m_imgW, (uint32_t)m_imgH}};
         ri.layerCount = 1;
-        ri.colorAttachmentCount = 3; ri.pColorAttachments = gb;
+        ri.colorAttachmentCount = 4; ri.pColorAttachments = gb;
         ri.pDepthAttachment = &da;
         vkCmdBeginRendering(cmd, &ri);
 
@@ -432,6 +455,7 @@ public:
     nvvk::cmdImageMemoryBarrier(cmd, {m_gbufPos.image,  color, ro});
     nvvk::cmdImageMemoryBarrier(cmd, {m_gbufNorm.image, color, ro});
     nvvk::cmdImageMemoryBarrier(cmd, {m_gbufID.image,   color, ro});
+    nvvk::cmdImageMemoryBarrier(cmd, {m_gbufUV.image,   color, ro});
 
     // ==============================================
     // PASS 2: Resolve — full-screen tri → render target
@@ -455,8 +479,8 @@ public:
         vkCmdSetViewport(cmd, 0, 1, &vp);
         vkCmdSetScissor(cmd, 0, 1, &sc);
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineResolve);
-        VkDescriptorSet rds[2] = {m_resolveDs, m_resolveDs1[m_frameIndex]};
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_resolvePipelineLayout, 0, 2, rds, 0, nullptr);
+        VkDescriptorSet rds[3] = {m_resolveDs, m_resolveDs1[m_frameIndex], m_resolveDs2};
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_resolvePipelineLayout, 0, 3, rds, 0, nullptr);
         vkCmdDraw(cmd, 3, 1, 0, 0);  // full-screen triangle: 3 vertices, no vertex buffer
 
         vkCmdEndRendering(cmd);
@@ -466,6 +490,7 @@ public:
     nvvk::cmdImageMemoryBarrier(cmd, {m_gbufPos.image,  ro, color});
     nvvk::cmdImageMemoryBarrier(cmd, {m_gbufNorm.image, ro, color});
     nvvk::cmdImageMemoryBarrier(cmd, {m_gbufID.image,   ro, color});
+    nvvk::cmdImageMemoryBarrier(cmd, {m_gbufUV.image,   ro, color});
 
     // ==============================================
     // Blit render target → viewport image for ImGui
@@ -620,6 +645,9 @@ private:
   nvvk::Image    m_gbufPos{};         // R32G32B32A32_SFLOAT: world-space position (xyz)
   nvvk::Image    m_gbufNorm{};        // R32G32B32A32_SFLOAT: world-space normal (xyz)
   nvvk::Image    m_gbufID{};          // R32_UINT: patch index
+  nvvk::Image    m_gbufUV{};          // R32G32_SFLOAT: parametric (u,v) coordinates
+  nvvk::Buffer   m_bezierSSBO{};      // SSBO: Bézier CPs (64 floats/patch, 16×vec4)
+  bool           m_hasSSBO = false;   // true when SSBO is uploaded (adaptive path)
   VkDescriptorSet m_imguiImage{};
   bool           m_firstFrame = true;
 #pragma endregion
@@ -654,10 +682,12 @@ private:
   // Resolve pass pipeline (G-buffer → lighting)
   VkPipeline            m_pipelineResolve   = VK_NULL_HANDLE;
   VkPipelineLayout      m_resolvePipelineLayout = VK_NULL_HANDLE;
-  VkDescriptorSetLayout m_resolveDsLayout   = VK_NULL_HANDLE;
+  VkDescriptorSetLayout m_resolveDsLayout   = VK_NULL_HANDLE;     // set=0: G-buffer images
+  VkDescriptorSetLayout m_resolveSsboLayout = VK_NULL_HANDLE;     // set=2: Bézier CP SSBO
   VkDescriptorPool      m_resolveDsPool     = VK_NULL_HANDLE;
-  VkDescriptorSet       m_resolveDs         = VK_NULL_HANDLE;  // set=0: G-buffer (shared)
-  VkDescriptorSet       m_resolveDs1[MAX_FIF] = {};             // set=1: lighting UBO, per-frame
+  VkDescriptorSet       m_resolveDs         = VK_NULL_HANDLE;     // set=0: G-buffer (shared)
+  VkDescriptorSet       m_resolveDs1[MAX_FIF] = {};               // set=1: lighting UBO, per-frame
+  VkDescriptorSet       m_resolveDs2        = VK_NULL_HANDLE;     // set=2: SSBO (shared)
   nvvk::Buffer          m_lightUbo[MAX_FIF]{};   // Lighting UBO, one per frame-in-flight
   int                   m_frameIndex = 0;         // cycles 0..MAX_FIF-1 each frame
   bool                  m_conservativeRaster = false;  // extension support
@@ -739,6 +769,11 @@ private:
     ii.format = VK_FORMAT_R32_UINT;
     NVVK_CHECK(m_alloc.createImage(m_gbufID, ii, vi));
     NVVK_CHECK(m_samplerPool.acquireSampler(m_gbufID.descriptor.sampler));
+
+    // gbufUV: parametric (u,v) coordinates (R32G32_SFLOAT)
+    ii.format = VK_FORMAT_R32G32_SFLOAT;
+    NVVK_CHECK(m_alloc.createImage(m_gbufUV, ii, vi));
+    NVVK_CHECK(m_samplerPool.acquireSampler(m_gbufUV.descriptor.sampler));
   }
 
   // Visibility pass pipeline (ETER §6.1 Pass 1): mesh → G-buffer.
@@ -774,16 +809,17 @@ private:
     plCI.setLayoutCount = 1; plCI.pSetLayouts = &m_visDsLayout;
     NVVK_CHECK(vkCreatePipelineLayout(dev, &plCI, nullptr, &m_visPipelineLayout));
 
-    // Vertex input: 7 floats per vertex (x,y,z + nx,ny,nz + patchID)
-    VkVertexInputBindingDescription vib = {0, 7 * sizeof(float), VK_VERTEX_INPUT_RATE_VERTEX};
-    VkVertexInputAttributeDescription via[3] = {
+    // Vertex input: 9 floats per vertex (x,y,z + nx,ny,nz + u,v + patchID)
+    VkVertexInputBindingDescription vib = {0, 9 * sizeof(float), VK_VERTEX_INPUT_RATE_VERTEX};
+    VkVertexInputAttributeDescription via[4] = {
         {0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0},           // location=0: position
         {1, 0, VK_FORMAT_R32G32B32_SFLOAT, 3*sizeof(float)}, // location=1: normal
-        {2, 0, VK_FORMAT_R32_SFLOAT,        6*sizeof(float)}, // location=2: patchID
+        {2, 0, VK_FORMAT_R32G32_SFLOAT, 6*sizeof(float)}, // location=2: (u,v)
+        {3, 0, VK_FORMAT_R32_SFLOAT,       8*sizeof(float)}, // location=3: patchID
     };
     VkPipelineVertexInputStateCreateInfo vi = {VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
     vi.vertexBindingDescriptionCount = 1; vi.pVertexBindingDescriptions = &vib;
-    vi.vertexAttributeDescriptionCount = 3; vi.pVertexAttributeDescriptions = via;
+    vi.vertexAttributeDescriptionCount = 4; vi.pVertexAttributeDescriptions = via;
 
     // Standard pipeline state: triangle list, 1 viewport, no blending
     VkPipelineInputAssemblyStateCreateInfo ia = {VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
@@ -798,10 +834,10 @@ private:
     VkPipelineMultisampleStateCreateInfo ms = {VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
     ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
 
-    VkPipelineColorBlendAttachmentState cba[3] = {};
-    for (int i = 0; i < 3; i++) cba[i].colorWriteMask = 0xF; // all channels for gbufPos/Norm; R only used for gbufID but mask all is fine
+    VkPipelineColorBlendAttachmentState cba[4] = {};
+    for (int i = 0; i < 4; i++) cba[i].colorWriteMask = 0xF;
     VkPipelineColorBlendStateCreateInfo cb = {VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
-    cb.attachmentCount = 3; cb.pAttachments = cba;
+    cb.attachmentCount = 4; cb.pAttachments = cba;
 
     // Depth test: enable Z-buffer (closer pixels occlude farther ones)
     VkPipelineDepthStencilStateCreateInfo dss = {VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
@@ -819,11 +855,11 @@ private:
         {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, 0, 0, VK_SHADER_STAGE_FRAGMENT_BIT, fs, "main"},
     };
 
-    // Dynamic rendering (Vulkan 1.3+): 3 color attachments (G-buffer) + depth
-    VkFormat cf[3] = {VK_FORMAT_R32G32B32A32_SFLOAT, VK_FORMAT_R32G32B32A32_SFLOAT, VK_FORMAT_R32_UINT};
+    // Dynamic rendering (Vulkan 1.3+): 4 color attachments (G-buffer) + depth
+    VkFormat cf[4] = {VK_FORMAT_R32G32B32A32_SFLOAT, VK_FORMAT_R32G32B32A32_SFLOAT, VK_FORMAT_R32_UINT, VK_FORMAT_R32G32_SFLOAT};
     VkFormat df = VK_FORMAT_D32_SFLOAT;
     VkPipelineRenderingCreateInfo pr = {VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
-    pr.colorAttachmentCount = 3; pr.pColorAttachmentFormats = cf;
+    pr.colorAttachmentCount = 4; pr.pColorAttachmentFormats = cf;
     pr.depthAttachmentFormat = df;
 
     VkGraphicsPipelineCreateInfo pi = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &pr};
@@ -854,29 +890,36 @@ private:
     VkShaderModule fs; vkCreateShaderModule(dev, &sm, nullptr, &fs);
 
     // Descriptor set layouts:
-    //   set=0: 3 combined image samplers (gbufPos, gbufNorm, gbufID)
+    //   set=0: 4 combined image samplers (gbufPos, gbufNorm, gbufID, gbufUV)
     //   set=1: 1 UBO (lighting params)
-    VkDescriptorSetLayoutBinding bindings0[3] = {};
-    for (int i = 0; i < 3; i++) {
-        bindings0[i].binding = i;
+    //   set=2: 1 SSBO (Bézier CPs)
+    VkDescriptorSetLayoutBinding bindings0[4] = {};
+    for (int i = 0; i < 4; i++) {
+        bindings0[i].binding = (uint32_t)i;
         bindings0[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         bindings0[i].descriptorCount = 1;
         bindings0[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
     }
     VkDescriptorSetLayoutCreateInfo dslCI0 = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    dslCI0.bindingCount = 3; dslCI0.pBindings = bindings0;
+    dslCI0.bindingCount = 4; dslCI0.pBindings = bindings0;
 
     VkDescriptorSetLayoutBinding binding1 = {0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT};
     VkDescriptorSetLayoutCreateInfo dslCI1 = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     dslCI1.bindingCount = 1; dslCI1.pBindings = &binding1;
 
-    VkDescriptorSetLayout layouts[2];
+    VkDescriptorSetLayoutBinding binding2 = {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT};
+    VkDescriptorSetLayoutCreateInfo dslCI2 = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    dslCI2.bindingCount = 1; dslCI2.pBindings = &binding2;
+
+    VkDescriptorSetLayout layouts[3];
     NVVK_CHECK(vkCreateDescriptorSetLayout(dev, &dslCI0, nullptr, &layouts[0]));
     NVVK_CHECK(vkCreateDescriptorSetLayout(dev, &dslCI1, nullptr, &layouts[1]));
-    m_resolveDsLayout = layouts[0]; // save set=0 for pool creation ref
+    NVVK_CHECK(vkCreateDescriptorSetLayout(dev, &dslCI2, nullptr, &layouts[2]));
+    m_resolveDsLayout = layouts[0];    // save set=0 for pool creation ref
+    m_resolveSsboLayout = layouts[2];  // save set=2 for pool creation ref
 
     VkPipelineLayoutCreateInfo plCI = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-    plCI.setLayoutCount = 2; plCI.pSetLayouts = layouts;
+    plCI.setLayoutCount = 3; plCI.pSetLayouts = layouts;
     NVVK_CHECK(vkCreatePipelineLayout(dev, &plCI, nullptr, &m_resolvePipelineLayout));
 
     // No vertex input — full-screen triangle uses gl_VertexIndex
@@ -951,25 +994,26 @@ private:
   // set=0 is shared across all frames (G-buffer images don't change).
   // set=1 is triple-buffered (one per frame-in-flight) for UBO coherency.
   void createResolveDescriptorSet(VkDevice dev) {
-    int totalSets = 1 + MAX_FIF;  // 1×set0 + MAX_FIF×set1
-    VkDescriptorPoolSize dps[2] = {
-        {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 3},
-        {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, (uint32_t)MAX_FIF},
+    int totalSets = 1 + MAX_FIF + 1;  // 1×set0 + MAX_FIF×set1 + 1×set2
+    VkDescriptorPoolSize dps[3] = {
+        {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 4},          // gbufPos, Norm, ID, UV
+        {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, (uint32_t)MAX_FIF},  // lighting UBO
+        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1},                  // Bézier CP SSBO
     };
     VkDescriptorPoolCreateInfo dpCI = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-    dpCI.maxSets = (uint32_t)totalSets; dpCI.poolSizeCount = 2; dpCI.pPoolSizes = dps;
+    dpCI.maxSets = (uint32_t)totalSets; dpCI.poolSizeCount = 3; dpCI.pPoolSizes = dps;
     NVVK_CHECK(vkCreateDescriptorPool(dev, &dpCI, nullptr, &m_resolveDsPool));
 
-    // Re-create temp set layouts for allocation (pipeline layout was already created with matching layouts)
-    VkDescriptorSetLayoutBinding bindings0[3] = {};
-    for (int i = 0; i < 3; i++) {
-        bindings0[i].binding = i;
+    // Re-create temp set layouts for allocation (matching pipeline layout)
+    VkDescriptorSetLayoutBinding bindings0[4] = {};
+    for (int i = 0; i < 4; i++) {
+        bindings0[i].binding = (uint32_t)i;
         bindings0[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         bindings0[i].descriptorCount = 1;
         bindings0[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
     }
     VkDescriptorSetLayoutCreateInfo dslCI0 = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    dslCI0.bindingCount = 3; dslCI0.pBindings = bindings0;
+    dslCI0.bindingCount = 4; dslCI0.pBindings = bindings0;
     VkDescriptorSetLayout set0Layout;
     NVVK_CHECK(vkCreateDescriptorSetLayout(dev, &dslCI0, nullptr, &set0Layout));
 
@@ -979,35 +1023,38 @@ private:
     VkDescriptorSetLayout set1Layout;
     NVVK_CHECK(vkCreateDescriptorSetLayout(dev, &dslCI1, nullptr, &set1Layout));
 
-    // Allocate: 1×set0 + MAX_FIF×set1
-    VkDescriptorSetLayout set0Layouts[1] = {set0Layout};
     VkDescriptorSetLayout set1Layouts[MAX_FIF];
     for (int i = 0; i < MAX_FIF; i++) set1Layouts[i] = set1Layout;
 
     VkDescriptorSetAllocateInfo dsa = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
     dsa.descriptorPool = m_resolveDsPool;
-    dsa.descriptorSetCount = 1; dsa.pSetLayouts = set0Layouts;
+    // set=0: G-buffer textures (shared)
+    dsa.descriptorSetCount = 1; dsa.pSetLayouts = &set0Layout;
     NVVK_CHECK(vkAllocateDescriptorSets(dev, &dsa, &m_resolveDs));
-
+    // set=1: lighting UBO (per-frame)
     dsa.descriptorSetCount = MAX_FIF; dsa.pSetLayouts = set1Layouts;
     NVVK_CHECK(vkAllocateDescriptorSets(dev, &dsa, m_resolveDs1));
+    // set=2: SSBO (shared)
+    dsa.descriptorSetCount = 1; dsa.pSetLayouts = &m_resolveSsboLayout;
+    NVVK_CHECK(vkAllocateDescriptorSets(dev, &dsa, &m_resolveDs2));
 
-    // Write set=0: bind 3 G-buffer images as combined image samplers (shared)
-    VkDescriptorImageInfo imgInfo[3] = {
+    // Write set=0: bind 4 G-buffer images as combined image samplers
+    VkDescriptorImageInfo imgInfo[4] = {
         {m_gbufPos.descriptor.sampler,  m_gbufPos.descriptor.imageView,  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
         {m_gbufNorm.descriptor.sampler, m_gbufNorm.descriptor.imageView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
         {m_gbufID.descriptor.sampler,   m_gbufID.descriptor.imageView,   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+        {m_gbufUV.descriptor.sampler,   m_gbufUV.descriptor.imageView,   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
     };
-    VkWriteDescriptorSet wds[3] = {};
-    for (int i = 0; i < 3; i++) {
+    VkWriteDescriptorSet wds[4] = {};
+    for (int i = 0; i < 4; i++) {
         wds[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         wds[i].dstSet = m_resolveDs;
-        wds[i].dstBinding = i;
+        wds[i].dstBinding = (uint32_t)i;
         wds[i].descriptorCount = 1;
         wds[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         wds[i].pImageInfo = &imgInfo[i];
     }
-    vkUpdateDescriptorSets(dev, 3, wds, 0, nullptr);
+    vkUpdateDescriptorSets(dev, 4, wds, 0, nullptr);
 
     vkDestroyDescriptorSetLayout(dev, set0Layout, nullptr);
     vkDestroyDescriptorSetLayout(dev, set1Layout, nullptr);
@@ -1054,6 +1101,24 @@ private:
         VkWriteDescriptorSet wds[2] = {wdsVis, wdsLight};
         vkUpdateDescriptorSets(dev, 2, wds, 0, nullptr);
     }
+
+    // Dummy SSBO: 4 bytes, ensures descriptor set=2 is always valid.
+    // Replaced with real Bézier CP data when adaptive mesh is loaded.
+    VkBufferCreateInfo ssboCI = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    ssboCI.size = 4; ssboCI.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    VmaAllocationCreateInfo ssboACI = {};
+    ssboACI.usage = VMA_MEMORY_USAGE_GPU_ONLY;
+    VmaAllocationInfo ssboAI;
+    vmaCreateBuffer((VmaAllocator)m_alloc, &ssboCI, &ssboACI,
+                    &m_bezierSSBO.buffer, &m_bezierSSBO.allocation, &ssboAI);
+    m_bezierSSBO.bufferSize = 4;
+    m_hasSSBO = false;
+
+    VkDescriptorBufferInfo dbiSSBO = {m_bezierSSBO.buffer, 0, 4};
+    VkWriteDescriptorSet wdsSSBO = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    wdsSSBO.dstSet = m_resolveDs2; wdsSSBO.dstBinding = 0; wdsSSBO.descriptorCount = 1;
+    wdsSSBO.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; wdsSSBO.pBufferInfo = &dbiSSBO;
+    vkUpdateDescriptorSets(dev, 1, &wdsSSBO, 0, nullptr);
   }
 
   void uploadMesh(const Mesh& m) {
@@ -1064,12 +1129,35 @@ private:
     VkDeviceSize isz = m.i.size() * sizeof(uint32_t);
     m_alloc.createBuffer(m_indexBuffer, isz, VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_GPU_ONLY);
     { void* p; NVVK_CHECK(m_stagingUploader.appendBufferMapping(m_indexBuffer, 0, isz, p)); memcpy(p, m.i.data(), isz); }
+
+    // Upload Bézier CP SSBO if available (adaptive path with ETER §6.2)
+    if (!m.cp.empty() && m.patchCount > 0) {
+        VkDeviceSize cpsz = m.cp.size() * sizeof(float);
+        if (m_hasSSBO) m_alloc.destroyBuffer(m_bezierSSBO);
+        m_alloc.createBuffer(m_bezierSSBO, cpsz,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            VMA_MEMORY_USAGE_GPU_ONLY);
+        { void* p; NVVK_CHECK(m_stagingUploader.appendBufferMapping(m_bezierSSBO, 0, cpsz, p)); memcpy(p, m.cp.data(), cpsz); }
+        m_hasSSBO = true;
+
+        // Write SSBO descriptor (if descriptor set is already created)
+        if (m_resolveDs2 != VK_NULL_HANDLE) {
+            VkDescriptorBufferInfo dbiSSBO = {m_bezierSSBO.buffer, 0, cpsz};
+            VkWriteDescriptorSet wdsSSBO = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            wdsSSBO.dstSet = m_resolveDs2; wdsSSBO.dstBinding = 0; wdsSSBO.descriptorCount = 1;
+            wdsSSBO.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; wdsSSBO.pBufferInfo = &dbiSSBO;
+            vkUpdateDescriptorSets(dev, 1, &wdsSSBO, 0, nullptr);
+        }
+    } else {
+        m_hasSSBO = false;
+    }
+
     VkCommandBuffer c = m_app->createTempCmdBuffer();
     m_stagingUploader.cmdUploadAppended(c);
     m_app->submitAndWaitTempCmdBuffer(c);
     m_stagingUploader.releaseStaging();
     m_indexCount = (uint32_t)m.i.size();
-    LOGI("Uploaded: %d verts, %d tris\n", m.verts(), (int)(m.i.size()/3));
+    LOGI("Uploaded: %d verts, %d tris, %d CPs\n", m.verts(), (int)(m.i.size()/3), (int)m.cp.size());
   }
 
   void initViewportForImGui(VkDevice dev) {
