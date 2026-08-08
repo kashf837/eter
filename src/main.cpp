@@ -83,7 +83,6 @@ public:
         float* verts = nurbs_adaptive_eval(path, cam, &nu, &nv, &info, &total, &bezierCPs);
         if (!verts) { fprintf(stderr, "  [SKIP] %s\n", path); return m; }
         m.patchCount = nu * nv;
-        m.patchCols  = nv;
         if (bezierCPs) {
             int cpFloats = m.patchCount * 64;
             m.cp.assign(bezierCPs, bezierCPs + cpFloats);
@@ -107,8 +106,10 @@ public:
             for (int pj = 0; pj < nv; pj++) {
                 PatchInfo* p = &info[pi*nv+pj];
                 float* patch = verts + p->offset * 6;
-                uint32_t base = (uint32_t)m.v.size() / 9;  // stride 9
-                float patchID = (float)(pi * nv + pj);  // global sequential index
+                uint32_t base = (uint32_t)m.v.size() / 11;  // stride 11
+                float detail = (float)(p->tu + p->tv) / 128.0f;  // [0,1] tess density
+                float patchID = (float)(pi * nv + pj) + detail * 0.1f;
+                if ((pi + pj) & 1) patchID = -patchID;  // sign bit = checkerboard parity
                 for (int y = 0; y < p->tv; y++)
                     for (int x = 0; x < p->tu; x++) {
                         int k = y*p->tu + x;
@@ -126,14 +127,14 @@ public:
                         float inv=1.f/(sqrtf(nl)+1e-10f);
                         float u = p->tu > 1 ? (float)x / (float)(p->tu - 1) : 0.5f;
                         float v = p->tv > 1 ? (float)y / (float)(p->tv - 1) : 0.5f;
-                        m.v.insert(m.v.end(),{px,py,pz,nx*inv,ny*inv,nz*inv,u,v,patchID});
+                        m.v.insert(m.v.end(),{px,py,pz,nx*inv,ny*inv,nz*inv,u,v,patchID,(float)x,(float)y});
                         if(px<m.bbMin[0])m.bbMin[0]=px;if(py<m.bbMin[1])m.bbMin[1]=py;if(pz<m.bbMin[2])m.bbMin[2]=pz;
                         if(px>m.bbMax[0])m.bbMax[0]=px;if(py>m.bbMax[1])m.bbMax[1]=py;if(pz>m.bbMax[2])m.bbMax[2]=pz;
                     }
                 for (int y = 0; y < p->tv-1; y++)
                     for (int x = 0; x < p->tu-1; x++) {
                         uint32_t a=base+y*p->tu+x, b=a+1, c=a+p->tu, d=c+1;
-                        m.i.insert(m.i.end(),{a,b,c,b,d,c});
+                        m.i.insert(m.i.end(),{a,b,c, d,c,b});
                     }
             }
         free(verts); free(info);
@@ -184,7 +185,6 @@ private:
     }
 
     static void addPatchGrid(Mesh& m, const float* verts, const float* cp, int nu, int nv, int res) {
-        m.patchCols = nv;  // for checkerboard decode in shader
         // Append CPs (pre-centering) for global indexing
         int cpBase = m.patchCount;
         if (cp) {
@@ -192,9 +192,10 @@ private:
         }
         for (int pi = 0; pi < nu; pi++)
             for (int pj = 0; pj < nv; pj++) {
-                uint32_t base = (uint32_t)m.v.size() / 9;  // stride 9
+                uint32_t base = (uint32_t)m.v.size() / 11;  // stride 11
                 const float* p = verts + (pi*nv+pj)*res*res*6;
-                float patchID = (float)(m.patchCount++);  // global sequential ID
+                float patchID = (float)(m.patchCount++) + 0.05f;  // uniform tess detail=0.5
+                if ((pi + pj) & 1) patchID = -patchID;  // sign bit = checkerboard parity
                 for (int y = 0; y < res; y++)
                     for (int x = 0; x < res; x++) {
                         int idx = y*res+x;
@@ -211,14 +212,14 @@ private:
                         float inv=1.f/(sqrtf(gnLen)+1e-10f);
                         float u = res > 1 ? (float)x / (float)(res - 1) : 0.5f;
                         float v = res > 1 ? (float)y / (float)(res - 1) : 0.5f;
-                        m.v.insert(m.v.end(),{px,py,pz, gnx*inv,gny*inv,gnz*inv, u,v, patchID});
+                        m.v.insert(m.v.end(),{px,py,pz, gnx*inv,gny*inv,gnz*inv, u,v, patchID, (float)x,(float)y});
                         if(px<m.bbMin[0])m.bbMin[0]=px; if(py<m.bbMin[1])m.bbMin[1]=py; if(pz<m.bbMin[2])m.bbMin[2]=pz;
                         if(px>m.bbMax[0])m.bbMax[0]=px; if(py>m.bbMax[1])m.bbMax[1]=py; if(pz>m.bbMax[2])m.bbMax[2]=pz;
                     }
                 for (int y = 0; y < res-1; y++)
                     for (int x = 0; x < res-1; x++) {
                         uint32_t a=base+y*res+x, b=a+1, c=a+res, d=c+1;
-                        m.i.insert(m.i.end(),{a,b,c, b,d,c});
+                        m.i.insert(m.i.end(),{a,b,c, d,c,b});
                     }
             }
         // Center CPs per patch for FP32 precision in SSBO eval
@@ -296,7 +297,8 @@ public:
              m_center[0],m_center[1],m_center[2],m_modelScale,dist);
       glm::dvec3 e = m_camera->getEye();
       m_lastEye[0]=(float)e.x; m_lastEye[1]=(float)e.y; m_lastEye[2]=(float)e.z;
-      // Adaptive re-tessellation only for single .surf files, not STP directories
+      m_rebuildEye[0]=(float)e.x; m_rebuildEye[1]=(float)e.y; m_rebuildEye[2]=(float)e.z;
+      // Adaptive re-tessellation only for single .surf files (STP dirs = fixed res)
       m_lastPath = isDir ? "" : path;
     }
     if (isDir) std::filesystem::remove_all(path);
@@ -589,24 +591,27 @@ public:
 
   void onPreRender() override {
     m_profilerTimeline->frameAdvance();
-    // Adaptive re-tessellation (ETER §4): only rebuild when camera IDLE.
-    // Rebuilding during camera movement causes visible popping since each
-    // frame's mesh has slightly different vertex positions.
+    // Adaptive re-tessellation (ETER §4): rebuild when camera settles.
+    // Idle-counter approach: reset on any camera movement, rebuild after N idle frames.
     if (!m_lastPath.empty() && m_indexCount > 0) {
         glm::dvec3 e = m_camera->getEye();
         float dx=(float)e.x-m_lastEye[0], dy=(float)e.y-m_lastEye[1], dz=(float)e.z-m_lastEye[2];
         float dist = sqrtf(dx*dx+dy*dy+dz*dz);
 
-        if (dist > m_modelScale * 0.15f) {
-            // Camera moved enough: mark dirty, start/restart idle countdown
-            m_rebuildPending = true;
-            m_dirtyEye[0] = (float)e.x; m_dirtyEye[1] = (float)e.y; m_dirtyEye[2] = (float)e.z;
+        if (dist > m_modelScale * 0.001f) {
+            // Camera is moving: reset idle counter
             m_idleFrames = 0;
-        } else if (m_rebuildPending) {
+            m_lastEye[0] = (float)e.x; m_lastEye[1] = (float)e.y; m_lastEye[2] = (float)e.z;
+        } else {
             m_idleFrames++;
-            if (m_idleFrames >= 30 && !m_lastPath.empty()) {  // ~0.5s @60fps
+        }
+
+        if (m_idleFrames == 60) {  // ~1s idle @60fps → rebuild
+            float rdx=(float)e.x-m_rebuildEye[0], rdy=(float)e.y-m_rebuildEye[1], rdz=(float)e.z-m_rebuildEye[2];
+            float rdist = sqrtf(rdx*rdx+rdy*rdy+rdz*rdz);
+            if (rdist > m_modelScale * 0.01f) {  // worth rebuilding
                 CameraParams cam;
-                cam.camX = m_dirtyEye[0]; cam.camY = m_dirtyEye[1]; cam.camZ = m_dirtyEye[2];
+                cam.camX = (float)e.x; cam.camY = (float)e.y; cam.camZ = (float)e.z;
                 cam.fovY = 60.f; cam.scrW = m_imgW; cam.scrH = m_imgH;
                 Mesh m = MeshBuilder::adaptive(m_lastPath.c_str(), &cam);
                 if (!m.empty()) {
@@ -615,11 +620,11 @@ public:
                     uploadMesh(m);
                     m_modelScale = m.scale();
                     m_center[0]=m.cx(); m_center[1]=m.cy(); m_center[2]=m.cz();
-                    m_lastEye[0] = m_dirtyEye[0]; m_lastEye[1] = m_dirtyEye[1]; m_lastEye[2] = m_dirtyEye[2];
-                    m_rebuildPending = false;
-                    LOGI("[Adaptive] camera idle, %d verts\n", m.verts());
+                    m_rebuildEye[0] = (float)e.x; m_rebuildEye[1] = (float)e.y; m_rebuildEye[2] = (float)e.z;
+                    LOGI("[Adaptive] rebuilt, %d verts\n", m.verts());
                 }
             }
+            m_idleFrames = 0;
         }
     }
   }
@@ -718,9 +723,8 @@ private:
   float m_center[3] = {0,0,0};
   float m_lastEye[3] = {0,0,0};
   std::string m_lastPath;
-  float m_dirtyEye[3] = {0,0,0};  // target eye for next rebuild
-  int   m_idleFrames = 0;         // consecutive frames with negligible camera movement
-  bool  m_rebuildPending = false; // true when waiting for camera to idle
+  float m_rebuildEye[3] = {0,0,0};  // eye position at last rebuild
+  int   m_idleFrames = 0;          // consecutive frames with negligible camera movement
 #pragma endregion
 
 #pragma region Graphics pipeline
@@ -856,17 +860,18 @@ private:
     plCI.setLayoutCount = 1; plCI.pSetLayouts = &m_visDsLayout;
     NVVK_CHECK(vkCreatePipelineLayout(dev, &plCI, nullptr, &m_visPipelineLayout));
 
-    // Vertex input: 9 floats per vertex (x,y,z + nx,ny,nz + u,v + patchID)
-    VkVertexInputBindingDescription vib = {0, 9 * sizeof(float), VK_VERTEX_INPUT_RATE_VERTEX};
-    VkVertexInputAttributeDescription via[4] = {
+    // Vertex input: 11 floats per vertex (x,y,z + nx,ny,nz + u,v + patchID + gridX,gridY)
+    VkVertexInputBindingDescription vib = {0, 11 * sizeof(float), VK_VERTEX_INPUT_RATE_VERTEX};
+    VkVertexInputAttributeDescription via[5] = {
         {0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0},           // location=0: position
         {1, 0, VK_FORMAT_R32G32B32_SFLOAT, 3*sizeof(float)}, // location=1: normal
         {2, 0, VK_FORMAT_R32G32_SFLOAT, 6*sizeof(float)}, // location=2: (u,v)
         {3, 0, VK_FORMAT_R32_SFLOAT,       8*sizeof(float)}, // location=3: patchID
+        {4, 0, VK_FORMAT_R32G32_SFLOAT,       9*sizeof(float)}, // location=4: (gridX,gridY)
     };
     VkPipelineVertexInputStateCreateInfo vi = {VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
     vi.vertexBindingDescriptionCount = 1; vi.pVertexBindingDescriptions = &vib;
-    vi.vertexAttributeDescriptionCount = 4; vi.pVertexAttributeDescriptions = via;
+    vi.vertexAttributeDescriptionCount = 5; vi.pVertexAttributeDescriptions = via;
 
     // Standard pipeline state: triangle list, 1 viewport, no blending
     VkPipelineInputAssemblyStateCreateInfo ia = {VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};

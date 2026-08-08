@@ -60,93 +60,11 @@ def parse_step_file(path):
         r'#(\d+)\s*=\s*VERTEX_POINT\s*\(\s*\'[^\']*\'\s*,\s*#(\d+)\s*\)\s*;', text):
         vertex_points[int(m.group(1))] = int(m.group(2))
 
-    # EDGE_CURVE: id → (vp1, vp2, curve_geom_id)
+    # EDGE_CURVE: id → (vp1, vp2)
     edge_curves = {}
     for m in re.finditer(
-        r'#(\d+)\s*=\s*EDGE_CURVE\s*\(\s*\'[^\']*\'\s*,\s*#(\d+)\s*,\s*#(\d+)\s*,\s*#(\d+)\s*,', text):
-        edge_curves[int(m.group(1))] = (int(m.group(2)), int(m.group(3)), int(m.group(4)))
-
-    # --- Parse B-spline curve geometries for edge sampling ---
-    # B_SPLINE_CURVE_WITH_KNOTS: id → (degree, cps, knots, domain_min, domain_max)
-    bsp_curves = {}
-    for m in re.finditer(
-        r'#(\d+)\s*=\s*B_SPLINE_CURVE_WITH_KNOTS\s*\((.*?)\)\s*;', text, re.DOTALL):
-        cid = int(m.group(1))
-        body = m.group(2)
-        # Split body at top-level commas
-        parts, depth, cur = [], 0, ''
-        for ch in body:
-            if ch == '(': depth += 1
-            elif ch == ')': depth -= 1
-            if ch == ',' and depth == 0:
-                parts.append(cur.strip()); cur = ''
-            else: cur += ch
-        if cur.strip(): parts.append(cur.strip())
-        try:
-            # parts[0] = name, parts[1] = degree
-            deg = int(parts[1])
-            # parts[2] = CP list: ((#cp1,#cp2,...),(#cp3,...),...)
-            cp_text = parts[2]
-            cp_ids = [int(s.strip().lstrip('#')) for s in cp_text.split(',') if s.strip().lstrip('#').isdigit()]
-            cps = [cart_points[cid_] for cid_ in cp_ids if cid_ in cart_points]
-            if len(cps) < 2: continue
-            # Find knot data: look for the multiplicity and knot lists
-            # After CPs: .UNSPECIFIED., .F., .F., (mults), (knots)
-            knot_mults = []
-            knot_vals = []
-            for p in parts[3:]:
-                p = p.strip()
-                if p.startswith('(') and not knot_mults:
-                    knot_mults = [int(float(x.strip())) for x in p.strip('()').split(',') if x.strip()]
-                elif p.startswith('(') and knot_mults and not knot_vals:
-                    knot_vals = [float(x.strip()) for x in p.strip('()').split(',') if x.strip()]
-            if knot_mults and knot_vals:
-                # Build full knot vector
-                knots = []
-                for kval, mult in zip(knot_vals, knot_mults):
-                    knots.extend([kval] * mult)
-                domain_min = knots[deg]
-                domain_max = knots[len(cps)]
-                bsp_curves[cid] = (deg, cps, knots, domain_min, domain_max)
-        except:
-            pass
-
-    # B-spline curve evaluation (Cox-de Boor)
-    def eval_curve(curve, t):
-        deg, cps, knots, _, _ = curve
-        n = len(cps) - 1
-        # Clamp t to domain
-        t = max(knots[deg], min(t, knots[n + 1]))
-        # Find knot span
-        span = deg
-        for i in range(deg, n + 1):
-            if knots[i] <= t < knots[i + 1]:
-                span = i
-                break
-        if t >= knots[n + 1]:
-            span = n
-        # Basis functions
-        N = [0.0] * (deg + 1)
-        left = [0.0] * (deg + 1)
-        right = [0.0] * (deg + 1)
-        N[0] = 1.0
-        for j in range(1, deg + 1):
-            left[j] = t - knots[span + 1 - j]
-            right[j] = knots[span + j] - t
-            saved = 0.0
-            for r in range(j):
-                temp = N[r] / (right[r + 1] + left[j - r]) if (right[r + 1] + left[j - r]) > 1e-15 else 0.0
-                N[r] = saved + right[r + 1] * temp
-                saved = left[j - r] * temp
-            N[j] = saved
-        # Evaluate
-        pt = [0.0, 0.0, 0.0]
-        for i in range(deg + 1):
-            cp = cps[span - deg + i]
-            w = N[i]
-            for d in range(3):
-                pt[d] += w * cp[d]
-        return pt
+        r'#(\d+)\s*=\s*EDGE_CURVE\s*\(\s*\'[^\']*\'\s*,\s*#(\d+)\s*,\s*#(\d+)\s*,', text):
+        edge_curves[int(m.group(1))] = (int(m.group(2)), int(m.group(3)))
 
     # ORIENTED_EDGE: id → (edge_curve_id, orientation)  orientation=True means forward
     oriented_edges = {}
@@ -201,9 +119,8 @@ def parse_step_file(path):
         if aid not in axises: continue
         origin, normal, x_dir = axises[aid]
 
-        # Collect boundary points in EDGE_LOOP order (sample curves, not just vertices)
+        # Collect vertices in EDGE_LOOP order
         ordered_pts = []
-        EDGE_SAMPLES = 8  # samples per edge for smooth curve approximation
         if plane_id in surface_to_bounds:
             for bound_id in surface_to_bounds[plane_id]:
                 if bound_id not in face_outer_bounds: continue
@@ -213,25 +130,10 @@ def parse_step_file(path):
                     if oe_id not in oriented_edges: continue
                     ec_id, forward = oriented_edges[oe_id]
                     if ec_id not in edge_curves: continue
-                    vp1, vp2, cg_id = edge_curves[ec_id]
+                    vp1, vp2 = edge_curves[ec_id]
                     cp1 = vertex_points.get(vp1)
                     cp2 = vertex_points.get(vp2)
-
-                    # Try to sample the B-spline curve for smooth edges
-                    if cg_id in bsp_curves and cp1 and cp2 and cp1 in cart_points and cp2 in cart_points:
-                        curve = bsp_curves[cg_id]
-                        t_min, t_max = curve[3], curve[4]
-                        # Sample uniformly (respect orientation)
-                        samples = EDGE_SAMPLES
-                        for s in range(samples):
-                            t_val = t_min + (t_max - t_min) * s / (samples - 1)
-                            if not forward:
-                                t_val = t_max - (t_val - t_min)
-                            pt = eval_curve(curve, t_val)
-                            if not ordered_pts or ordered_pts[-1] != pt:
-                                ordered_pts.append(pt)
-                    elif cp1 and cp2 and cp1 in cart_points and cp2 in cart_points:
-                        # Fallback: straight line between vertices
+                    if cp1 and cp2 and cp1 in cart_points and cp2 in cart_points:
                         if forward:
                             pts = [cart_points[cp1], cart_points[cp2]]
                         else:

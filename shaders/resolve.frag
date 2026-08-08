@@ -5,6 +5,10 @@
 //                    CPs are centered per-patch → FP32-safe at any scale.
 //                    Consistent across all patch boundaries → no seams.
 // Crack pixels:      SSBO Bézier from nearest valid neighbor.
+//
+// Checkerboard:      encoded as sign bit of patchID float in vertex buffer,
+//                    stored in gbufNorm.w by visibility.frag.
+//                    patchID in gbufID (uint) = abs(original) = clean seq ID.
 
 layout(location = 0) out vec4 outColor;
 
@@ -20,21 +24,13 @@ layout(std140, set = 1, binding = 0) uniform Lighting {
     float lightDirZ;
     float checkerboard;
     float boundary;
-    float patchCols;
+    float patchCols;   // unused (kept for UBO compat)
     float _pad;
 } lighting;
 
 layout(std430, set = 2, binding = 0) buffer BezierData {
     vec4 bezierCP[];
 };
-
-// ============================================================
-// Patch ID decoding
-// ============================================================
-uint decodeSeqID(uint patchID)
-{
-    return patchID;  // patchID is the global sequential index
-}
 
 // ============================================================
 // Cubic Bernstein polynomials
@@ -57,7 +53,7 @@ void bernsteinDeriv(float t, out float dB[4])
     dB[3] =  3.0 * t * t;
 }
 
-void evalBezier(uint seqID, vec2 uv, out vec3 pos, out vec3 norm)
+void evalBezier(uint patchID, vec2 uv, out vec3 pos, out vec3 norm)
 {
     float u = clamp(uv.x, 0.0, 1.0);
     float v = clamp(uv.y, 0.0, 1.0);
@@ -68,7 +64,7 @@ void evalBezier(uint seqID, vec2 uv, out vec3 pos, out vec3 norm)
     bernsteinDeriv(u, dBu);
     bernsteinDeriv(v, dBv);
 
-    uint base = seqID * 16u;
+    uint base = patchID * 16u;
     vec4 Sw  = vec4(0.0);
     vec4 dSu = vec4(0.0);
     vec4 dSv = vec4(0.0);
@@ -104,20 +100,20 @@ vec3 shadeNormal(vec3 N, vec3 L, float checker)
     return vec3(0.85) * (ambient + diffuse * 0.6 * checker) * lighting.intensity;
 }
 
-float decodeChecker(uint pid)
+// detail: tessellation density [0,1] from |gbufNorm.w|
+// isEven: sign of gbufNorm.w → checkerboard parity (encoded via sign bit of patchID)
+// Binary checker modulated by detail brightness:
+//   high tess = brighter, low tess = dimmer, but checker pattern always visible
+float checkerFromParity(bool isEven)
 {
-    int nv = max(int(lighting.patchCols), 1);
-    uint row = pid / uint(nv);
-    uint col = pid % uint(nv);
-    return (((row + col) & 1u) != 0u) ? 0.6 : 1.0;
+    return isEven ? 1.15 : 0.85;  // checkerboard, average ≈ 1.0
 }
 
-vec3 shadeSSBO(uint patchID, vec2 uv, vec3 L)
+vec3 shadeSSBO(uint patchID, vec2 uv, vec3 L, bool isEven)
 {
-    uint seqID = decodeSeqID(patchID);
     vec3 pos, norm;
-    evalBezier(seqID, uv, pos, norm);
-    float checker = mix(1.0, decodeChecker(patchID), lighting.checkerboard);
+    evalBezier(patchID, uv, pos, norm);
+    float checker = mix(1.0, checkerFromParity(isEven), lighting.checkerboard);
     return shadeNormal(norm, L, checker);
 }
 
@@ -137,8 +133,10 @@ void main()
     // Valid pixel
     // ============================================================
     if (isFg) {
-        uint patchID = texelFetch(gbufID, coord, 0).r;
-        vec2 paramUV = texelFetch(gbufUV, coord, 0).rg;
+        uint  patchID  = texelFetch(gbufID, coord, 0).r;
+        vec2  paramUV  = texelFetch(gbufUV, coord, 0).rg;
+        float rawW     = texelFetch(gbufNorm, coord, 0).w;
+        bool  isEven   = rawW >= 0.0;     // sign bit → checkerboard parity
 
         // Detect patch boundary
         uint n0 = texelFetchOffset(gbufID, coord, 0, ivec2( 1,  0)).r;
@@ -148,8 +146,7 @@ void main()
         bool isBoundary = (n0 != patchID || n1 != patchID || n2 != patchID || n3 != patchID);
 
         // SSBO Bézier for all pixels → pixel-accurate, boundary-consistent normals.
-        // CPs are centered per-patch so FP32 precision is safe at any model scale.
-        vec3 colorOut = shadeSSBO(patchID, paramUV, lightDir);
+        vec3 colorOut = shadeSSBO(patchID, paramUV, lightDir, isEven);
 
         // Boundary debug overlay
         outColor = (lighting.boundary > 0.5 && isBoundary)
@@ -166,19 +163,33 @@ void main()
     vec4 nt = texelFetchOffset(gbufPos, coord, 0, ivec2( 0,  1));
     vec4 nb = texelFetchOffset(gbufPos, coord, 0, ivec2( 0, -1));
 
-    uint  selID  = 0u;
-    vec2  selUV  = vec2(0.0);
+    uint  selID     = 0u;
+    vec2  selUV     = vec2(0.0);
+    float selRawW   = 0.0;
 
-    if (np.a >= 0.5) { selID = texelFetchOffset(gbufID, coord, 0, ivec2( 1,  0)).r; selUV = vec2(0.0, texelFetchOffset(gbufUV, coord, 0, ivec2( 1,  0)).rg.y); }
-    else if (nn.a >= 0.5) { selID = texelFetchOffset(gbufID, coord, 0, ivec2(-1,  0)).r; selUV = vec2(1.0, texelFetchOffset(gbufUV, coord, 0, ivec2(-1,  0)).rg.y); }
-    else if (nt.a >= 0.5) { selID = texelFetchOffset(gbufID, coord, 0, ivec2( 0,  1)).r; selUV = vec2(texelFetchOffset(gbufUV, coord, 0, ivec2( 0,  1)).rg.x, 0.0); }
-    else if (nb.a >= 0.5) { selID = texelFetchOffset(gbufID, coord, 0, ivec2( 0, -1)).r; selUV = vec2(texelFetchOffset(gbufUV, coord, 0, ivec2( 0, -1)).rg.x, 1.0); }
+    if (np.a >= 0.5) {
+        selID = texelFetchOffset(gbufID, coord, 0, ivec2( 1,  0)).r;
+        selUV = vec2(0.0, texelFetchOffset(gbufUV, coord, 0, ivec2( 1,  0)).rg.y);
+        selRawW = texelFetchOffset(gbufNorm, coord, 0, ivec2( 1,  0)).w;
+    } else if (nn.a >= 0.5) {
+        selID = texelFetchOffset(gbufID, coord, 0, ivec2(-1,  0)).r;
+        selUV = vec2(1.0, texelFetchOffset(gbufUV, coord, 0, ivec2(-1,  0)).rg.y);
+        selRawW = texelFetchOffset(gbufNorm, coord, 0, ivec2(-1,  0)).w;
+    } else if (nt.a >= 0.5) {
+        selID = texelFetchOffset(gbufID, coord, 0, ivec2( 0,  1)).r;
+        selUV = vec2(texelFetchOffset(gbufUV, coord, 0, ivec2( 0,  1)).rg.x, 0.0);
+        selRawW = texelFetchOffset(gbufNorm, coord, 0, ivec2( 0,  1)).w;
+    } else if (nb.a >= 0.5) {
+        selID = texelFetchOffset(gbufID, coord, 0, ivec2( 0, -1)).r;
+        selUV = vec2(texelFetchOffset(gbufUV, coord, 0, ivec2( 0, -1)).rg.x, 1.0);
+        selRawW = texelFetchOffset(gbufNorm, coord, 0, ivec2( 0, -1)).w;
+    }
 
     if (selID != 0u) {
-        uint seqID = decodeSeqID(selID);
         vec3 pos, norm;
-        evalBezier(seqID, selUV, pos, norm);
-        float checker = mix(1.0, decodeChecker(selID), lighting.checkerboard);
+        evalBezier(selID, selUV, pos, norm);
+        bool  selEven   = selRawW >= 0.0;
+        float checker = mix(1.0, checkerFromParity(selEven), lighting.checkerboard);
         outColor = vec4(shadeNormal(norm, lightDir, checker), 1.0);
     } else {
         outColor = vec4(0.1, 0.1, 0.15, 1.0);
