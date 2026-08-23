@@ -32,3 +32,12 @@ add_executable(eter
 target_link_libraries(eter PRIVATE nvpro2::nvapp)
 add_project_definitions(eter)
 copy_to_runtime_and_install(eter AUTO)
+
+# Console regression harness for the packed .surfb reader
+add_executable(test_packed
+  tests/test_packed.cpp
+  src/nurbs.cu
+  src/knot_insert.cu
+  src/bezier_eval.cu
+  src/adaptive_tess.cu
+)

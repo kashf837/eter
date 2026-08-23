@@ -149,31 +149,71 @@ public:
         namespace fs = std::filesystem;
         Mesh m; resetBBox(m);
         std::vector<std::string> files;
-        for (auto& e : fs::directory_iterator(dirPath))
+        std::string packedPath;
+        for (auto& e : fs::directory_iterator(dirPath)) {
             if (e.is_regular_file() && e.path().extension() == ".surf")
                 files.push_back(e.path().string());
+            else if (e.is_regular_file() && e.path().extension() == ".surfb")
+                packedPath = e.path().string();
+        }
         std::sort(files.begin(), files.end());
-        LOGI("Loading %zu surf files (adaptive)...\n", files.size());
-        if (files.empty()) {
-            LOGI("WARNING: no .surf files in %s — STEP conversion may have failed\n", dirPath);
+        if (!packedPath.empty()) {
+            LOGI("Loading packed %s (adaptive)...\n", packedPath.c_str());
+        } else {
+            LOGI("Loading %zu surf files (adaptive)...\n", files.size());
+            if (files.empty())
+                LOGI("WARNING: no .surf files in %s — STEP conversion may have failed\n", dirPath);
         }
         int skipped = 0, tuMin = 999, tuMax = 0, tvMin = 999, tvMax = 0;
 
-        // Phase 1: read + decompose every file. Files are fully independent,
-        // so they load in parallel (OpenMP, same pattern as pass-1); results
-        // land in per-index slots and the cache fill below stays serial in
-        // scene order — the SSBO layout anchor. (Was 11.4 s serial.)
+        // Phase 1: read + decompose every surface. Prefer the packed binary
+        // .surfb (ONE open for the whole scene — the per-file text path pays
+        // thousands of fopen/close pairs, each hitting the I/O stack and the
+        // antivirus scan of freshly written files); fall back to per-file
+        // text .surf for hand-made datasets. Either way the cache fill below
+        // stays serial in scene order — the SSBO layout anchor. (Was 11.4 s
+        // serial, 0.94 s parallel text.)
         int nFiles = (int)files.size();
         std::vector<float*> rawCps((size_t)nFiles, nullptr);   // freed after phase 3
         std::vector<int> cNu((size_t)nFiles), cNv((size_t)nFiles), cRu((size_t)nFiles), cRv((size_t)nFiles);
-        #pragma omp parallel for schedule(dynamic)
-        for (int i = 0; i < nFiles; i++)
-            rawCps[i] = nurbs_read_cps(files[(size_t)i].c_str(), &cNu[i], &cNv[i], &cRu[i], &cRv[i]);
+        bool loadedPacked = false;
+        auto tL0 = std::chrono::steady_clock::now();
+        if (!packedPath.empty()) {
+            float** pk = nullptr;
+            int *pkNu = nullptr, *pkNv = nullptr, *pkRu = nullptr, *pkRv = nullptr;
+            int nk = nurbs_read_packed(packedPath.c_str(), &pk, &pkNu, &pkNv, &pkRu, &pkRv);
+            if (nk >= 0) {
+                rawCps.assign((size_t)nk, nullptr);
+                cNu.resize((size_t)nk); cNv.resize((size_t)nk); cRu.resize((size_t)nk); cRv.resize((size_t)nk);
+                for (int i = 0; i < nk; i++) {
+                    rawCps[(size_t)i] = pk[i];
+                    cNu[(size_t)i] = pkNu[i]; cNv[(size_t)i] = pkNv[i];
+                    cRu[(size_t)i] = pkRu[i]; cRv[(size_t)i] = pkRv[i];
+                }
+                nFiles = nk; loadedPacked = true;
+            } else {
+                fprintf(stderr, "  [scene] %s unreadable — falling back to per-file text load\n",
+                        packedPath.c_str());
+            }
+            free(pk); free(pkNu); free(pkNv); free(pkRu); free(pkRv);
+        }
+        if (!loadedPacked) {
+            #pragma omp parallel for schedule(dynamic)
+            for (int i = 0; i < nFiles; i++)
+                rawCps[(size_t)i] = nurbs_read_cps(files[(size_t)i].c_str(), &cNu[(size_t)i],
+                                                   &cNv[(size_t)i], &cRu[(size_t)i], &cRv[(size_t)i]);
+        }
+        auto tL1 = std::chrono::steady_clock::now();
+        fprintf(stderr, "  [scene] load: %d files, %.1f ms\n", nFiles,
+                1e-3f * std::chrono::duration_cast<std::chrono::microseconds>(tL1 - tL0).count());
 
         std::vector<SceneSurf> surfs;
-        surfs.reserve(files.size());
+        surfs.reserve((size_t)nFiles);
         for (int i = 0; i < nFiles; i++) {   // serial: scene order = SSBO anchor
-            if (!rawCps[i]) { fprintf(stderr, "  [SKIP] %s\n", files[(size_t)i].c_str()); skipped++; continue; }
+            if (!rawCps[i]) {
+                if (!loadedPacked) fprintf(stderr, "  [SKIP] %s\n", files[(size_t)i].c_str());
+                skipped++; continue;
+            }
             if (cache) {
                 BezierSurface s;
                 s.cps.assign(rawCps[i], rawCps[i] + (size_t)cNu[i] * cNv[i] * cRu[i] * cRv[i] * 4);
@@ -496,11 +536,13 @@ public:
                     std::string cmd = "python scripts/step2surf.py --all \"" + sp + "\" \"" + m_tempDir + "/out\"";
                     LOGI("Converting STEP...\n");
                     int ret = system(cmd.c_str());
-                    // Verify conversion succeeded and produced .surf files
+                    // Verify conversion succeeded and produced a packed file
                     bool hasFiles = false;
                     if (ret == 0) {
                         for (auto& e : std::filesystem::directory_iterator(m_tempDir))
-                            if (e.is_regular_file() && e.path().extension() == ".surf") { hasFiles = true; break; }
+                            if (e.is_regular_file() &&
+                                (e.path().extension() == ".surfb" || e.path().extension() == ".surf"))
+                                { hasFiles = true; break; }
                     }
                     if (hasFiles) {
                         m_pendingLoad = m_tempDir; m_pendingIsDir = true;

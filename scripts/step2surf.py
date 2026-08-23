@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Convert STEP B_SPLINE_SURFACE to .surf (supports inline and entity formats)."""
-import sys, os, re
+import sys, os, re, struct
 
 def parse_cp_grid(grid_text):
     """Parse nested CP grid like ((#1,#2),(#3,#4)) into list of row strings."""
@@ -310,6 +310,82 @@ def write_surf(path, s):
     # print(f"Wrote {path}: {s['n_u']+1}x{s['n_v']+1} CPs, order {s['p_u']}x{s['p_v']}")
 
 
+def dec_to_f32(s):
+    """Correctly-rounded decimal string -> IEEE-754 float32 (round-half-even).
+
+    Exact big-int implementation of C strtof for the fixed-point strings we
+    emit (:.10f / :.6f, no exponent/inf/nan). This matters: the text .surf
+    loader parses with strtof and knot insertion compares U[i]==u exactly,
+    so the packed file must carry the same float32 bits the text path would
+    have produced — patch counts are the canary (3678976 verts / 57484).
+    """
+    neg = s.startswith('-')
+    if neg:
+        s = s[1:]
+    ip, _, fp = s.partition('.')
+    digits = (ip + fp).lstrip('0') or '0'
+    if digits == '0':
+        return -0.0 if neg else 0.0
+    num = int(digits)
+    den = 10 ** len(fp)
+    # e such that 2^e <= num/den < 2^(e+1)  (starts within 1 of true, so the
+    # adjust loops run at most twice). Exact integer inequality x*2^n <= y —
+    # shifting and comparing floors would lose the fraction.
+    def le(x, n, y):
+        return (x << n) <= y if n >= 0 else x <= (y << -n)
+    e = num.bit_length() - den.bit_length()
+    while not le(den, e, num):
+        e -= 1
+    while le(den, e + 1, num):
+        e += 1
+    # Q = round(value / 2^e * 2^23) — the 24-bit significand in [2^23, 2^24)
+    shift = 23 - e
+    if shift >= 0:
+        Q, R = divmod(num << shift, den)
+        dv = den
+    else:
+        Q, R = divmod(num, den << -shift)
+        dv = den << -shift
+    if 2 * R > dv or (2 * R == dv and (Q & 1)):   # round to nearest, ties to even
+        Q += 1
+        if Q == 1 << 24:                          # significand overflow
+            Q = 1 << 23
+            e += 1
+    v = float(Q) * (2.0 ** (e - 23))              # exact in double (Q <= 2^24)
+    if neg:
+        v = -v
+    return struct.unpack('<f', struct.pack('<f', v))[0]
+
+
+def write_packed(path, surfaces):
+    """One binary .surfb for the whole STEP: 3506 text files -> 1 open.
+
+    Layout (little-endian, read by nurbs_read_packed in src/nurbs.cu):
+      "SURF" u32 version u32 nSurf, then per surface:
+      i32 p_u p_v n_u n_v | i32 m_u (m_u+1)xf32 U | i32 m_v (m_v+1)xf32 V |
+      (n_u+1)*(n_v+1) x 4xf32 CPs (i-major, xyz+w)
+    Floats are the exact float32s the text loader would parse (see
+    dec_to_f32), so packed and text loads are bit-identical.
+    """
+    with open(path, 'wb') as f:
+        f.write(b'SURF' + struct.pack('<II', 1, len(surfaces)))
+        for s in surfaces:
+            f.write(struct.pack('<4i', s['p_u'], s['p_v'], s['n_u'], s['n_v']))
+            U = [dec_to_f32(f"{v:.10f}") for v in s['U']]
+            V = [dec_to_f32(f"{v:.10f}") for v in s['V']]
+            f.write(struct.pack('<i', len(U) - 1))
+            f.write(struct.pack('<%df' % len(U), *U))
+            f.write(struct.pack('<i', len(V) - 1))
+            f.write(struct.pack('<%df' % len(V), *V))
+            cps = []
+            for i in range(s['n_u'] + 1):
+                for j in range(s['n_v'] + 1):
+                    xyz = s['cp_grid'][i][j]
+                    cps += [dec_to_f32(f"{xyz[0]:.6f}"), dec_to_f32(f"{xyz[1]:.6f}"),
+                            dec_to_f32(f"{xyz[2]:.6f}"), 1.0]
+            f.write(struct.pack('<%df' % len(cps), *cps))
+
+
 def main():
     all_flag = '--all' in sys.argv
     args = [a for a in sys.argv[1:] if a != '--all']
@@ -336,8 +412,10 @@ def main():
     if all_flag:
         base = args[1] if len(args) > 1 else re.sub(r'(?i)\.(STEP|STP)$', '', infile)
         os.makedirs(os.path.dirname(base) or '.', exist_ok=True)
-        for idx, s in enumerate(surfaces):
-            write_surf(f"{base}_{idx:04d}.surf", s)
+        # One packed binary instead of thousands of text files: the loader
+        # pays one open for the whole scene (per-file text cost ~1 s for
+        # 3506 files, mostly per-open overhead).
+        write_packed(f"{base}.surfb", surfaces)
     else:
         out = args[1]
         write_surf(out, surfaces[0])

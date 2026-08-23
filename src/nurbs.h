@@ -28,3 +28,14 @@ float* nurbs_adaptive_eval_scene(const SceneSurf* surfs, int nSurfs,
 // evaluation. Returns NULL on any error, incl. degree > 7 (the eval kernel's
 // shared Bernstein tables cap orders at 7). Caller frees the CP array.
 float* nurbs_read_cps(const char* path, int* nu, int* nv, int* ru, int* rv);
+
+// Read a packed binary .surfb file (written by scripts/step2surf.py --all):
+// the whole scene in one file — ONE open replaces 3506 fopen/close pairs
+// (the per-open cost of the per-file text path dominated its wall clock).
+// All surfaces are decomposed in parallel (OpenMP). Returns per-surface flat
+// uncentered Bézier CP arrays (same layout as nurbs_read_cps); entry i is
+// NULL if surface i was skipped (degree > 7 etc.). Returns the surface count
+// or -1 if the file cannot be read. Caller frees *cpsOut and each non-NULL
+// entry, plus the four int arrays.
+int nurbs_read_packed(const char* path, float*** cpsOut, int** nuOut, int** nvOut,
+                      int** ruOut, int** rvOut);

@@ -224,6 +224,137 @@ float* nurbs_read_cps(const char* path, int* nu, int* nv, int* ru, int* rv)
     return cps;
 }
 
+// ============================================================
+// Packed .surfb reader — the whole scene in one open
+// ============================================================
+// Format (little-endian, written by scripts/step2surf.py --all):
+//   "SURF" u32 version u32 nSurf, then per surface:
+//   i32 p_u p_v n_u n_v | i32 m_u (m_u+1)xf32 U | i32 m_v (m_v+1)xf32 V |
+//   (n_u+1)*(n_v+1) x 4xf32 CPs (i-major, xyz+w).
+// The floats are the exact float32s the text parser produces (the writer
+// rounds the same .10f/.6f strings correctly), so knot insertion's U[i]==u
+// compares behave bit-identically to a text load.
+
+int nurbs_read_packed(const char* path, float*** cpsOut, int** nuOut, int** nvOut,
+                      int** ruOut, int** rvOut)
+{
+    *cpsOut = NULL; *nuOut = NULL; *nvOut = NULL; *ruOut = NULL; *rvOut = NULL;
+
+    FILE* f = fopen(path, "rb");
+    if (!f) return -1;
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (sz < 12) { fclose(f); return -1; }
+    char* buf = (char*)malloc((size_t)sz + 1);
+    if (!buf) { fclose(f); return -1; }
+    if (fread(buf, 1, (size_t)sz, f) != (size_t)sz) { free(buf); fclose(f); return -1; }
+    fclose(f);
+    buf[sz] = '\0';
+
+    const char* q = buf;
+    const char* end = buf + sz;
+    if (memcmp(q, "SURF", 4) != 0) { free(buf); return -1; }
+    q += 4;
+    uint32_t ver = 0, nSurf = 0;
+    memcpy(&ver, q, 4); q += 4;
+    memcpy(&nSurf, q, 4); q += 4;
+    if (ver != 1 || nSurf == 0 || nSurf > 1000000) { free(buf); return -1; }
+
+    // Serial sweep: record each surface's byte span so the parallel decode
+    // below can hand every thread a disjoint buffer slice. The skip
+    // arithmetic here and the memcpy arithmetic in the parallel loop must
+    // stay identical — they are each other's bounds guarantee.
+    size_t* offs = (size_t*)malloc(((size_t)nSurf + 1) * sizeof(size_t));
+    if (!offs) { free(buf); return -1; }
+    bool ok = true;
+    for (uint32_t i = 0; i < nSurf && ok; i++) {
+        offs[i] = (size_t)(q - buf);
+        int h[4];
+        if (end - q < 16) { ok = false; break; }
+        memcpy(h, q, 16); q += 16;
+        if (h[0] <= 0 || h[1] <= 0 || h[2] <= 0 || h[3] <= 0 ||
+            h[0] > 20 || h[1] > 20 || h[2] > 10000 || h[3] > 10000) { ok = false; break; }
+        int m_u = 0, m_v = 0;
+        if (end - q < 4) { ok = false; break; }
+        memcpy(&m_u, q, 4); q += 4;
+        if (m_u < 0 || m_u > 100000 || end - q < (long)(m_u + 1) * 4) { ok = false; break; }
+        q += (m_u + 1) * 4;
+        if (end - q < 4) { ok = false; break; }
+        memcpy(&m_v, q, 4); q += 4;
+        if (m_v < 0 || m_v > 100000 || end - q < (long)(m_v + 1) * 4) { ok = false; break; }
+        q += (m_v + 1) * 4;
+        long ncp = (long)(h[2] + 1) * (h[3] + 1) * 16;
+        if (end - q < ncp) { ok = false; break; }
+        q += ncp;
+    }
+    if (!ok) { free(buf); free(offs); return -1; }
+    offs[nSurf] = (size_t)(q - buf);
+
+    float** cps = (float**)calloc(nSurf, sizeof(float*));
+    int* nu = (int*)calloc(nSurf, sizeof(int));
+    int* nv = (int*)calloc(nSurf, sizeof(int));
+    int* ru = (int*)calloc(nSurf, sizeof(int));
+    int* rv = (int*)calloc(nSurf, sizeof(int));
+    if (!cps || !nu || !nv || !ru || !rv) {
+        free(cps); free(nu); free(nv); free(ru); free(rv);
+        free(buf); free(offs); return -1;
+    }
+
+    // Decompose every surface in parallel. Each thread owns a disjoint
+    // buffer slice and its own NURBS structs — fully independent, the same
+    // pattern as the per-file text path.
+    #pragma omp parallel for schedule(dynamic)
+    for (int i = 0; i < (int)nSurf; i++) {
+        const char* p = buf + offs[(size_t)i];
+        NurbsSurf s;
+        memcpy(&s.p_u, p, 16); p += 16;
+        memcpy(&s.m_u, p, 4);  p += 4;
+        s.U = (float*)malloc(((size_t)s.m_u + 1) * 4);
+        memcpy(s.U, p, ((size_t)s.m_u + 1) * 4); p += ((size_t)s.m_u + 1) * 4;
+        memcpy(&s.m_v, p, 4);  p += 4;
+        s.V = (float*)malloc(((size_t)s.m_v + 1) * 4);
+        memcpy(s.V, p, ((size_t)s.m_v + 1) * 4); p += ((size_t)s.m_v + 1) * 4;
+        s.Ps = new_cpgrid(s.n_u, s.n_v, 4);
+        for (int ii = 0; ii <= s.n_u; ii++)
+            for (int jj = 0; jj <= s.n_v; jj++)
+                memcpy(s.Ps[ii][jj], p + ((size_t)ii * (s.n_v + 1) + jj) * 16, 16);
+
+        nurbs_to_beziers(&s);
+
+        int r_u = s.p_u + 1, r_v = s.p_v + 1;
+        int n_u = (s.n_u + 1) / r_u, n_v = (s.n_v + 1) / r_v;
+        // NOTE: s lives on the STACK here — do NOT call free_surf(&s) (it
+        // does free(s) and would hand a stack pointer to the heap, which is
+        // exactly the 0xC0000374 heap corruption this path hit). Free the
+        // three heap-owned parts manually instead.
+        if (n_u <= 0 || n_v <= 0 || r_u - 1 > 7 || r_v - 1 > 7) {
+            if (r_u - 1 > 7 || r_v - 1 > 7)
+                fprintf(stderr, "  [SKIP] surface %d: degree (%d,%d) > 7 not supported\n",
+                        i, r_u - 1, r_v - 1);
+            free_cpgrid(s.Ps, s.n_u, s.n_v);
+            free(s.U); free(s.V);
+            continue;   // cps[i] stays NULL -> caller skips it
+        }
+        int np = n_u * n_v;
+        float* flat = (float*)malloc((size_t)np * r_u * r_v * 4 * sizeof(float));
+        for (int ii = 0; ii < n_u; ii++)
+            for (int jj = 0; jj < n_v; jj++)
+                for (int k = 0; k < r_u; k++)
+                    for (int l = 0; l < r_v; l++)
+                        memcpy(&flat[((size_t)(ii * n_v + jj) * r_u * r_v + k * r_v + l) * 4],
+                               s.Ps[ii * r_u + k][jj * r_v + l], 4 * sizeof(float));
+        free_cpgrid(s.Ps, s.n_u, s.n_v);
+        free(s.U); free(s.V);
+        cps[i] = flat;
+        nu[i] = n_u; nv[i] = n_v; ru[i] = r_u; rv[i] = r_v;
+    }
+    free(buf); free(offs);
+
+    *cpsOut = cps; *nuOut = nu; *nvOut = nv; *ruOut = ru; *rvOut = rv;
+    return (int)nSurf;
+}
+
 // Scene-level adaptive evaluation: one pass-1 (host tess factors, OpenMP-
 // parallel over surfaces) over ALL surfaces, then ONE GPU launch for the
 // whole scene (ETER §4 rebuild path).
