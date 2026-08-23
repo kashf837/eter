@@ -83,78 +83,11 @@ public:
         float* bezierCPs = nullptr;
         float* verts = nurbs_adaptive_eval(path, cam, &nu, &nv, &info, &total, &ru, &rv, &bezierCPs);
         if (!verts) { fprintf(stderr, "  [SKIP] %s\n", path); return m; }
-        m.patchCount = nu * nv;
-        if (bezierCPs) {
-            int cpsPerPatch = ru * rv * 4;  // floats per patch (e.g. 64 for bicubic)
-            int cpFloats = m.patchCount * cpsPerPatch;
-            m.cp.assign(bezierCPs, bezierCPs + cpFloats);
-            free(bezierCPs);
-            // Per-patch metadata for the resolve shader: {cpOffsetInVec4, ru, rv, 0}
-            for (int p = 0; p < m.patchCount; p++)
-                m.meta.insert(m.meta.end(), {(uint32_t)(p * ru * rv), (uint32_t)ru, (uint32_t)rv, 0u});
-            // Center each patch's CPs for FP32 precision in SSBO eval.
-            // Translating all CPs by the same offset cancels in du/dv
-            // (derivative of constant = 0), so normals are unchanged.
-            for (int p = 0; p < m.patchCount; p++) {
-                float* cp = m.cp.data() + p * cpsPerPatch;
-                float cx = 0, cy = 0, cz = 0;
-                for (int k = 0; k < ru * rv; k++) {
-                    cx += cp[k*4+0]; cy += cp[k*4+1]; cz += cp[k*4+2];
-                }
-                cx /= (float)(ru * rv); cy /= (float)(ru * rv); cz /= (float)(ru * rv);
-                for (int k = 0; k < ru * rv; k++) {
-                    cp[k*4+0] -= cx; cp[k*4+1] -= cy; cp[k*4+2] -= cz;
-                }
-            }
-        }
-        for (int pi = 0; pi < nu; pi++)
-            for (int pj = 0; pj < nv; pj++) {
-                PatchInfo* p = &info[pi*nv+pj];
-                float* patch = verts + p->offset * 6;
-                uint32_t base = (uint32_t)m.v.size() / 11;  // stride 11
-                float detail = (float)(p->tu + p->tv) / 128.0f;  // [0,1] tess density
-                float patchID = (float)(pi * nv + pj) + detail * 0.1f;
-                if ((pi + pj) & 1) patchID = -patchID;  // sign bit = checkerboard parity
-                for (int y = 0; y < p->tv; y++)
-                    for (int x = 0; x < p->tu; x++) {
-                        int k = y*p->tu + x;
-                        float px=patch[k*6+0], py=patch[k*6+1], pz=patch[k*6+2];
-                        float nx=patch[k*6+3], ny=patch[k*6+4], nz=patch[k*6+5];
-                        float nl=nx*nx+ny*ny+nz*nz;
-                        if (nl < 1e-6f) {
-                            int xR=(x+1<p->tu)?x+1:x, xL=xR>0?xR-1:0;
-                            int yD=(y+1<p->tv)?y+1:y, yU=yD>0?yD-1:0;
-                            float du[3]={patch[(y*p->tu+xR)*6+0]-patch[(y*p->tu+xL)*6+0],patch[(y*p->tu+xR)*6+1]-patch[(y*p->tu+xL)*6+1],patch[(y*p->tu+xR)*6+2]-patch[(y*p->tu+xL)*6+2]};
-                            float dv[3]={patch[(yD*p->tu+x)*6+0]-patch[(yU*p->tu+x)*6+0],patch[(yD*p->tu+x)*6+1]-patch[(yU*p->tu+x)*6+1],patch[(yD*p->tu+x)*6+2]-patch[(yU*p->tu+x)*6+2]};
-                            nx=du[1]*dv[2]-du[2]*dv[1];ny=du[2]*dv[0]-du[0]*dv[2];nz=du[0]*dv[1]-du[1]*dv[0];
-                            nl=nx*nx+ny*ny+nz*nz;
-                        }
-                        float inv=1.f/(sqrtf(nl)+1e-10f);
-                        float u = p->tu > 1 ? (float)x / (float)(p->tu - 1) : 0.5f;
-                        float v = p->tv > 1 ? (float)y / (float)(p->tv - 1) : 0.5f;
-                        m.v.insert(m.v.end(),{px,py,pz,nx*inv,ny*inv,nz*inv,u,v,patchID,(float)x,(float)y});
-                        if(px<m.bbMin[0])m.bbMin[0]=px;if(py<m.bbMin[1])m.bbMin[1]=py;if(pz<m.bbMin[2])m.bbMin[2]=pz;
-                        if(px>m.bbMax[0])m.bbMax[0]=px;if(py>m.bbMax[1])m.bbMax[1]=py;if(pz>m.bbMax[2])m.bbMax[2]=pz;
-                    }
-                for (int y = 0; y < p->tv-1; y++)
-                    for (int x = 0; x < p->tu-1; x++) {
-                        uint32_t a=base+y*p->tu+x, b=a+1, c=a+p->tu, d=c+1;
-                        m.i.insert(m.i.end(),{a,b,c, d,c,b});
-                    }
-            }
-        free(verts); free(info);
+        // CUDA gives per-patch {tu, tv, offset} — feed them straight to the
+        // shared grid builder (same routine as the uniform wireframe path).
+        addPatchGrid(m, verts, bezierCPs, info, nu, nv, ru, rv);
+        free(verts); free(bezierCPs); free(info);
         LOGI("Adaptive %s: %d verts, %d tris, %d patches\n", path, m.verts(), (int)(m.i.size()/3), m.patchCount);
-        return m;
-    }
-
-    static Mesh single(const char* path, int res = 32) {
-        Mesh m; resetBBox(m);
-        int nu, nv, ru = 0, rv = 0; float* cp = nullptr;
-        float* verts = nurbs_wireframe(path, res, &nu, &nv, &ru, &rv, &cp);
-        if (!verts) { fprintf(stderr, "  [SKIP] %s\n", path); return m; }
-        addPatchGrid(m, verts, cp, nu, nv, res, ru, rv);
-        free(verts); free(cp);
-        LOGI("Loaded %s: %d verts, %d tris\n", path, m.verts(), (int)(m.i.size()/3));
         return m;
     }
 
@@ -176,7 +109,10 @@ public:
             int nu, nv, ru = 0, rv = 0; float* cp = nullptr;
             float* verts = nurbs_wireframe(files[i].c_str(), res, &nu, &nv, &ru, &rv, &cp);
             if (!verts) { skipped++; free(cp); fprintf(stderr, "  [SKIP %d] %s\n", skipped, files[i].c_str()); continue; }
-            addPatchGrid(m, verts, cp, nu, nv, res, ru, rv);
+            // Uniform wireframe: every patch is res×res — synthesize PatchInfo.
+            std::vector<PatchInfo> info(nu * nv);
+            for (int k = 0; k < nu * nv; k++) info[k] = {res, res, k * res * res};
+            addPatchGrid(m, verts, cp, info.data(), nu, nv, ru, rv);
             free(verts); free(cp);
         }
         LOGI("Done: %d verts, %d tris, %d skipped\n", m.verts(), (int)(m.i.size()/3), skipped);
@@ -189,54 +125,63 @@ private:
         m.bbMax[0]=m.bbMax[1]=m.bbMax[2]=-1e30f;
     }
 
-    static void addPatchGrid(Mesh& m, const float* verts, const float* cp, int nu, int nv, int res, int ru, int rv) {
+    // Append one file's patches to m. Both loading paths describe each patch as
+    // {tu, tv, offset} (PatchInfo), so this one routine covers them: adaptive
+    // gets per-patch densities from CUDA, uniform wireframe synthesizes
+    // tu=tv=res with a uniform offset stride.
+    static void addPatchGrid(Mesh& m, const float* verts, const float* cp,
+                             const PatchInfo* info, int nu, int nv, int ru, int rv) {
         // Append CPs (pre-centering) for global indexing.
         // CP stride is degree-dependent (ru*rv vec4s per patch), so the resolve
         // shader gets each patch's offset/order from m.meta, not a fixed stride.
-        int cpBase = m.patchCount;
+        int np = nu * nv;
+        int batchBase = m.patchCount;              // global patch index of this batch
         int cpVec4Base = (int)(m.cp.size() / 4);   // CP offset in vec4 units for this file's patches
         int cpsPerPatch = ru * rv * 4;             // floats per patch (e.g. 64 for bicubic)
         if (cp) {
-            m.cp.insert(m.cp.end(), cp, cp + nu * nv * cpsPerPatch);
-            for (int k = 0; k < nu * nv; k++)
+            m.cp.insert(m.cp.end(), cp, cp + np * cpsPerPatch);
+            for (int k = 0; k < np; k++)
                 m.meta.insert(m.meta.end(), {(uint32_t)(cpVec4Base + k * ru * rv), (uint32_t)ru, (uint32_t)rv, 0u});
         }
-        for (int pi = 0; pi < nu; pi++)
-            for (int pj = 0; pj < nv; pj++) {
-                uint32_t base = (uint32_t)m.v.size() / 11;  // stride 11
-                const float* p = verts + (pi*nv+pj)*res*res*6;
-                float patchID = (float)(m.patchCount++) + 0.05f;  // uniform tess detail=0.5
-                if ((pi + pj) & 1) patchID = -patchID;  // sign bit = checkerboard parity
-                for (int y = 0; y < res; y++)
-                    for (int x = 0; x < res; x++) {
-                        int idx = y*res+x;
-                        float px=p[idx*6+0], py=p[idx*6+1], pz=p[idx*6+2];
-                        float gnx=p[idx*6+3], gny=p[idx*6+4], gnz=p[idx*6+5];
-                        float gnLen = gnx*gnx+gny*gny+gnz*gnz;
-                        if(gnLen < 1e-6f) {
-                            int xR=(x+1<res)?x+1:x,xL=xR>0?xR-1:0, yD=(y+1<res)?y+1:y,yU=yD>0?yD-1:0;
-                            float du[3]={p[(y*res+xR)*6+0]-p[(y*res+xL)*6+0],p[(y*res+xR)*6+1]-p[(y*res+xL)*6+1],p[(y*res+xR)*6+2]-p[(y*res+xL)*6+2]};
-                            float dv[3]={p[(yD*res+x)*6+0]-p[(yU*res+x)*6+0],p[(yD*res+x)*6+1]-p[(yU*res+x)*6+1],p[(yD*res+x)*6+2]-p[(yU*res+x)*6+2]};
-                            gnx=du[1]*dv[2]-du[2]*dv[1]; gny=du[2]*dv[0]-du[0]*dv[2]; gnz=du[0]*dv[1]-du[1]*dv[0];
-                            gnLen = gnx*gnx+gny*gny+gnz*gnz;
-                        }
-                        float inv=1.f/(sqrtf(gnLen)+1e-10f);
-                        float u = res > 1 ? (float)x / (float)(res - 1) : 0.5f;
-                        float v = res > 1 ? (float)y / (float)(res - 1) : 0.5f;
-                        m.v.insert(m.v.end(),{px,py,pz, gnx*inv,gny*inv,gnz*inv, u,v, patchID, (float)x,(float)y});
-                        if(px<m.bbMin[0])m.bbMin[0]=px; if(py<m.bbMin[1])m.bbMin[1]=py; if(pz<m.bbMin[2])m.bbMin[2]=pz;
-                        if(px>m.bbMax[0])m.bbMax[0]=px; if(py>m.bbMax[1])m.bbMax[1]=py; if(pz>m.bbMax[2])m.bbMax[2]=pz;
+        m.patchCount += np;
+        for (int k = 0; k < np; k++) {
+            int pi = k / nv, pj = k % nv;
+            const PatchInfo* p = &info[k];
+            uint32_t base = (uint32_t)m.v.size() / 11;  // stride 11
+            const float* patch = verts + p->offset * 6;
+            float detail = (float)(p->tu + p->tv) / 128.0f;  // [0,1] tess density
+            float patchID = (float)(batchBase + k) + detail * 0.1f;
+            if ((pi + pj) & 1) patchID = -patchID;  // sign bit = checkerboard parity
+            for (int y = 0; y < p->tv; y++)
+                for (int x = 0; x < p->tu; x++) {
+                    int idx = y*p->tu + x;
+                    float px=patch[idx*6+0], py=patch[idx*6+1], pz=patch[idx*6+2];
+                    float gnx=patch[idx*6+3], gny=patch[idx*6+4], gnz=patch[idx*6+5];
+                    float gnLen = gnx*gnx+gny*gny+gnz*gnz;
+                    if(gnLen < 1e-6f) {
+                        int xR=(x+1<p->tu)?x+1:x,xL=xR>0?xR-1:0, yD=(y+1<p->tv)?y+1:y,yU=yD>0?yD-1:0;
+                        float du[3]={patch[(y*p->tu+xR)*6+0]-patch[(y*p->tu+xL)*6+0],patch[(y*p->tu+xR)*6+1]-patch[(y*p->tu+xL)*6+1],patch[(y*p->tu+xR)*6+2]-patch[(y*p->tu+xL)*6+2]};
+                        float dv[3]={patch[(yD*p->tu+x)*6+0]-patch[(yU*p->tu+x)*6+0],patch[(yD*p->tu+x)*6+1]-patch[(yU*p->tu+x)*6+1],patch[(yD*p->tu+x)*6+2]-patch[(yU*p->tu+x)*6+2]};
+                        gnx=du[1]*dv[2]-du[2]*dv[1]; gny=du[2]*dv[0]-du[0]*dv[2]; gnz=du[0]*dv[1]-du[1]*dv[0];
+                        gnLen = gnx*gnx+gny*gny+gnz*gnz;
                     }
-                for (int y = 0; y < res-1; y++)
-                    for (int x = 0; x < res-1; x++) {
-                        uint32_t a=base+y*res+x, b=a+1, c=a+res, d=c+1;
-                        m.i.insert(m.i.end(),{a,b,c, d,c,b});
-                    }
-            }
+                    float inv=1.f/(sqrtf(gnLen)+1e-10f);
+                    float u = p->tu > 1 ? (float)x / (float)(p->tu - 1) : 0.5f;
+                    float v = p->tv > 1 ? (float)y / (float)(p->tv - 1) : 0.5f;
+                    m.v.insert(m.v.end(),{px,py,pz, gnx*inv,gny*inv,gnz*inv, u,v, patchID, (float)x,(float)y});
+                    if(px<m.bbMin[0])m.bbMin[0]=px; if(py<m.bbMin[1])m.bbMin[1]=py; if(pz<m.bbMin[2])m.bbMin[2]=pz;
+                    if(px>m.bbMax[0])m.bbMax[0]=px; if(py>m.bbMax[1])m.bbMax[1]=py; if(pz>m.bbMax[2])m.bbMax[2]=pz;
+                }
+            for (int y = 0; y < p->tv-1; y++)
+                for (int x = 0; x < p->tu-1; x++) {
+                    uint32_t a=base+y*p->tu+x, b=a+1, c=a+p->tu, d=c+1;
+                    m.i.insert(m.i.end(),{a,b,c, d,c,b});
+                }
+        }
         // Center CPs per patch for FP32 precision in SSBO eval
         if (cp) {
-            for (int p = cpBase; p < m.patchCount; p++) {
-                float* cpp = m.cp.data() + (cpVec4Base + (p - cpBase) * ru * rv) * 4;
+            for (int p = batchBase; p < m.patchCount; p++) {
+                float* cpp = m.cp.data() + (cpVec4Base + (p - batchBase) * ru * rv) * 4;
                 float cx = 0, cy = 0, cz = 0;
                 for (int k = 0; k < ru * rv; k++) {
                     cx += cpp[k*4+0]; cy += cpp[k*4+1]; cz += cpp[k*4+2];
