@@ -232,7 +232,13 @@ private:
         appendCps(m, bezierCPs, nu, nv, ru, rv);
         m.v.resize((size_t)total * 11);
         fillVerts(m, verts, info, nu, nv, 0);   // serial path: bbox merged inline
-        fillIndices(m, info, nu, nv);
+        {
+            size_t quads = 0;
+            for (int k = 0; k < nu * nv; k++) quads += (size_t)(info[k].tu - 1) * (info[k].tv - 1);
+            size_t quadBase = m.i.size() / 6;
+            m.i.resize((quadBase + quads) * 6);
+            fillIndices(m.i.data(), info, nu, nv, quadBase);
+        }
         free(verts); free(bezierCPs); free(info);
         return true;
     }
@@ -262,7 +268,7 @@ private:
         m.meta.reserve(((size_t)m.patchCount + (size_t)n) * 4);  // 4 uint32 per patch
     }
 
-    // ---- Scene fill (ETER §4 rebuild): CPs serial, vertex slices parallel ----
+    // ---- Scene fill (ETER §4 rebuild): CPs serial, vertex+index slices parallel ----
 
     // Append one surface's CPs (pre-centering) + per-patch meta, then center
     // the CPs in place for FP32 precision in the SSBO eval. Serial, in scene
@@ -338,26 +344,33 @@ private:
         }
     }
 
-    // Index fill for one surface (indices reference scene-global vertex
-    // positions; m.i was reserved by reserveMesh, so inserts never realloc).
-    static void fillIndices(Mesh& m, const ScenePatchMeta* info, int nu, int nv) {
+    // Index fill for one surface, written directly into a pre-sized slice of
+    // m.i (quadBase = this surface's first quad, 6 indices per quad). Slices
+    // are disjoint so surfaces run in parallel; direct writes replace 2.8M
+    // insert() calls whose per-call overhead dominated the old serial fill.
+    static void fillIndices(uint32_t* idst, const ScenePatchMeta* info, int nu, int nv,
+                            size_t quadBase) {
         int np = nu * nv;
+        size_t quad = quadBase;
         for (int k = 0; k < np; k++) {
             const ScenePatchMeta* p = &info[k];
             uint32_t base = (uint32_t)p->offset;
             for (int y = 0; y < p->tv-1; y++)
                 for (int x = 0; x < p->tu-1; x++) {
                     uint32_t a=base+y*p->tu+x, b=a+1, c=a+p->tu, d=c+1;
-                    m.i.insert(m.i.end(),{a,b,c, d,c,b});
+                    idst[quad*6+0]=a; idst[quad*6+1]=b; idst[quad*6+2]=c;
+                    idst[quad*6+3]=d; idst[quad*6+4]=c; idst[quad*6+5]=b;
+                    quad++;
                 }
         }
     }
 
     // Whole-scene mesh fill: reserve once, append CPs serially in scene order
-    // (SSBO layout invariant), fill all vertex slices in ONE OpenMP region
-    // (slices are disjoint — no locks needed), then indices + bbox merge
-    // serially. Output layout is identical to the old per-surface loop:
-    // per-patch slices land at global offset*11 regardless of thread order.
+    // (SSBO layout invariant), then fill all vertex AND index slices in ONE
+    // OpenMP region (both slice families are disjoint — no locks needed),
+    // then the cheap bbox merge serially. Output layout is identical to the
+    // old per-surface loop: per-patch slices land at global offset*11 and the
+    // index stream stays quad-major in scene order regardless of thread order.
     static void fillScene(Mesh& m, const float* verts, const ScenePatchMeta* meta,
                           const std::vector<SceneSurf>& surfs, int total) {
         int nSurfs = (int)surfs.size();
@@ -369,24 +382,33 @@ private:
         reserveMesh(m, meta, npTotal, total, cpF);
         m.v.resize((size_t)total * 11);   // one resize: m.v is write-only from here on
 
-        std::vector<int> pb((size_t)nSurfs + 1);   // per-surface global patch base
-        for (int s = 0; s < nSurfs; s++) pb[s+1] = pb[s] + surfs[s].nu * surfs[s].nv;
-        std::vector<float> bbT((size_t)nSurfs * 6);
+        std::vector<int> pb((size_t)nSurfs + 1);     // per-surface global patch base
+        std::vector<size_t> qb((size_t)nSurfs + 1);  // per-surface quad base (m.i units)
+        for (int s = 0; s < nSurfs; s++) {
+            int np = surfs[s].nu * surfs[s].nv;
+            pb[s+1] = pb[s] + np;
+            size_t q = 0;
+            for (int k = 0; k < np; k++)
+                q += (size_t)(meta[pb[s]+k].tu - 1) * (meta[pb[s]+k].tv - 1);
+            qb[s+1] = qb[s] + q;
+        }
+        std::vector<float> bbT((size_t)nSurfs * 16);  // 16-float stride: one cache line per surface
 
+        m.i.resize(qb[nSurfs] * 6);   // already reserved by reserveMesh: zero-fill only
         for (int s = 0; s < nSurfs; s++)   // serial: CP/meta order = scene order
             appendCps(m, surfs[s].cps, surfs[s].nu, surfs[s].nv, surfs[s].ru, surfs[s].rv);
 
         #pragma omp parallel for schedule(dynamic)
-        for (int s = 0; s < nSurfs; s++)   // parallel: disjoint vertex slices
-            fillVerts(m, verts, meta + pb[s], surfs[s].nu, surfs[s].nv, pb[s], bbT.data() + (size_t)s * 6);
-
-        for (int s = 0; s < nSurfs; s++) { // serial: indices + bbox merge
-            fillIndices(m, meta + pb[s], surfs[s].nu, surfs[s].nv);
-            for (int d = 0; d < 3; d++) {
-                if (bbT[(size_t)s*6+d] < m.bbMin[d]) m.bbMin[d] = bbT[(size_t)s*6+d];
-                if (bbT[(size_t)s*6+3+d] > m.bbMax[d]) m.bbMax[d] = bbT[(size_t)s*6+3+d];
-            }
+        for (int s = 0; s < nSurfs; s++) { // parallel: disjoint vertex + index slices
+            fillVerts(m, verts, meta + pb[s], surfs[s].nu, surfs[s].nv, pb[s], bbT.data() + (size_t)s * 16);
+            fillIndices(m.i.data(), meta + pb[s], surfs[s].nu, surfs[s].nv, qb[s]);
         }
+
+        for (int s = 0; s < nSurfs; s++)   // serial: bbox merge
+            for (int d = 0; d < 3; d++) {
+                if (bbT[(size_t)s*16+d] < m.bbMin[d]) m.bbMin[d] = bbT[(size_t)s*16+d];
+                if (bbT[(size_t)s*16+3+d] > m.bbMax[d]) m.bbMax[d] = bbT[(size_t)s*16+3+d];
+            }
     }
 
 };
