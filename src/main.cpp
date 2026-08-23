@@ -127,13 +127,10 @@ public:
         float* verts = nurbs_adaptive_eval_scene(surfs.data(), (int)surfs.size(),
                                                  cam, &meta, &total);
         if (!verts) { fprintf(stderr, "  [SKIP] cached scene eval failed\n"); return m; }
-        int npTotal = 0;
-        for (const BezierSurface& s : cache.surfaces) npTotal += s.nu * s.nv;
-        reserveMesh(m, meta, npTotal, total, cache.cpsFloats());
+        fillScene(m, verts, meta, surfs, total);
         int base = 0;
         for (const BezierSurface& s : cache.surfaces) {
             accumTessRange(meta + base, s.nu * s.nv, &tuMin, &tuMax, &tvMin, &tvMax);
-            addPatchGrid(m, verts, s.cps.data(), meta + base, s.nu, s.nv, s.ru, s.rv);
             base += s.nu * s.nv;
         }
         free(verts); free(meta);
@@ -187,18 +184,13 @@ public:
                      : nurbs_adaptive_eval_scene(surfs.data(), (int)surfs.size(),
                                                  cam, &meta, &total);
 
-        // Phase 3: append all surfaces in scene order.
+        // Phase 3: append all surfaces in scene order (CPs serial, vertex
+        // slices in one parallel region — see fillScene).
         if (verts) {
-            int npTotal = 0; size_t cpF = 0;
-            for (const SceneSurf& sf : surfs) {
-                npTotal += sf.nu * sf.nv;
-                cpF += (size_t)sf.nu * sf.nv * sf.ru * sf.rv * 4;
-            }
-            reserveMesh(m, meta, npTotal, total, cpF);
+            fillScene(m, verts, meta, surfs, total);
             int base = 0;
             for (const SceneSurf& sf : surfs) {
                 accumTessRange(meta + base, sf.nu * sf.nv, &tuMin, &tuMax, &tvMin, &tvMax);
-                addPatchGrid(m, verts, sf.cps, meta + base, sf.nu, sf.nv, sf.ru, sf.rv);
                 base += sf.nu * sf.nv;
             }
             free(verts); free(meta);
@@ -237,7 +229,10 @@ private:
         if (tuMin && tuMax && tvMin && tvMax)
             accumTessRange(info, nu * nv, tuMin, tuMax, tvMin, tvMax);
         reserveMesh(m, info, nu * nv, total, (size_t)nu * nv * ru * rv * 4);
-        addPatchGrid(m, verts, bezierCPs, info, nu, nv, ru, rv);
+        appendCps(m, bezierCPs, nu, nv, ru, rv);
+        m.v.resize((size_t)total * 11);
+        fillVerts(m, verts, info, nu, nv, 0);   // serial path: bbox merged inline
+        fillIndices(m, info, nu, nv);
         free(verts); free(bezierCPs); free(info);
         return true;
     }
@@ -256,7 +251,7 @@ private:
     // Reserve m's vectors to their final sizes ONCE per rebuild, so the
     // per-batch inserts/resizes below never reallocate. Vector doubling used
     // to copy ~450 MB (vertex + index data) on every rebuild — that was most
-    // of addPatchGrid's ~200 ms.
+    // of the old per-surface fill's ~200 ms.
     static void reserveMesh(Mesh& m, const ScenePatchMeta* info, int n,
                             int totalVerts, size_t cpFloats) {
         size_t quads = 0;
@@ -267,46 +262,46 @@ private:
         m.meta.reserve(((size_t)m.patchCount + (size_t)n) * 4);  // 4 uint32 per patch
     }
 
-    // Append one file's patches to m. Every patch is described as
-    // {tu, tv, offset} (ScenePatchMeta, offset is scene-global) coming straight
-    // from the adaptive CUDA eval.
-    static void addPatchGrid(Mesh& m, const float* verts, const float* cp,
-                             const ScenePatchMeta* info, int nu, int nv, int ru, int rv) {
-        // Append CPs (pre-centering) for global indexing.
-        // CP stride is degree-dependent (ru*rv vec4s per patch), so the resolve
-        // shader gets each patch's offset/order from m.meta, not a fixed stride.
+    // ---- Scene fill (ETER §4 rebuild): CPs serial, vertex slices parallel ----
+
+    // Append one surface's CPs (pre-centering) + per-patch meta, then center
+    // the CPs in place for FP32 precision in the SSBO eval. Serial, in scene
+    // order — the cp/meta layout must stay surface-major so the SSBO offsets
+    // keep matching the resolve shader across rebuilds.
+    static void appendCps(Mesh& m, const float* cp, int nu, int nv, int ru, int rv) {
         int np = nu * nv;
-        if (np <= 0) return;
+        if (np <= 0 || !cp) return;
         int batchBase = m.patchCount;              // global patch index of this batch
         int cpVec4Base = (int)(m.cp.size() / 4);   // CP offset in vec4 units for this file's patches
         int cpsPerPatch = ru * rv * 4;             // floats per patch (e.g. 64 for bicubic)
-        if (cp) {
-            m.cp.insert(m.cp.end(), cp, cp + np * cpsPerPatch);
-            for (int k = 0; k < np; k++)
-                m.meta.insert(m.meta.end(), {(uint32_t)(cpVec4Base + k * ru * rv), (uint32_t)ru, (uint32_t)rv, 0u});
-        }
+        m.cp.insert(m.cp.end(), cp, cp + np * cpsPerPatch);
+        for (int k = 0; k < np; k++)
+            m.meta.insert(m.meta.end(), {(uint32_t)(cpVec4Base + k * ru * rv), (uint32_t)ru, (uint32_t)rv, 0u});
         m.patchCount += np;
+        for (int p = batchBase; p < m.patchCount; p++) {   // center CPs per patch
+            float* cpp = m.cp.data() + (cpVec4Base + (p - batchBase) * ru * rv) * 4;
+            float cx = 0, cy = 0, cz = 0;
+            for (int k = 0; k < ru * rv; k++) { cx += cpp[k*4+0]; cy += cpp[k*4+1]; cz += cpp[k*4+2]; }
+            cx /= (float)(ru * rv); cy /= (float)(ru * rv); cz /= (float)(ru * rv);
+            for (int k = 0; k < ru * rv; k++) { cpp[k*4+0] -= cx; cpp[k*4+1] -= cy; cpp[k*4+2] -= cz; }
+        }
+    }
 
-        // Vertex fill: pre-size m.v for this batch (the caller reserved the
-        // scene total, so resize() never reallocates) and write each patch's
-        // slice directly. The old per-vertex m.v.insert() paid a size check +
-        // occasional reallocation copy per push — ~200 ms/rebuild for 3.7M
-        // vertices. Offsets are scene-global, so patch slices are disjoint and
-        // the write order reproduces the old insert order exactly.
-        int batchVerts = info[np-1].offset + info[np-1].tu * info[np-1].tv - info[0].offset;
-        size_t vBase = m.v.size();                 // batch vertex base, in floats (stride 11)
-        m.v.resize(vBase + (size_t)batchVerts * 11);
-        float* vData = m.v.data();                 // stable: no realloc past reserved size
+    // Fill ONE surface's vertex slices into the pre-sized m.v. p->offset is
+    // scene-GLOBAL: the patch's vertex block lives at float index offset*11,
+    // so slices are disjoint and surfaces can run in parallel with no locks.
+    // Per-surface bbox goes to bbOut[0..2]=min/[3..5]=max when given; when
+    // bbOut is null (serial single-surface path) it merges into m.bb directly.
+    static void fillVerts(Mesh& m, const float* verts, const ScenePatchMeta* info,
+                          int nu, int nv, int batchBase, float* bbOut = nullptr) {
+        int np = nu * nv;
+        float* vData = m.v.data();   // stable: reserved + fully resized before any parallel fill
+        float bmin[3] = {1e30f,1e30f,1e30f}, bmax[3] = {-1e30f,-1e30f,-1e30f};
         for (int k = 0; k < np; k++) {
             int pi = k / nv, pj = k % nv;
             const ScenePatchMeta* p = &info[k];
             const float* patch = verts + p->offset * 6;
-            // p->offset is scene-GLOBAL: the patch's vertex block lives at
-            // global vertex index p->offset, i.e. float index p->offset*11.
-            // vBase (this batch's float base) is only for the resize above —
-            // it is already included in p->offset, adding it again would
-            // double-count every previous batch.
-            float* dst = vData + (size_t)p->offset * 11;
+            float* dst = vData + (size_t)p->offset * 11;   // stride 11
             float detail = (float)(p->tu + p->tv) / 128.0f;  // [0,1] tess density
             float patchID = (float)(batchBase + k) + detail * 0.1f;
             if ((pi + pj) & 1) patchID = -patchID;  // sign bit = checkerboard parity
@@ -330,14 +325,23 @@ private:
                     d[0]=px; d[1]=py; d[2]=pz;
                     d[3]=gnx*inv; d[4]=gny*inv; d[5]=gnz*inv;
                     d[6]=u; d[7]=v; d[8]=patchID; d[9]=(float)x; d[10]=(float)y;
-                    if(px<m.bbMin[0])m.bbMin[0]=px; if(py<m.bbMin[1])m.bbMin[1]=py; if(pz<m.bbMin[2])m.bbMin[2]=pz;
-                    if(px>m.bbMax[0])m.bbMax[0]=px; if(py>m.bbMax[1])m.bbMax[1]=py; if(pz>m.bbMax[2])m.bbMax[2]=pz;
+                    if(px<bmin[0])bmin[0]=px; if(py<bmin[1])bmin[1]=py; if(pz<bmin[2])bmin[2]=pz;
+                    if(px>bmax[0])bmax[0]=px; if(py>bmax[1])bmax[1]=py; if(pz>bmax[2])bmax[2]=pz;
                 }
         }
+        if (bbOut) {
+            bbOut[0]=bmin[0]; bbOut[1]=bmin[1]; bbOut[2]=bmin[2];
+            bbOut[3]=bmax[0]; bbOut[4]=bmax[1]; bbOut[5]=bmax[2];
+        } else {
+            if(bmin[0]<m.bbMin[0])m.bbMin[0]=bmin[0]; if(bmin[1]<m.bbMin[1])m.bbMin[1]=bmin[1]; if(bmin[2]<m.bbMin[2])m.bbMin[2]=bmin[2];
+            if(bmax[0]>m.bbMax[0])m.bbMax[0]=bmax[0]; if(bmax[1]>m.bbMax[1])m.bbMax[1]=bmax[1]; if(bmax[2]>m.bbMax[2])m.bbMax[2]=bmax[2];
+        }
+    }
 
-        // Index fill (indices reference the scene-global vertex positions —
-        // the old code's base was m.v.size()/11 at patch time, which equals
-        // p->offset since vertices are appended in patch order).
+    // Index fill for one surface (indices reference scene-global vertex
+    // positions; m.i was reserved by reserveMesh, so inserts never realloc).
+    static void fillIndices(Mesh& m, const ScenePatchMeta* info, int nu, int nv) {
+        int np = nu * nv;
         for (int k = 0; k < np; k++) {
             const ScenePatchMeta* p = &info[k];
             uint32_t base = (uint32_t)p->offset;
@@ -347,18 +351,40 @@ private:
                     m.i.insert(m.i.end(),{a,b,c, d,c,b});
                 }
         }
-        // Center CPs per patch for FP32 precision in SSBO eval
-        if (cp) {
-            for (int p = batchBase; p < m.patchCount; p++) {
-                float* cpp = m.cp.data() + (cpVec4Base + (p - batchBase) * ru * rv) * 4;
-                float cx = 0, cy = 0, cz = 0;
-                for (int k = 0; k < ru * rv; k++) {
-                    cx += cpp[k*4+0]; cy += cpp[k*4+1]; cz += cpp[k*4+2];
-                }
-                cx /= (float)(ru * rv); cy /= (float)(ru * rv); cz /= (float)(ru * rv);
-                for (int k = 0; k < ru * rv; k++) {
-                    cpp[k*4+0] -= cx; cpp[k*4+1] -= cy; cpp[k*4+2] -= cz;
-                }
+    }
+
+    // Whole-scene mesh fill: reserve once, append CPs serially in scene order
+    // (SSBO layout invariant), fill all vertex slices in ONE OpenMP region
+    // (slices are disjoint — no locks needed), then indices + bbox merge
+    // serially. Output layout is identical to the old per-surface loop:
+    // per-patch slices land at global offset*11 regardless of thread order.
+    static void fillScene(Mesh& m, const float* verts, const ScenePatchMeta* meta,
+                          const std::vector<SceneSurf>& surfs, int total) {
+        int nSurfs = (int)surfs.size();
+        int npTotal = 0; size_t cpF = 0;
+        for (const SceneSurf& sf : surfs) {
+            npTotal += sf.nu * sf.nv;
+            cpF += (size_t)sf.nu * sf.nv * sf.ru * sf.rv * 4;
+        }
+        reserveMesh(m, meta, npTotal, total, cpF);
+        m.v.resize((size_t)total * 11);   // one resize: m.v is write-only from here on
+
+        std::vector<int> pb((size_t)nSurfs + 1);   // per-surface global patch base
+        for (int s = 0; s < nSurfs; s++) pb[s+1] = pb[s] + surfs[s].nu * surfs[s].nv;
+        std::vector<float> bbT((size_t)nSurfs * 6);
+
+        for (int s = 0; s < nSurfs; s++)   // serial: CP/meta order = scene order
+            appendCps(m, surfs[s].cps, surfs[s].nu, surfs[s].nv, surfs[s].ru, surfs[s].rv);
+
+        #pragma omp parallel for schedule(dynamic)
+        for (int s = 0; s < nSurfs; s++)   // parallel: disjoint vertex slices
+            fillVerts(m, verts, meta + pb[s], surfs[s].nu, surfs[s].nv, pb[s], bbT.data() + (size_t)s * 6);
+
+        for (int s = 0; s < nSurfs; s++) { // serial: indices + bbox merge
+            fillIndices(m, meta + pb[s], surfs[s].nu, surfs[s].nv);
+            for (int d = 0; d < 3; d++) {
+                if (bbT[(size_t)s*6+d] < m.bbMin[d]) m.bbMin[d] = bbT[(size_t)s*6+d];
+                if (bbT[(size_t)s*6+3+d] > m.bbMax[d]) m.bbMax[d] = bbT[(size_t)s*6+3+d];
             }
         }
     }
