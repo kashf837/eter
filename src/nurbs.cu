@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "nurbs.h"
+#include "knot_insert.h"
 #include "bezier_eval.h"
 
 // ============================================================
@@ -74,7 +75,7 @@ static void free_surf(NurbsSurf* s) {
 }
 
 // ============================================================
-// NURBS → triangle mesh
+// NURBS → Bézier decomposition
 // ============================================================
 
 static void nurbs_to_beziers(NurbsSurf* s) {
@@ -88,59 +89,6 @@ static void nurbs_to_beziers(NurbsSurf* s) {
         while (mult_of(s->V, s->m_v, v) < s->p_v + 1)
             knot_insert_surf(s, 1, v);
     }
-}
-
-float* nurbs_wireframe(const char* surf_path, int res,
-                       int* np_u_out, int* np_v_out,
-                       int* ru_out, int* rv_out,
-                       float** cp_out)
-{
-    NurbsSurf* s = read_surf(surf_path);
-    if (!s) return NULL;
-
-    nurbs_to_beziers(s);
-
-    int ru = s->p_u + 1, rv = s->p_v + 1;
-    int np_u = (s->n_u + 1) / ru, np_v = (s->n_v + 1) / rv;
-    *np_u_out = np_u; *np_v_out = np_v;
-    *ru_out = ru; *rv_out = rv;
-    int np = np_u * np_v;
-    int cpsPerPatch = ru * rv * 4;  // e.g. 64 for bicubic
-
-    float* verts = (float*)malloc(np * res * res * 6 * sizeof(float));
-    BezierPatch bp = {s->p_u, s->p_v, (float*)malloc(cpsPerPatch * sizeof(float))};
-
-    // Allocate CP output if requested (ETER §6.2 SSBO)
-    if (cp_out) {
-        *cp_out = (float*)malloc(np * cpsPerPatch * sizeof(float));
-    }
-
-    for (int pi = 0; pi < np_u; pi++) {
-        for (int pj = 0; pj < np_v; pj++) {
-            for (int i = 0; i < ru; i++)
-                for (int j = 0; j < rv; j++)
-                    memcpy(&bp.CP[(i * rv + j) * 4],
-                           s->Ps[pi * ru + i][pj * rv + j], 4 * sizeof(float));
-
-            // Copy CPs if requested
-            if (cp_out) {
-                memcpy(*cp_out + (pi * np_v + pj) * cpsPerPatch,
-                       bp.CP, cpsPerPatch * sizeof(float));
-            }
-
-            float* pv = (float*)malloc(res * res * 6 * sizeof(float));
-            eval_bezier_patch(&bp, pv, res, res);
-
-            float* dst = verts + (pi * np_v + pj) * res * res * 6;
-            for (int y = 0; y < res; y++)
-                for (int x = 0; x < res; x++)
-                    memcpy(&dst[(y * res + x) * 6], &pv[(x * res + y) * 6], 6 * sizeof(float));
-            free(pv);
-        }
-    }
-    free(bp.CP);
-    free_surf(s);
-    return verts;
 }
 
 // ============================================================
@@ -181,37 +129,20 @@ static float* adaptive_eval_core(const float* cps, int nu, int nv, int ru, int r
         }
     }
 
-    // Second pass: evaluate each patch at its own resolution
+    // Second pass: batch-evaluate every patch at its own resolution in ONE
+    // GPU round trip (one launch for the whole surface). The old per-patch
+    // eval_bezier_patch made 13 CUDA API calls per patch (~680µs each on
+    // WDDM = 39s for 57k patches); this is one cudaMalloc group + one H2D +
+    // one launch + one D2H per surface. The kernel writes v-major directly
+    // (index = offset + v*tu + u), so the old per-patch transpose loop is
+    // gone too.
     float* verts = (float*)malloc(offset * 6 * sizeof(float));
-
-    for (int i = 0; i < nu; i++) {
-        for (int j = 0; j < nv; j++) {
-            for (int ii = 0; ii < ru; ii++)
-                for (int jj = 0; jj < rv; jj++)
-                    memcpy(&bp.CP[(ii*rv+jj)*4],
-                           cps + ((i*nv+j)*ru*rv + ii*rv+jj)*4, 4*sizeof(float));
-
-            int idx = i*nv+j;
-            int tu = info[idx].tu, tv = info[idx].tv;
-            float* pv = (float*)malloc(tu * tv * 6 * sizeof(float));
-            eval_bezier_patch(&bp, pv, tu, tv);
-
-            float* dst = verts + info[idx].offset * 6;
-            for (int y = 0; y < tv; y++)
-                for (int x = 0; x < tu; x++)
-                    memcpy(&dst[(y*tu+x)*6], &pv[(x*tv+y)*6], 6*sizeof(float));
-            free(pv);
-        }
-    }
+    eval_bezier_patches_batched(cps, info, np, ru, rv, verts, offset);
 
     free(bp.CP);
     *info_out = info;
     *total_verts = offset;
 
-    int tu_min=999,tu_max=0,tv_min=999,tv_max=0;
-    for(int k=0;k<np;k++){if(info[k].tu<tu_min)tu_min=info[k].tu;if(info[k].tu>tu_max)tu_max=info[k].tu;if(info[k].tv<tv_min)tv_min=info[k].tv;if(info[k].tv>tv_max)tv_max=info[k].tv;}
-    printf("  [ADAPT] %dx%d patches, tu=[%d,%d] tv=[%d,%d] total=%d verts\n",
-           nu, nv, tu_min, tu_max, tv_min, tv_max, offset);
     return verts;
 }
 
