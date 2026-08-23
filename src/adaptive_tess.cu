@@ -1,7 +1,7 @@
 #include "adaptive_tess.h"
 #include <math.h>
 
-float compute_epsilon(BezierPatch* bp, const CameraParams* cam) {
+float compute_epsilon(const BezierPatch* bp, const CameraParams* cam) {
     float B = 1.0f / tanf((cam->fovY * 3.14159265f / 180.0f) * 0.5f);
     float A = B * (float)cam->scrW / (float)cam->scrH;
     float tau_x = 1.0f / (float)cam->scrW;
@@ -41,7 +41,7 @@ float compute_epsilon(BezierPatch* bp, const CameraParams* cam) {
 
 // ========== §4.1: Zheng & Sederberg (2000) ε → tu, tv ==========
 
-void compute_tess_factors(BezierPatch* bp, float eps, int* tu, int* tv) {
+void compute_tess_factors(const BezierPatch* bp, float eps, int* tu, int* tv) {
     int m = bp->p_u + 1,  n = bp->p_v + 1;
     int cols = n;
 

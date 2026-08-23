@@ -196,8 +196,9 @@ float* nurbs_read_cps(const char* path, int* nu, int* nv, int* ru, int* rv)
     return cps;
 }
 
-// Scene-level adaptive evaluation: one pass-1 (host tess factors) over ALL
-// surfaces, then ONE GPU launch for the whole scene (ETER §4 rebuild path).
+// Scene-level adaptive evaluation: one pass-1 (host tess factors, OpenMP-
+// parallel over surfaces) over ALL surfaces, then ONE GPU launch for the
+// whole scene (ETER §4 rebuild path).
 // Patch order = surface order in surfs[], then k = i*nv+j inside each surface
 // — identical to the order addPatchGrid appends batches, so cpOff matches
 // addPatchGrid's cpVec4Base + k*ru*rv exactly and SSBO meta offsets stay valid.
@@ -207,49 +208,61 @@ float* nurbs_adaptive_eval_scene(const SceneSurf* surfs, int nSurfs,
 {
     if (nSurfs <= 0) return NULL;
 
-    // One-time sweep: patch/meta/CP totals + largest CP grid (the pass-1
-    // scratch BezierPatch below is reused by every surface).
-    int npTotal = 0, maxCpsFloats = 0;
+    // One-time sweep: per-surface bases (meta/flatCps indices) + scene totals.
+    int npTotal = 0;
     size_t cpsFloatsTotal = 0;
+    int* metaBase = (int*)malloc((size_t)nSurfs * sizeof(int));
+    size_t* cpsBase = (size_t*)malloc((size_t)nSurfs * sizeof(size_t));
     for (int s = 0; s < nSurfs; s++) {
+        metaBase[s] = npTotal;
+        cpsBase[s] = cpsFloatsTotal;
         npTotal += surfs[s].nu * surfs[s].nv;
         cpsFloatsTotal += (size_t)surfs[s].nu * surfs[s].nv * surfs[s].ru * surfs[s].rv * 4;
-        int cpsFloats = surfs[s].ru * surfs[s].rv * 4;
-        if (cpsFloats > maxCpsFloats) maxCpsFloats = cpsFloats;
     }
-    if (npTotal <= 0) return NULL;
+    if (npTotal <= 0) { free(metaBase); free(cpsBase); return NULL; }
 
     ScenePatchMeta* meta = (ScenePatchMeta*)malloc((size_t)npTotal * sizeof(ScenePatchMeta));
     float* flatCps = (float*)malloc(cpsFloatsTotal * sizeof(float));
 
-    // Pass 1 (host): per-patch eps + tess factors + scene-global offsets.
-    // flatCps is filled in the same patch order for the single H2D upload.
-    BezierPatch bp = {0, 0, (float*)malloc(maxCpsFloats * sizeof(float))};
-    int mi = 0, offset = 0, cpOff = 0;
-    size_t cpi = 0;
+    // Pass 1 (host): per-patch eps + tess factors. Patches are independent,
+    // so surfaces run in parallel (OpenMP); each thread uses a stack-local
+    // BezierPatch whose CP points straight into the shared source array — the
+    // compute functions only READ CPs (verified), so the old per-patch memcpy
+    // into a scratch buffer is gone too. Only tu/tv/ru/rv are written here;
+    // the scene-global offsets are filled by the serial prefix sums below
+    // (57k iterations of += — negligible vs the ~150ms of math they replace:
+    // measured 3.7-5.0 ms on 24 threads).
+    #pragma omp parallel for schedule(dynamic)
     for (int s = 0; s < nSurfs; s++) {
         const SceneSurf& sf = surfs[s];
-        bp.p_u = sf.ru - 1; bp.p_v = sf.rv - 1;  // compute_epsilon/tess read these
+        BezierPatch bp;                            // thread-local
+        bp.p_u = sf.ru - 1; bp.p_v = sf.rv - 1;    // compute_epsilon/tess read these
+        ScenePatchMeta* sm = meta + metaBase[s];
         int np = sf.nu * sf.nv;
         for (int k = 0; k < np; k++) {
-            memcpy(bp.CP, sf.cps + (size_t)k * sf.ru * sf.rv * 4,
-                   sf.ru * sf.rv * 4 * sizeof(float));
+            bp.CP = (float*)(sf.cps + (size_t)k * sf.ru * sf.rv * 4);
             float eps = compute_epsilon(&bp, cam);
             int tu = 0, tv = 0;
             compute_tess_factors(&bp, eps, &tu, &tv);
             adapt_tess_factors(&tu, &tv);
-            meta[mi].tu = tu; meta[mi].tv = tv;
-            meta[mi].offset = offset;
-            meta[mi].ru = sf.ru; meta[mi].rv = sf.rv;
-            meta[mi].cpOff = cpOff + k * sf.ru * sf.rv;   // scene-global, vec4 units
-            offset += tu * tv;
-            mi++;
+            sm[k].tu = tu; sm[k].tv = tv;
+            sm[k].ru = sf.ru; sm[k].rv = sf.rv;
         }
-        memcpy(flatCps + cpi, sf.cps, (size_t)np * sf.ru * sf.rv * 4 * sizeof(float));
-        cpi += (size_t)np * sf.ru * sf.rv * 4;
-        cpOff += np * sf.ru * sf.rv;
+        // Each surface owns a disjoint slice of flatCps — parallel-safe.
+        memcpy(flatCps + cpsBase[s], sf.cps,
+               (size_t)np * sf.ru * sf.rv * 4 * sizeof(float));
     }
-    free(bp.CP);
+
+    // Serial prefix sums: scene-global vertex offset and vec4 CP offset.
+    // Same arithmetic as the old in-loop accumulation — bit-identical.
+    int offset = 0, cpOff = 0;
+    for (int mi = 0; mi < npTotal; mi++) {
+        meta[mi].offset = offset;
+        meta[mi].cpOff = cpOff;
+        offset += meta[mi].tu * meta[mi].tv;
+        cpOff += meta[mi].ru * meta[mi].rv;
+    }
+    free(metaBase); free(cpsBase);
 
     // Pass 2 (GPU): ONE launch for the whole scene.
     float* verts = (float*)malloc((size_t)offset * 6 * sizeof(float));

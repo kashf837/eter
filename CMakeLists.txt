@@ -5,6 +5,7 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CUDA_STANDARD 20)
 set(CMAKE_CUDA_ARCHITECTURES 89)
 add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>)
+add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/openmp>)
 
 # ---- nvpro_core2 ----
 option(NVPRO2_ENABLE_nvgl "" OFF)

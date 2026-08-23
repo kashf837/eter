@@ -8,10 +8,10 @@ typedef struct {
 } CameraParams;
 
 // Screen-space error → object-space epsilon
-float compute_epsilon(BezierPatch* bp, const CameraParams* cam);
+float compute_epsilon(const BezierPatch* bp, const CameraParams* cam);
 
 // Zheng & Sederberg (2000): second-difference → tu, tv
-void compute_tess_factors(BezierPatch* bp, float eps, int* tu, int* tv);
+void compute_tess_factors(const BezierPatch* bp, float eps, int* tu, int* tv);
 
 // Scale tu, tv to (7p+1)x(7q+1) for 8x8 meshlet compatibility
 void adapt_tess_factors(int* tu, int* tv);

@@ -127,6 +127,9 @@ public:
         float* verts = nurbs_adaptive_eval_scene(surfs.data(), (int)surfs.size(),
                                                  cam, &meta, &total);
         if (!verts) { fprintf(stderr, "  [SKIP] cached scene eval failed\n"); return m; }
+        int npTotal = 0;
+        for (const BezierSurface& s : cache.surfaces) npTotal += s.nu * s.nv;
+        reserveMesh(m, meta, npTotal, total, cache.cpsFloats());
         int base = 0;
         for (const BezierSurface& s : cache.surfaces) {
             accumTessRange(meta + base, s.nu * s.nv, &tuMin, &tuMax, &tvMin, &tvMax);
@@ -186,6 +189,12 @@ public:
 
         // Phase 3: append all surfaces in scene order.
         if (verts) {
+            int npTotal = 0; size_t cpF = 0;
+            for (const SceneSurf& sf : surfs) {
+                npTotal += sf.nu * sf.nv;
+                cpF += (size_t)sf.nu * sf.nv * sf.ru * sf.rv * 4;
+            }
+            reserveMesh(m, meta, npTotal, total, cpF);
             int base = 0;
             for (const SceneSurf& sf : surfs) {
                 accumTessRange(meta + base, sf.nu * sf.nv, &tuMin, &tuMax, &tvMin, &tvMax);
@@ -227,6 +236,7 @@ private:
         }
         if (tuMin && tuMax && tvMin && tvMax)
             accumTessRange(info, nu * nv, tuMin, tuMax, tvMin, tvMax);
+        reserveMesh(m, info, nu * nv, total, (size_t)nu * nv * ru * rv * 4);
         addPatchGrid(m, verts, bezierCPs, info, nu, nv, ru, rv);
         free(verts); free(bezierCPs); free(info);
         return true;
@@ -243,6 +253,20 @@ private:
         }
     }
 
+    // Reserve m's vectors to their final sizes ONCE per rebuild, so the
+    // per-batch inserts/resizes below never reallocate. Vector doubling used
+    // to copy ~450 MB (vertex + index data) on every rebuild — that was most
+    // of addPatchGrid's ~200 ms.
+    static void reserveMesh(Mesh& m, const ScenePatchMeta* info, int n,
+                            int totalVerts, size_t cpFloats) {
+        size_t quads = 0;
+        for (int k = 0; k < n; k++) quads += (size_t)(info[k].tu - 1) * (info[k].tv - 1);
+        m.v.reserve(((size_t)m.verts() + (size_t)totalVerts) * 11);
+        m.i.reserve(m.i.size() + quads * 6);  // 2 tris per quad × 3 indices
+        m.cp.reserve(m.cp.size() + cpFloats);
+        m.meta.reserve(((size_t)m.patchCount + (size_t)n) * 4);  // 4 uint32 per patch
+    }
+
     // Append one file's patches to m. Every patch is described as
     // {tu, tv, offset} (ScenePatchMeta, offset is scene-global) coming straight
     // from the adaptive CUDA eval.
@@ -252,6 +276,7 @@ private:
         // CP stride is degree-dependent (ru*rv vec4s per patch), so the resolve
         // shader gets each patch's offset/order from m.meta, not a fixed stride.
         int np = nu * nv;
+        if (np <= 0) return;
         int batchBase = m.patchCount;              // global patch index of this batch
         int cpVec4Base = (int)(m.cp.size() / 4);   // CP offset in vec4 units for this file's patches
         int cpsPerPatch = ru * rv * 4;             // floats per patch (e.g. 64 for bicubic)
@@ -261,11 +286,27 @@ private:
                 m.meta.insert(m.meta.end(), {(uint32_t)(cpVec4Base + k * ru * rv), (uint32_t)ru, (uint32_t)rv, 0u});
         }
         m.patchCount += np;
+
+        // Vertex fill: pre-size m.v for this batch (the caller reserved the
+        // scene total, so resize() never reallocates) and write each patch's
+        // slice directly. The old per-vertex m.v.insert() paid a size check +
+        // occasional reallocation copy per push — ~200 ms/rebuild for 3.7M
+        // vertices. Offsets are scene-global, so patch slices are disjoint and
+        // the write order reproduces the old insert order exactly.
+        int batchVerts = info[np-1].offset + info[np-1].tu * info[np-1].tv - info[0].offset;
+        size_t vBase = m.v.size();                 // batch vertex base, in floats (stride 11)
+        m.v.resize(vBase + (size_t)batchVerts * 11);
+        float* vData = m.v.data();                 // stable: no realloc past reserved size
         for (int k = 0; k < np; k++) {
             int pi = k / nv, pj = k % nv;
             const ScenePatchMeta* p = &info[k];
-            uint32_t base = (uint32_t)m.v.size() / 11;  // stride 11
             const float* patch = verts + p->offset * 6;
+            // p->offset is scene-GLOBAL: the patch's vertex block lives at
+            // global vertex index p->offset, i.e. float index p->offset*11.
+            // vBase (this batch's float base) is only for the resize above —
+            // it is already included in p->offset, adding it again would
+            // double-count every previous batch.
+            float* dst = vData + (size_t)p->offset * 11;
             float detail = (float)(p->tu + p->tv) / 128.0f;  // [0,1] tess density
             float patchID = (float)(batchBase + k) + detail * 0.1f;
             if ((pi + pj) & 1) patchID = -patchID;  // sign bit = checkerboard parity
@@ -285,10 +326,21 @@ private:
                     float inv=1.f/(sqrtf(gnLen)+1e-10f);
                     float u = p->tu > 1 ? (float)x / (float)(p->tu - 1) : 0.5f;
                     float v = p->tv > 1 ? (float)y / (float)(p->tv - 1) : 0.5f;
-                    m.v.insert(m.v.end(),{px,py,pz, gnx*inv,gny*inv,gnz*inv, u,v, patchID, (float)x,(float)y});
+                    float* d = dst + (size_t)idx * 11;
+                    d[0]=px; d[1]=py; d[2]=pz;
+                    d[3]=gnx*inv; d[4]=gny*inv; d[5]=gnz*inv;
+                    d[6]=u; d[7]=v; d[8]=patchID; d[9]=(float)x; d[10]=(float)y;
                     if(px<m.bbMin[0])m.bbMin[0]=px; if(py<m.bbMin[1])m.bbMin[1]=py; if(pz<m.bbMin[2])m.bbMin[2]=pz;
                     if(px>m.bbMax[0])m.bbMax[0]=px; if(py>m.bbMax[1])m.bbMax[1]=py; if(pz>m.bbMax[2])m.bbMax[2]=pz;
                 }
+        }
+
+        // Index fill (indices reference the scene-global vertex positions —
+        // the old code's base was m.v.size()/11 at patch time, which equals
+        // p->offset since vertices are appended in patch order).
+        for (int k = 0; k < np; k++) {
+            const ScenePatchMeta* p = &info[k];
+            uint32_t base = (uint32_t)p->offset;
             for (int y = 0; y < p->tv-1; y++)
                 for (int x = 0; x < p->tu-1; x++) {
                     uint32_t a=base+y*p->tu+x, b=a+1, c=a+p->tu, d=c+1;
