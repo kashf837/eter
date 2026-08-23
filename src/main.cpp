@@ -253,49 +253,112 @@ public:
   }
 
   // ============================================================
-  // onDetach — destroy all GPU resources (reverse order of creation)
+  // onUIMenu — menu bar (File / View)
   // ============================================================
-  void onDetach() override
+  void onUIMenu() override
   {
-    NVVK_CHECK(vkDeviceWaitIdle(m_app->getDevice()));  // wait for GPU to finish
-    VkDevice dev = m_app->getDevice();
-    ImGui_ImplVulkan_RemoveTexture(m_imguiImage);
-
-    // Pipelines
-    vkDestroyPipeline(dev, m_pipelineResolve, nullptr);
-    vkDestroyPipeline(dev, m_pipelineVis, nullptr);
-    vkDestroyPipelineLayout(dev, m_resolvePipelineLayout, nullptr);
-    vkDestroyPipelineLayout(dev, m_visPipelineLayout, nullptr);
-    vkDestroyDescriptorSetLayout(dev, m_resolveSsboLayout, nullptr);
-    vkDestroyDescriptorSetLayout(dev, m_resolveUboLayout, nullptr);
-    vkDestroyDescriptorSetLayout(dev, m_resolveDsLayout, nullptr);
-    vkDestroyDescriptorSetLayout(dev, m_visDsLayout, nullptr);
-    vkDestroyDescriptorPool(dev, m_resolveDsPool, nullptr);
-    vkDestroyDescriptorPool(dev, m_visDsPool, nullptr);
-
-    // Buffers & images
-    for (int i = 0; i < MAX_FIF; i++) {
-        vmaDestroyBuffer((VmaAllocator)m_alloc, m_lightUbo[i].buffer, m_lightUbo[i].allocation);
-        vmaDestroyBuffer((VmaAllocator)m_alloc, m_visUbo[i].buffer, m_visUbo[i].allocation);
+    bool vsync = m_app->isVsync();
+    if (ImGui::BeginMenu("File")) {
+        if (ImGui::MenuItem("Open...")) {
+            auto path = nvgui::windowOpenFileDialog(m_app->getWindowHandle(), "Open SURF / STEP", "*.surf;*.stp;*.step");
+            if (!path.empty()) {
+                std::string sp = path.string();
+                // Case-insensitive extension check
+                std::string lower = sp;
+                for (auto& c : lower) c = (char)tolower((unsigned char)c);
+                if (lower.ends_with(".stp") || lower.ends_with(".step")) {
+                    auto stem = path.stem().string();
+                    m_tempDir = (path.parent_path() / (stem + "_parts")).string();
+                    std::filesystem::create_directory(m_tempDir);
+                    std::string cmd = "python scripts/step2surf.py --all \"" + sp + "\" \"" + m_tempDir + "/out\"";
+                    LOGI("Converting STEP...\n");
+                    int ret = system(cmd.c_str());
+                    // Verify conversion succeeded and produced .surf files
+                    bool hasFiles = false;
+                    if (ret == 0) {
+                        for (auto& e : std::filesystem::directory_iterator(m_tempDir))
+                            if (e.is_regular_file() && e.path().extension() == ".surf") { hasFiles = true; break; }
+                    }
+                    if (hasFiles) {
+                        m_pendingLoad = m_tempDir; m_pendingIsDir = true;
+                    } else {
+                        LOGI("STEP conversion failed (ret=%d, hasFiles=%d)\n", ret, (int)hasFiles);
+                    }
+                } else { m_pendingLoad = sp; m_pendingIsDir = false; }
+            }
+        }
+        if (ImGui::MenuItem("Exit", "Ctrl+Q")) m_app->close();
+        ImGui::EndMenu();
     }
-    m_alloc.destroyBuffer(m_indexBuffer);
-    m_alloc.destroyBuffer(m_vertexBuffer);
-    m_alloc.destroyBuffer(m_bezierSSBO);  // always exists (dummy or real)
-    m_alloc.destroyBuffer(m_bezierMetaSSBO);
-    m_alloc.destroyImage(m_gbufUV);
-    m_alloc.destroyImage(m_gbufID);
-    m_alloc.destroyImage(m_gbufNorm);
-    m_alloc.destroyImage(m_gbufPos);
-    m_alloc.destroyImage(m_depthImage);
-    m_alloc.destroyImage(m_renderTarget);
-    m_alloc.destroyImage(m_viewportImage);
+    if (ImGui::BeginMenu("View")) {
+        ImGui::MenuItem("V-Sync", "Ctrl+Shift+V", &vsync);
+        ImGui::EndMenu();
+    }
+    if (ImGui::IsKeyPressed(ImGuiKey_Q) && ImGui::IsKeyDown(ImGuiKey_LeftCtrl)) m_app->close();
+    if (ImGui::IsKeyPressed(ImGuiKey_V) && ImGui::IsKeyDown(ImGuiKey_LeftCtrl) && ImGui::IsKeyDown(ImGuiKey_LeftShift))
+        vsync = !vsync;
+    if (vsync != m_app->isVsync()) m_app->setVsync(vsync);
+  }
 
-    // Framework
-    m_stagingUploader.deinit();
-    m_samplerPool.deinit();
-    m_alloc.deinit();
-    m_profilerGpuTimer.deinit();
-    m_info.profilerManager->destroyTimeline(m_profilerTimeline);
+  // ============================================================
+  // onUIRender — ImGui panels
+  // ============================================================
+  void onUIRender() override
+  {
+    ImGui::Begin("Settings");
+    ImGui::SliderFloat("Intensity", &m_intensity, 0.0f, 2.0f);
+    ImGui::Checkbox("Checkerboard", &m_checkerboard);
+    ImGui::Checkbox("Show Boundaries", &m_showBoundary);
+    ImGui::Text("Triangles: %d", m_indexCount / 3);
+    ImGui::TextDisabled("%d FPS / %.3fms",
+        static_cast<int>(ImGui::GetIO().Framerate), 1000.f / ImGui::GetIO().Framerate);
+    ImGui::Text("Viewport: %d x %d", m_app->getViewportSize().width, m_app->getViewportSize().height);
+    ImGui::End();
+
+    // Viewport: display our rendered image (render target → viewport via blit)
+    ImGui::Begin("Viewport");
+    ImGui::Image((ImTextureID)m_imguiImage, ImGui::GetContentRegionAvail());
+    ImGui::End();
+  }
+
+  void onPreRender() override {
+    m_profilerTimeline->frameAdvance();
+    // Adaptive re-tessellation (ETER §4): rebuild when camera settles.
+    // Idle-counter approach: reset on any camera movement, rebuild after N idle frames.
+    if (!m_lastPath.empty() && m_indexCount > 0) {
+        glm::dvec3 e = m_camera->getEye();
+        float dx=(float)e.x-m_lastEye[0], dy=(float)e.y-m_lastEye[1], dz=(float)e.z-m_lastEye[2];
+        float dist = sqrtf(dx*dx+dy*dy+dz*dz);
+
+        if (dist > m_modelScale * 0.001f) {
+            // Camera is moving: reset idle counter
+            m_idleFrames = 0;
+            m_lastEye[0] = (float)e.x; m_lastEye[1] = (float)e.y; m_lastEye[2] = (float)e.z;
+        } else {
+            m_idleFrames++;
+        }
+
+        if (m_idleFrames == 60) {  // ~1s idle @60fps → rebuild
+            float rdx=(float)e.x-m_rebuildEye[0], rdy=(float)e.y-m_rebuildEye[1], rdz=(float)e.z-m_rebuildEye[2];
+            float rdist = sqrtf(rdx*rdx+rdy*rdy+rdz*rdz);
+            if (rdist > m_modelScale * 0.01f) {  // worth rebuilding
+                CameraParams cam;
+                cam.camX = (float)e.x; cam.camY = (float)e.y; cam.camZ = (float)e.z;
+                cam.fovY = 60.f; cam.scrW = m_imgW; cam.scrH = m_imgH;
+                Mesh m = MeshBuilder::adaptive(m_lastPath.c_str(), &cam);
+                if (!m.empty()) {
+                    NVVK_CHECK(vkDeviceWaitIdle(m_app->getDevice()));
+                    if (m_indexCount > 0) { m_alloc.destroyBuffer(m_indexBuffer); m_alloc.destroyBuffer(m_vertexBuffer); m_indexCount = 0; }
+                    uploadMesh(m);
+                    m_modelScale = m.scale();
+                    m_center[0]=m.cx(); m_center[1]=m.cy(); m_center[2]=m.cz();
+                    m_rebuildEye[0] = (float)e.x; m_rebuildEye[1] = (float)e.y; m_rebuildEye[2] = (float)e.z;
+                    LOGI("[Adaptive] rebuilt, %d verts\n", m.verts());
+                }
+            }
+            m_idleFrames = 0;
+        }
+    }
   }
 
   // ============================================================
@@ -473,112 +536,49 @@ public:
   }
 
   // ============================================================
-  // onUIRender — ImGui panels
+  // onDetach — destroy all GPU resources (reverse order of creation)
   // ============================================================
-  void onUIRender() override
+  void onDetach() override
   {
-    ImGui::Begin("Settings");
-    ImGui::SliderFloat("Intensity", &m_intensity, 0.0f, 2.0f);
-    ImGui::Checkbox("Checkerboard", &m_checkerboard);
-    ImGui::Checkbox("Show Boundaries", &m_showBoundary);
-    ImGui::Text("Triangles: %d", m_indexCount / 3);
-    ImGui::TextDisabled("%d FPS / %.3fms",
-        static_cast<int>(ImGui::GetIO().Framerate), 1000.f / ImGui::GetIO().Framerate);
-    ImGui::Text("Viewport: %d x %d", m_app->getViewportSize().width, m_app->getViewportSize().height);
-    ImGui::End();
+    NVVK_CHECK(vkDeviceWaitIdle(m_app->getDevice()));  // wait for GPU to finish
+    VkDevice dev = m_app->getDevice();
+    ImGui_ImplVulkan_RemoveTexture(m_imguiImage);
 
-    // Viewport: display our rendered image (render target → viewport via blit)
-    ImGui::Begin("Viewport");
-    ImGui::Image((ImTextureID)m_imguiImage, ImGui::GetContentRegionAvail());
-    ImGui::End();
-  }
+    // Pipelines
+    vkDestroyPipeline(dev, m_pipelineResolve, nullptr);
+    vkDestroyPipeline(dev, m_pipelineVis, nullptr);
+    vkDestroyPipelineLayout(dev, m_resolvePipelineLayout, nullptr);
+    vkDestroyPipelineLayout(dev, m_visPipelineLayout, nullptr);
+    vkDestroyDescriptorSetLayout(dev, m_resolveSsboLayout, nullptr);
+    vkDestroyDescriptorSetLayout(dev, m_resolveUboLayout, nullptr);
+    vkDestroyDescriptorSetLayout(dev, m_resolveDsLayout, nullptr);
+    vkDestroyDescriptorSetLayout(dev, m_visDsLayout, nullptr);
+    vkDestroyDescriptorPool(dev, m_resolveDsPool, nullptr);
+    vkDestroyDescriptorPool(dev, m_visDsPool, nullptr);
 
-  void onPreRender() override {
-    m_profilerTimeline->frameAdvance();
-    // Adaptive re-tessellation (ETER §4): rebuild when camera settles.
-    // Idle-counter approach: reset on any camera movement, rebuild after N idle frames.
-    if (!m_lastPath.empty() && m_indexCount > 0) {
-        glm::dvec3 e = m_camera->getEye();
-        float dx=(float)e.x-m_lastEye[0], dy=(float)e.y-m_lastEye[1], dz=(float)e.z-m_lastEye[2];
-        float dist = sqrtf(dx*dx+dy*dy+dz*dz);
-
-        if (dist > m_modelScale * 0.001f) {
-            // Camera is moving: reset idle counter
-            m_idleFrames = 0;
-            m_lastEye[0] = (float)e.x; m_lastEye[1] = (float)e.y; m_lastEye[2] = (float)e.z;
-        } else {
-            m_idleFrames++;
-        }
-
-        if (m_idleFrames == 60) {  // ~1s idle @60fps → rebuild
-            float rdx=(float)e.x-m_rebuildEye[0], rdy=(float)e.y-m_rebuildEye[1], rdz=(float)e.z-m_rebuildEye[2];
-            float rdist = sqrtf(rdx*rdx+rdy*rdy+rdz*rdz);
-            if (rdist > m_modelScale * 0.01f) {  // worth rebuilding
-                CameraParams cam;
-                cam.camX = (float)e.x; cam.camY = (float)e.y; cam.camZ = (float)e.z;
-                cam.fovY = 60.f; cam.scrW = m_imgW; cam.scrH = m_imgH;
-                Mesh m = MeshBuilder::adaptive(m_lastPath.c_str(), &cam);
-                if (!m.empty()) {
-                    NVVK_CHECK(vkDeviceWaitIdle(m_app->getDevice()));
-                    if (m_indexCount > 0) { m_alloc.destroyBuffer(m_indexBuffer); m_alloc.destroyBuffer(m_vertexBuffer); m_indexCount = 0; }
-                    uploadMesh(m);
-                    m_modelScale = m.scale();
-                    m_center[0]=m.cx(); m_center[1]=m.cy(); m_center[2]=m.cz();
-                    m_rebuildEye[0] = (float)e.x; m_rebuildEye[1] = (float)e.y; m_rebuildEye[2] = (float)e.z;
-                    LOGI("[Adaptive] rebuilt, %d verts\n", m.verts());
-                }
-            }
-            m_idleFrames = 0;
-        }
+    // Buffers & images
+    for (int i = 0; i < MAX_FIF; i++) {
+        vmaDestroyBuffer((VmaAllocator)m_alloc, m_lightUbo[i].buffer, m_lightUbo[i].allocation);
+        vmaDestroyBuffer((VmaAllocator)m_alloc, m_visUbo[i].buffer, m_visUbo[i].allocation);
     }
-  }
+    m_alloc.destroyBuffer(m_indexBuffer);
+    m_alloc.destroyBuffer(m_vertexBuffer);
+    m_alloc.destroyBuffer(m_bezierSSBO);  // always exists (dummy or real)
+    m_alloc.destroyBuffer(m_bezierMetaSSBO);
+    m_alloc.destroyImage(m_gbufUV);
+    m_alloc.destroyImage(m_gbufID);
+    m_alloc.destroyImage(m_gbufNorm);
+    m_alloc.destroyImage(m_gbufPos);
+    m_alloc.destroyImage(m_depthImage);
+    m_alloc.destroyImage(m_renderTarget);
+    m_alloc.destroyImage(m_viewportImage);
 
-  // ============================================================
-  // onUIMenu — menu bar (File / View)
-  // ============================================================
-  void onUIMenu() override
-  {
-    bool vsync = m_app->isVsync();
-    if (ImGui::BeginMenu("File")) {
-        if (ImGui::MenuItem("Open...")) {
-            auto path = nvgui::windowOpenFileDialog(m_app->getWindowHandle(), "Open SURF / STEP", "*.surf;*.stp;*.step");
-            if (!path.empty()) {
-                std::string sp = path.string();
-                // Case-insensitive extension check
-                std::string lower = sp;
-                for (auto& c : lower) c = (char)tolower((unsigned char)c);
-                if (lower.ends_with(".stp") || lower.ends_with(".step")) {
-                    auto stem = path.stem().string();
-                    m_tempDir = (path.parent_path() / (stem + "_parts")).string();
-                    std::filesystem::create_directory(m_tempDir);
-                    std::string cmd = "python scripts/step2surf.py --all \"" + sp + "\" \"" + m_tempDir + "/out\"";
-                    LOGI("Converting STEP...\n");
-                    int ret = system(cmd.c_str());
-                    // Verify conversion succeeded and produced .surf files
-                    bool hasFiles = false;
-                    if (ret == 0) {
-                        for (auto& e : std::filesystem::directory_iterator(m_tempDir))
-                            if (e.is_regular_file() && e.path().extension() == ".surf") { hasFiles = true; break; }
-                    }
-                    if (hasFiles) {
-                        m_pendingLoad = m_tempDir; m_pendingIsDir = true;
-                    } else {
-                        LOGI("STEP conversion failed (ret=%d, hasFiles=%d)\n", ret, (int)hasFiles);
-                    }
-                } else { m_pendingLoad = sp; m_pendingIsDir = false; }
-            }
-        }
-        if (ImGui::MenuItem("Exit", "Ctrl+Q")) m_app->close();
-        ImGui::EndMenu();
-    }
-    if (ImGui::BeginMenu("View")) {
-        ImGui::MenuItem("V-Sync", "Ctrl+Shift+V", &vsync);
-        ImGui::EndMenu();
-    }
-    if (ImGui::IsKeyPressed(ImGuiKey_Q) && ImGui::IsKeyDown(ImGuiKey_LeftCtrl)) m_app->close();
-    if (ImGui::IsKeyPressed(ImGuiKey_V) && ImGui::IsKeyDown(ImGuiKey_LeftCtrl) && ImGui::IsKeyDown(ImGuiKey_LeftShift))
-        vsync = !vsync;
-    if (vsync != m_app->isVsync()) m_app->setVsync(vsync);
+    // Framework
+    m_stagingUploader.deinit();
+    m_samplerPool.deinit();
+    m_alloc.deinit();
+    m_profilerGpuTimer.deinit();
+    m_info.profilerManager->destroyTimeline(m_profilerTimeline);
   }
 
 private:
