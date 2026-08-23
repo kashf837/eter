@@ -97,16 +97,16 @@ static void nurbs_to_beziers(NurbsSurf* s) {
 
 // Core of adaptive evaluation: takes pre-converted Bézier CPs (flat array,
 // patch-major), computes per-patch tess factors and evaluates vertices.
-// Shared by nurbs_adaptive_eval (fresh load) and nurbs_adaptive_eval_cached
-// (camera rebuild — no file I/O, no knot insertion).
+// Single-surface path (loadFile); the scene path nurbs_adaptive_eval_scene
+// evaluates many surfaces in ONE launch and is the rebuild workhorse.
 static float* adaptive_eval_core(const float* cps, int nu, int nv, int ru, int rv,
                                  const CameraParams* cam,
-                                 PatchInfo** info_out, int* total_verts)
+                                 ScenePatchMeta** info_out, int* total_verts)
 {
     int np = nu * nv;
     int cpsPerPatch = ru * rv * 4;  // e.g. 64 for bicubic
 
-    PatchInfo* info = (PatchInfo*)malloc(np * sizeof(PatchInfo));
+    ScenePatchMeta* info = (ScenePatchMeta*)malloc(np * sizeof(ScenePatchMeta));
     BezierPatch bp = {ru - 1, rv - 1, (float*)malloc(cpsPerPatch * sizeof(float))};
     int offset = 0;
 
@@ -125,19 +125,19 @@ static float* adaptive_eval_core(const float* cps, int nu, int nv, int ru, int r
 
             int idx = i*nv+j;
             info[idx].tu = tu; info[idx].tv = tv; info[idx].offset = offset;
+            info[idx].ru = ru; info[idx].rv = rv; info[idx].cpOff = idx * ru * rv;
             offset += tu * tv;
         }
     }
 
     // Second pass: batch-evaluate every patch at its own resolution in ONE
-    // GPU round trip (one launch for the whole surface). The old per-patch
-    // eval_bezier_patch made 13 CUDA API calls per patch (~680µs each on
-    // WDDM = 39s for 57k patches); this is one cudaMalloc group + one H2D +
-    // one launch + one D2H per surface. The kernel writes v-major directly
-    // (index = offset + v*tu + u), so the old per-patch transpose loop is
-    // gone too.
+    // GPU round trip. The old per-patch eval_bezier_patch made 13 CUDA API
+    // calls per patch (~680µs each on WDDM = 39s for 57k patches); the scene
+    // wrapper needs only 2 H2D + 1 launch + 1 D2H. The kernel writes v-major
+    // directly (index = offset + v*tu + u), so the old per-patch transpose
+    // loop is gone too.
     float* verts = (float*)malloc(offset * 6 * sizeof(float));
-    eval_bezier_patches_batched(cps, info, np, ru, rv, verts, offset);
+    eval_bezier_patches_scene(cps, info, np, verts, offset);
 
     free(bp.CP);
     *info_out = info;
@@ -147,44 +147,116 @@ static float* adaptive_eval_core(const float* cps, int nu, int nv, int ru, int r
 }
 
 float* nurbs_adaptive_eval(const char* surf_path, const CameraParams* cam,
-                           int* np_u, int* np_v, PatchInfo** info_out, int* total_verts,
+                           int* np_u, int* np_v, ScenePatchMeta** info_out, int* total_verts,
                            int* ru_out, int* rv_out, float** cp_out)
 {
-    NurbsSurf* s = read_surf(surf_path);
-    if (!s) return NULL;
+    int nu, nv, ru, rv;
+    float* cps = nurbs_read_cps(surf_path, &nu, &nv, &ru, &rv);
+    if (!cps) return NULL;
 
-    nurbs_to_beziers(s);
-
-    int ru = s->p_u + 1, rv = s->p_v + 1;
-    int nu = (s->n_u + 1) / ru, nv = (s->n_v + 1) / rv;
-    *np_u = nu; *np_v = nv;
-    *ru_out = ru; *rv_out = rv;
-    int np = nu * nv;
-    int cpsPerPatch = ru * rv * 4;  // e.g. 64 for bicubic
-
-    // Extract all patches' CPs into one flat array (uncentered) up front.
-    // If the caller wants them (cp_out), hand over this allocation; otherwise
-    // free it after the core finishes. The core only reads this array.
-    float* cps;
-    if (cp_out) { *cp_out = (float*)malloc(np * cpsPerPatch * sizeof(float)); cps = *cp_out; }
-    else        { cps = (float*)malloc(np * cpsPerPatch * sizeof(float)); }
-    for (int i = 0; i < nu; i++)
-        for (int j = 0; j < nv; j++)
-            for (int ii = 0; ii < ru; ii++)
-                for (int jj = 0; jj < rv; jj++)
-                    memcpy(&cps[((i*nv+j)*ru*rv + ii*rv+jj)*4],
-                           s->Ps[i*ru+ii][j*rv+jj], 4*sizeof(float));
-    free_surf(s);
+    *np_u = nu; *np_v = nv; *ru_out = ru; *rv_out = rv;
+    if (cp_out) *cp_out = cps;   // hand over the CP array; the core only reads it
 
     float* verts = adaptive_eval_core(cps, nu, nv, ru, rv, cam, info_out, total_verts);
     if (!cp_out) free(cps);
     return verts;
 }
 
-float* nurbs_adaptive_eval_cached(const float* cps, int nu, int nv, int ru, int rv,
-                                  const CameraParams* cam,
-                                  PatchInfo** info_out, int* total_verts)
+// Read + decompose one .surf without evaluating: NURBS→Bézier knot insertion,
+// flat uncentered CP extraction. The scene path (directory loads) calls this
+// for every file first, then evaluates everything in one launch.
+float* nurbs_read_cps(const char* path, int* nu, int* nv, int* ru, int* rv)
 {
-    if (!cps || nu <= 0 || nv <= 0 || ru <= 1 || rv <= 1) return NULL;
-    return adaptive_eval_core(cps, nu, nv, ru, rv, cam, info_out, total_verts);
+    NurbsSurf* s = read_surf(path);
+    if (!s) return NULL;
+
+    nurbs_to_beziers(s);
+
+    int r_u = s->p_u + 1, r_v = s->p_v + 1;
+    int n_u = (s->n_u + 1) / r_u, n_v = (s->n_v + 1) / r_v;
+    if (n_u <= 0 || n_v <= 0) { free_surf(s); return NULL; }
+    // The eval kernel's shared Bernstein tables cap degrees at 7 (MAX_ORDER).
+    if (r_u - 1 > 7 || r_v - 1 > 7) {
+        fprintf(stderr, "  [SKIP] %s: degree (%d,%d) > 7 not supported\n", path, r_u - 1, r_v - 1);
+        free_surf(s); return NULL;
+    }
+    int np = n_u * n_v;
+    int cpsPerPatch = r_u * r_v * 4;  // e.g. 64 for bicubic
+
+    float* cps = (float*)malloc((size_t)np * cpsPerPatch * sizeof(float));
+    for (int i = 0; i < n_u; i++)
+        for (int j = 0; j < n_v; j++)
+            for (int ii = 0; ii < r_u; ii++)
+                for (int jj = 0; jj < r_v; jj++)
+                    memcpy(&cps[((i*n_v+j)*r_u*r_v + ii*r_v+jj)*4],
+                           s->Ps[i*r_u+ii][j*r_v+jj], 4*sizeof(float));
+    free_surf(s);
+
+    *nu = n_u; *nv = n_v; *ru = r_u; *rv = r_v;
+    return cps;
+}
+
+// Scene-level adaptive evaluation: one pass-1 (host tess factors) over ALL
+// surfaces, then ONE GPU launch for the whole scene (ETER §4 rebuild path).
+// Patch order = surface order in surfs[], then k = i*nv+j inside each surface
+// — identical to the order addPatchGrid appends batches, so cpOff matches
+// addPatchGrid's cpVec4Base + k*ru*rv exactly and SSBO meta offsets stay valid.
+float* nurbs_adaptive_eval_scene(const SceneSurf* surfs, int nSurfs,
+                                 const CameraParams* cam,
+                                 ScenePatchMeta** meta_out, int* total_verts)
+{
+    if (nSurfs <= 0) return NULL;
+
+    // One-time sweep: patch/meta/CP totals + largest CP grid (the pass-1
+    // scratch BezierPatch below is reused by every surface).
+    int npTotal = 0, maxCpsFloats = 0;
+    size_t cpsFloatsTotal = 0;
+    for (int s = 0; s < nSurfs; s++) {
+        npTotal += surfs[s].nu * surfs[s].nv;
+        cpsFloatsTotal += (size_t)surfs[s].nu * surfs[s].nv * surfs[s].ru * surfs[s].rv * 4;
+        int cpsFloats = surfs[s].ru * surfs[s].rv * 4;
+        if (cpsFloats > maxCpsFloats) maxCpsFloats = cpsFloats;
+    }
+    if (npTotal <= 0) return NULL;
+
+    ScenePatchMeta* meta = (ScenePatchMeta*)malloc((size_t)npTotal * sizeof(ScenePatchMeta));
+    float* flatCps = (float*)malloc(cpsFloatsTotal * sizeof(float));
+
+    // Pass 1 (host): per-patch eps + tess factors + scene-global offsets.
+    // flatCps is filled in the same patch order for the single H2D upload.
+    BezierPatch bp = {0, 0, (float*)malloc(maxCpsFloats * sizeof(float))};
+    int mi = 0, offset = 0, cpOff = 0;
+    size_t cpi = 0;
+    for (int s = 0; s < nSurfs; s++) {
+        const SceneSurf& sf = surfs[s];
+        bp.p_u = sf.ru - 1; bp.p_v = sf.rv - 1;  // compute_epsilon/tess read these
+        int np = sf.nu * sf.nv;
+        for (int k = 0; k < np; k++) {
+            memcpy(bp.CP, sf.cps + (size_t)k * sf.ru * sf.rv * 4,
+                   sf.ru * sf.rv * 4 * sizeof(float));
+            float eps = compute_epsilon(&bp, cam);
+            int tu = 0, tv = 0;
+            compute_tess_factors(&bp, eps, &tu, &tv);
+            adapt_tess_factors(&tu, &tv);
+            meta[mi].tu = tu; meta[mi].tv = tv;
+            meta[mi].offset = offset;
+            meta[mi].ru = sf.ru; meta[mi].rv = sf.rv;
+            meta[mi].cpOff = cpOff + k * sf.ru * sf.rv;   // scene-global, vec4 units
+            offset += tu * tv;
+            mi++;
+        }
+        memcpy(flatCps + cpi, sf.cps, (size_t)np * sf.ru * sf.rv * 4 * sizeof(float));
+        cpi += (size_t)np * sf.ru * sf.rv * 4;
+        cpOff += np * sf.ru * sf.rv;
+    }
+    free(bp.CP);
+
+    // Pass 2 (GPU): ONE launch for the whole scene.
+    float* verts = (float*)malloc((size_t)offset * 6 * sizeof(float));
+    eval_bezier_patches_scene(flatCps, meta, npTotal, verts, offset);
+
+    free(flatCps);
+    *meta_out = meta;
+    *total_verts = offset;
+    return verts;
 }

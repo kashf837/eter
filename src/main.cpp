@@ -15,7 +15,7 @@
 #include <glm/gtc/matrix_transform.hpp>
 #include <backends/imgui_impl_vulkan.h>
 
-#include "nurbs.h"  // nurbs_adaptive_eval / nurbs_adaptive_eval_cached
+#include "nurbs.h"  // nurbs_adaptive_eval / nurbs_read_cps / nurbs_adaptive_eval_scene
 #include <nvapp/application.hpp>
 #include <nvapp/elem_profiler.hpp>
 #include <nvapp/elem_logger.hpp>
@@ -110,29 +110,41 @@ public:
     }
 
     // Camera-moved rebuild: replay all cached surfaces through the adaptive
-    // eval (skips .surf file I/O and NURBS→Bézier knot insertion). Same
-    // surface order as the initial load → identical cp/meta layout, so the
-    // existing SSBOs stay valid (uploadMesh skips re-uploading them).
+    // eval (skips .surf file I/O and NURBS→Bézier knot insertion). ONE GPU
+    // launch for the whole scene. Same surface order as the initial load →
+    // identical cp/meta layout, so the existing SSBOs stay valid (uploadMesh
+    // skips re-uploading them).
     static Mesh adaptive(const BezierCache& cache, const CameraParams* cam) {
         Mesh m; resetBBox(m);
         int tuMin = 999, tuMax = 0, tvMin = 999, tvMax = 0;
+
+        std::vector<SceneSurf> surfs;
+        surfs.reserve(cache.surfaces.size());
+        for (const BezierSurface& s : cache.surfaces)
+            surfs.push_back({s.cps.data(), s.nu, s.nv, s.ru, s.rv});
+
+        ScenePatchMeta* meta; int total;
+        float* verts = nurbs_adaptive_eval_scene(surfs.data(), (int)surfs.size(),
+                                                 cam, &meta, &total);
+        if (!verts) { fprintf(stderr, "  [SKIP] cached scene eval failed\n"); return m; }
+        int base = 0;
         for (const BezierSurface& s : cache.surfaces) {
-            PatchInfo* info; int total;
-            float* verts = nurbs_adaptive_eval_cached(s.cps.data(), s.nu, s.nv,
-                                                      s.ru, s.rv, cam, &info, &total);
-            if (!verts) { fprintf(stderr, "  [SKIP] cached surface (nu=%d nv=%d)\n", s.nu, s.nv); continue; }
-            accumTessRange(info, s.nu * s.nv, &tuMin, &tuMax, &tvMin, &tvMax);
-            addPatchGrid(m, verts, s.cps.data(), info, s.nu, s.nv, s.ru, s.rv);
-            free(verts); free(info);
+            accumTessRange(meta + base, s.nu * s.nv, &tuMin, &tuMax, &tvMin, &tvMax);
+            addPatchGrid(m, verts, s.cps.data(), meta + base, s.nu, s.nv, s.ru, s.rv);
+            base += s.nu * s.nv;
         }
+        free(verts); free(meta);
         if (m.patchCount > 0)
             LOGI("Adaptive (cached) %d verts, %d tris, %d patches, tu=[%d,%d] tv=[%d,%d]\n",
                  m.verts(), (int)(m.i.size()/3), m.patchCount, tuMin, tuMax, tvMin, tvMax);
         return m;
     }
 
-    // Load a directory of .surf files (STEP conversion output): adaptive eval
-    // per surface, filling the cache in the same order patches are appended.
+    // Load a directory of .surf files (STEP conversion output) in three phases:
+    // 1. read + decompose every file (no eval) — failures skip BOTH the cache
+    //    and the scene list so they stay in sync;
+    // 2. ONE adaptive evaluation for the whole scene (single GPU launch);
+    // 3. append every surface's patches in the same order the cache was filled.
     static Mesh directory(const char* dirPath, const CameraParams* cam, BezierCache* cache) {
         namespace fs = std::filesystem;
         Mesh m; resetBBox(m);
@@ -146,10 +158,43 @@ public:
             LOGI("WARNING: no .surf files in %s — STEP conversion may have failed\n", dirPath);
         }
         int skipped = 0, tuMin = 999, tuMax = 0, tvMin = 999, tvMax = 0;
+
+        // Phase 1: read + decompose everything first.
+        std::vector<SceneSurf> surfs;
+        std::vector<float*> rawCps;   // freed after phase 3 (addPatchGrid copies)
+        surfs.reserve(files.size()); rawCps.reserve(files.size());
         for (size_t i = 0; i < files.size(); i++) {
             if ((i+1) % 500 == 0) LOGI("  [%zu/%zu] ...\n", i+1, files.size());
-            if (!appendSurface(m, files[i].c_str(), cam, cache, &tuMin, &tuMax, &tvMin, &tvMax)) skipped++;
+            int nu, nv, ru, rv;
+            float* cps = nurbs_read_cps(files[i].c_str(), &nu, &nv, &ru, &rv);
+            if (!cps) { fprintf(stderr, "  [SKIP] %s\n", files[i].c_str()); skipped++; continue; }
+            if (cache) {
+                BezierSurface s;
+                s.cps.assign(cps, cps + (size_t)nu * nv * ru * rv * 4);
+                s.nu = nu; s.nv = nv; s.ru = ru; s.rv = rv;
+                cache->surfaces.push_back(std::move(s));
+            }
+            surfs.push_back({cps, nu, nv, ru, rv});
+            rawCps.push_back(cps);
         }
+
+        // Phase 2: ONE GPU round trip for the whole scene.
+        ScenePatchMeta* meta; int total;
+        float* verts = surfs.empty() ? nullptr
+                     : nurbs_adaptive_eval_scene(surfs.data(), (int)surfs.size(),
+                                                 cam, &meta, &total);
+
+        // Phase 3: append all surfaces in scene order.
+        if (verts) {
+            int base = 0;
+            for (const SceneSurf& sf : surfs) {
+                accumTessRange(meta + base, sf.nu * sf.nv, &tuMin, &tuMax, &tvMin, &tvMax);
+                addPatchGrid(m, verts, sf.cps, meta + base, sf.nu, sf.nv, sf.ru, sf.rv);
+                base += sf.nu * sf.nv;
+            }
+            free(verts); free(meta);
+        }
+        for (float* p : rawCps) free(p);
         LOGI("Done: %d verts, %d tris, %d patches, tu=[%d,%d] tv=[%d,%d], %d skipped, cache=%.1f MB\n",
              m.verts(), (int)(m.i.size()/3), m.patchCount, tuMin, tuMax, tvMin, tvMax, skipped,
              cache ? cache->cpsFloats() * 4.0f / (1024.f * 1024.f) : 0.0);
@@ -170,7 +215,7 @@ private:
                               int* tuMin = nullptr, int* tuMax = nullptr,
                               int* tvMin = nullptr, int* tvMax = nullptr) {
         int nu, nv, total, ru = 0, rv = 0;
-        PatchInfo* info;
+        ScenePatchMeta* info;
         float* bezierCPs = nullptr;
         float* verts = nurbs_adaptive_eval(path, cam, &nu, &nv, &info, &total, &ru, &rv, &bezierCPs);
         if (!verts) { fprintf(stderr, "  [SKIP] %s\n", path); return false; }
@@ -187,8 +232,8 @@ private:
         return true;
     }
 
-    // Accumulate per-patch tess factor ranges from one surface's PatchInfo batch.
-    static void accumTessRange(const PatchInfo* info, int n,
+    // Accumulate per-patch tess factor ranges from one surface's meta batch.
+    static void accumTessRange(const ScenePatchMeta* info, int n,
                                int* tuMin, int* tuMax, int* tvMin, int* tvMax) {
         for (int k = 0; k < n; k++) {
             if (info[k].tu < *tuMin) *tuMin = info[k].tu;
@@ -199,9 +244,10 @@ private:
     }
 
     // Append one file's patches to m. Every patch is described as
-    // {tu, tv, offset} (PatchInfo) coming straight from the adaptive CUDA eval.
+    // {tu, tv, offset} (ScenePatchMeta, offset is scene-global) coming straight
+    // from the adaptive CUDA eval.
     static void addPatchGrid(Mesh& m, const float* verts, const float* cp,
-                             const PatchInfo* info, int nu, int nv, int ru, int rv) {
+                             const ScenePatchMeta* info, int nu, int nv, int ru, int rv) {
         // Append CPs (pre-centering) for global indexing.
         // CP stride is degree-dependent (ru*rv vec4s per patch), so the resolve
         // shader gets each patch's offset/order from m.meta, not a fixed stride.
@@ -217,7 +263,7 @@ private:
         m.patchCount += np;
         for (int k = 0; k < np; k++) {
             int pi = k / nv, pj = k % nv;
-            const PatchInfo* p = &info[k];
+            const ScenePatchMeta* p = &info[k];
             uint32_t base = (uint32_t)m.v.size() / 11;  // stride 11
             const float* patch = verts + p->offset * 6;
             float detail = (float)(p->tu + p->tv) / 128.0f;  // [0,1] tess density

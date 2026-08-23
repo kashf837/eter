@@ -10,24 +10,33 @@ using namespace nvcuda;
 #define BLOCK_SIZE 8
 #define MAX_ORDER 7
 
-static void compute_binom(int order, int* binom) {
-    binom[0] = 1;
-    for (int k = 1; k <= order; k++)
-        binom[k] = binom[k - 1] * (order - k + 1) / k;
+// Binomial coefficient C(order, k) via the recurrence v_i = v_{i-1}*(order-i+1)/i.
+// Every division is exact (standard Pascal identity), so the values are
+// bit-identical to the old host-side compute_binom table — max C(7,3)=35 fits
+// int exactly and converts to float losslessly.
+__device__ int binom_k(int order, int k) {
+    int v = 1;
+    for (int i = 1; i <= k; i++)
+        v = v * (order - i + 1) / i;
+    return v;
 }
 
-// ---- Batched patch evaluation kernel ----
-// One block per patch (gridDim.x = np), block = 8×8. Each block loops over
-// the 8×8 tiles of its patch. tu/tv are always multiples of 8 (adapt_tess_
-// factors quantizes to [8,64]), so every tile is full — the i<tu && j<tv
-// guard on the final write is defensive only. Threads must NEVER early-return
-// (the old per-point kernel could): __syncthreads pairing depends on all 64
-// threads running every tile's pipeline.
+// ---- Scene batched patch evaluation kernel ----
+// One block per patch (gridDim.x = np of the WHOLE scene), block = 8×8. Each
+// block loops over the 8×8 tiles of its patch. tu/tv are always multiples of
+// 8 (adapt_tess_factors quantizes to [8,64]), so every tile is full — the
+// i<tu && j<tv guard on the final write is defensive only. Threads must NEVER
+// early-return (the old per-point kernel could): __syncthreads pairing depends
+// on all 64 threads running every tile's pipeline.
 //
 // Per-patch CP centering (ETER §5 precision recovery) happens in-kernel now:
 // every thread redundantly computes the bbox centroid (min+max)/2 over the
 // patch's ru*rv CPs — bit-identical to the old host-side centering, so the
 // output matches the previous per-patch kernels exactly.
+//
+// Every patch brings its own ru/rv (ScenePatchMeta), so order/cols/useTC are
+// block-local — all threads of a block read the same meta, so useTC stays a
+// block-uniform branch (no divergence across __syncthreads boundaries).
 //
 // Tensor Core path (order ≥ 3, ETER §5.1, aligned to paper):
 //   A1 = [Bu; Bu'] 16×m, B1 = C_weighted m×n, C1 = [T; Tu] 16×n
@@ -37,20 +46,21 @@ static void compute_binom(int order, int* binom) {
 // NOTE: s_C is only read in columns 0..7 (MMA store_matrix writes 8 columns) —
 // keep it that way if this pipeline is ever extended.
 __global__ void eval_patches(
-    const float* d_CP,     // np patches × ru*rv vec4s (uncentered), patch-major
+    const float* d_CP,     // scene CP array, patch-major (global cpOff in meta)
     float* d_V,            // total_verts*6 floats (pos+normal), per patch v-major
-    const int* d_meta,     // np × 3 ints: {tu, tv, outOff in verts} (= PatchInfo)
-    int ru, int rv,        // CP grid per patch (orders = ru-1, rv-1), surface-uniform
-    int useTC,             // order ≥ 3 in both directions (block-uniform branch)
-    const int* d_binom_u, const int* d_binom_v)
+    const int* d_meta)     // np × 6 ints: {tu, tv, outOff, ru, rv, cpOff in vec4s}
 {
     int patch = blockIdx.x;
+    const int* m = d_meta + patch * 6;
+    int tu = m[0], tv = m[1];
+    int outBase = m[2];
+    int ru = m[3], rv = m[4];
     int order_u = ru - 1, order_v = rv - 1;
     int cols = rv;
-    int tu = d_meta[patch*3+0], tv = d_meta[patch*3+1];
-    int outBase = d_meta[patch*3+2];
-    const float* cpBase = d_CP + (size_t)patch * ru * rv * 4;
+    const float* cpBase = d_CP + (size_t)m[5] * 4;   // cpOff in vec4 units
+    bool useTC = (order_u >= 3 && order_v >= 3);     // block-uniform (same meta)
     int ty = threadIdx.y, tx = threadIdx.x;
+    int bu = binom_k(order_u, tx), bv = binom_k(order_v, ty);  // C(order, idx), safe for any order ≤ 7
 
     // ---- Per-patch bbox centroid (min+max)/2, same as the old host code ----
     float cpMin[3]={1e30f,1e30f,1e30f}, cpMax[3]={-1e30f,-1e30f,-1e30f};
@@ -86,11 +96,11 @@ __global__ void eval_patches(
 
         // ---- Bernstein bases (verbatim from the old per-patch kernel) ----
         if (tx <= order_u) {
-            float b = (float)d_binom_u[tx];
+            float b = (float)bu;
             s_Bu[ty][tx] = powf(u,tx)*powf(1.f-u,order_u-tx)*b;
         }
         if (ty <= order_v) {
-            float b = (float)d_binom_v[ty];
+            float b = (float)bv;
             s_Bv[tx][ty] = powf(v,ty)*powf(1.f-v,order_v-ty)*b;
         }
         __syncthreads();
@@ -98,14 +108,14 @@ __global__ void eval_patches(
         // Derivatives: B'_{k,p}(t) = binom(p,k)*[k*t^{k-1}*(1-t)^{p-k} - (p-k)*t^k*(1-t)^{p-k-1}]
         if (order_u > 0 && tx <= order_u) {
             float k = (float)tx, p = (float)order_u;
-            float binom_pk = (float)d_binom_u[tx];
+            float binom_pk = (float)bu;
             float t1 = (tx>0) ? k * powf(u,k-1.f) * powf(1.f-u, p-k) : 0.f;
             float t2 = (tx<p) ? (p-k) * powf(u,k) * powf(1.f-u, p-k-1.f) : 0.f;
             s_BuP[ty][tx] = binom_pk * (t1 - t2);
         }
         if (order_v > 0 && ty <= order_v) {
             float k = (float)ty, p = (float)order_v;
-            float binom_pk = (float)d_binom_v[ty];
+            float binom_pk = (float)bv;
             float t1 = (ty>0) ? k * powf(v,k-1.f) * powf(1.f-v, p-k) : 0.f;
             float t2 = (ty<p) ? (p-k) * powf(v,k) * powf(1.f-v, p-k-1.f) : 0.f;
             s_BvP[tx][ty] = binom_pk * (t1 - t2);
@@ -287,16 +297,15 @@ __global__ void eval_patches(
 // ---- Process-lifetime device buffer pool ----
 // Per-surface eval used to allocate + free 5 device buffers per surface
 // (3506 surfaces ≈ 35k cudaMalloc/cudaFree ≈ ~1s of WDDM driver latency).
-// The buffers are fully overwritten on every use, so a static pool that only
-// grows to the largest size seen so far is correct and needs no resets.
+// With scene-level batching the pool needs only 3 buffers (CP / vertex out /
+// meta), allocated once at the scene's largest size and reused forever —
+// fully overwritten on every use, so grow-only with no resets is correct.
 // The CUDA context reclaims the memory at process exit — no explicit frees.
 namespace {
 struct DevPool {
-    float* d_CP     = nullptr; size_t cpCap     = 0;
-    float* d_V      = nullptr; size_t vCap      = 0;
-    int*   d_meta   = nullptr; size_t metaCap   = 0;
-    int*   d_binomU = nullptr; size_t binomUCap = 0;
-    int*   d_binomV = nullptr; size_t binomVCap = 0;
+    float* d_CP     = nullptr; size_t cpCap   = 0;
+    float* d_V      = nullptr; size_t vCap    = 0;
+    int*   d_meta   = nullptr; size_t metaCap = 0;
 };
 DevPool g_devPool;
 
@@ -314,37 +323,31 @@ bool ensurePool(T*& ptr, size_t& cap, size_t bytes) {
 }
 }  // namespace
 
-// Evaluate all patches of one surface in a single GPU round trip. The old
-// per-patch eval_bezier_patch made 13 CUDA API calls per patch (4 allocs +
-// 3 H2D + 1 launch + 1 blocking D2H + 4 frees ≈ 680µs each on WDDM = 39s
-// for 57k patches); this needs one cudaMalloc group + one H2D + one launch +
-// one D2H for the whole surface. All device buffers now come from the
-// process-lifetime pool above, so the remaining per-surface cost is
-// 4 memcpys + 1 launch + 1 blocking D2H (the D2H waits for the kernel).
-void eval_bezier_patches_batched(const float* cps, const PatchInfo* info, int np,
-                                 int ru, int rv, float* V_out, int total_verts)
+// Evaluate ALL patches of the scene in a single GPU round trip. The old
+// per-surface eval_bezier_patches_batched made 6 CUDA API calls per surface
+// (4 memcpys + 1 launch + 1 blocking D2H × 3506 surfaces ≈ 21k calls ≈ 0.5s
+// of WDDM driver latency on top of the actual work); this needs one cudaMalloc
+// group (from the process-lifetime pool above) + 2 H2D memcpys + one launch +
+// one blocking D2H for the whole scene (the D2H waits for the kernel).
+void eval_bezier_patches_scene(const float* cps, const ScenePatchMeta* meta, int np,
+                               float* V_out, int total_verts)
 {
     if (np <= 0 || total_verts <= 0) return;
-    int order_u = ru - 1, order_v = rv - 1;
-    int* binom_u = (int*)malloc(ru * sizeof(int));
-    int* binom_v = (int*)malloc(rv * sizeof(int));
-    compute_binom(order_u, binom_u); compute_binom(order_v, binom_v);
 
-    size_t cpsBytes    = (size_t)np * ru * rv * 4 * sizeof(float);
-    size_t metaBytes   = (size_t)np * 3 * sizeof(int);   // PatchInfo = 3 ints, no padding
-    size_t outBytes    = (size_t)total_verts * 6 * sizeof(float);
-    size_t binomUBytes = (size_t)ru * sizeof(int), binomVBytes = (size_t)rv * sizeof(int);
+    // cps byte size follows from the meta (Σ ru*rv*4 floats) — mixed CP grids
+    // per patch are allowed since each block reads its own ru/rv/cpOff.
+    size_t cpsBytes = 0;
+    for (int i = 0; i < np; i++)
+        cpsBytes += (size_t)meta[i].ru * meta[i].rv * 4 * sizeof(float);
+    size_t metaBytes = (size_t)np * 6 * sizeof(int);   // ScenePatchMeta = 6 ints, no padding
+    size_t outBytes  = (size_t)total_verts * 6 * sizeof(float);
 
     dim3 block(BLOCK_SIZE, BLOCK_SIZE);   // declared before the gotos (C++ init bypass rule)
-    int useTC = (order_u >= 3 && order_v >= 3);
 
     // One-time (grow-only) allocations from the process-lifetime pool.
-    if (!ensurePool(g_devPool.d_CP,     g_devPool.cpCap,     cpsBytes)
-     || !ensurePool(g_devPool.d_V,      g_devPool.vCap,      outBytes)
-     || !ensurePool(g_devPool.d_meta,   g_devPool.metaCap,   metaBytes)
-     || !ensurePool(g_devPool.d_binomU, g_devPool.binomUCap, binomUBytes)
-     || !ensurePool(g_devPool.d_binomV, g_devPool.binomVCap, binomVBytes)) {
-        free(binom_u); free(binom_v);
+    if (!ensurePool(g_devPool.d_CP,   g_devPool.cpCap,   cpsBytes)
+     || !ensurePool(g_devPool.d_V,    g_devPool.vCap,    outBytes)
+     || !ensurePool(g_devPool.d_meta, g_devPool.metaCap, metaBytes)) {
         memset(V_out, 0, outBytes);  // zeros beat garbage on the (OOM-only) failure path
         return;
     }
@@ -352,17 +355,14 @@ void eval_bezier_patches_batched(const float* cps, const PatchInfo* info, int np
     cudaError_t e;
     e=cudaMemcpy(g_devPool.d_CP, cps, cpsBytes, cudaMemcpyHostToDevice);
     if(e!=cudaSuccess){fprintf(stderr,"  [CUDA] memcpy H2D cps failed: %s\n",cudaGetErrorString(e));goto cleanup;}
-    e=cudaMemcpy(g_devPool.d_meta, info, metaBytes, cudaMemcpyHostToDevice);
+    e=cudaMemcpy(g_devPool.d_meta, meta, metaBytes, cudaMemcpyHostToDevice);
     if(e!=cudaSuccess){fprintf(stderr,"  [CUDA] memcpy H2D meta failed: %s\n",cudaGetErrorString(e));goto cleanup;}
-    e=cudaMemcpy(g_devPool.d_binomU, binom_u, binomUBytes, cudaMemcpyHostToDevice);
-    e=cudaMemcpy(g_devPool.d_binomV, binom_v, binomVBytes, cudaMemcpyHostToDevice);
 
-    eval_patches<<<np, block>>>(g_devPool.d_CP, g_devPool.d_V, g_devPool.d_meta,
-                                ru, rv, useTC, g_devPool.d_binomU, g_devPool.d_binomV);
+    eval_patches<<<np, block>>>(g_devPool.d_CP, g_devPool.d_V, g_devPool.d_meta);
     e=cudaGetLastError();
     if(e!=cudaSuccess) fprintf(stderr,"  [CUDA] kernel failed: %s\n",cudaGetErrorString(e));
     e=cudaMemcpy(V_out, g_devPool.d_V, outBytes, cudaMemcpyDeviceToHost);
     if(e!=cudaSuccess){fprintf(stderr,"  [CUDA] memcpy D2H failed: %s\n",cudaGetErrorString(e));memset(V_out,0,outBytes);}
 cleanup:
-    free(binom_u); free(binom_v);
+    ;
 }
