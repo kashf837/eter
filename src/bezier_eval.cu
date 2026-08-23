@@ -284,11 +284,43 @@ __global__ void eval_patches(
     }
 }
 
+// ---- Process-lifetime device buffer pool ----
+// Per-surface eval used to allocate + free 5 device buffers per surface
+// (3506 surfaces ≈ 35k cudaMalloc/cudaFree ≈ ~1s of WDDM driver latency).
+// The buffers are fully overwritten on every use, so a static pool that only
+// grows to the largest size seen so far is correct and needs no resets.
+// The CUDA context reclaims the memory at process exit — no explicit frees.
+namespace {
+struct DevPool {
+    float* d_CP     = nullptr; size_t cpCap     = 0;
+    float* d_V      = nullptr; size_t vCap      = 0;
+    int*   d_meta   = nullptr; size_t metaCap   = 0;
+    int*   d_binomU = nullptr; size_t binomUCap = 0;
+    int*   d_binomV = nullptr; size_t binomVCap = 0;
+};
+DevPool g_devPool;
+
+// Grow-only pool access: reallocates only on record-breaking sizes (typically
+// <10 per buffer over a whole run — every later surface reuses the largest).
+template<typename T>
+bool ensurePool(T*& ptr, size_t& cap, size_t bytes) {
+    if (bytes <= cap) return true;
+    if (ptr) cudaFree(ptr);
+    cudaError_t e = cudaMalloc(&ptr, bytes);
+    if (e == cudaSuccess) { cap = bytes; return true; }
+    ptr = nullptr; cap = 0;
+    fprintf(stderr, "  [CUDA] pool grow to %zu bytes failed: %s\n", bytes, cudaGetErrorString(e));
+    return false;
+}
+}  // namespace
+
 // Evaluate all patches of one surface in a single GPU round trip. The old
 // per-patch eval_bezier_patch made 13 CUDA API calls per patch (4 allocs +
 // 3 H2D + 1 launch + 1 blocking D2H + 4 frees ≈ 680µs each on WDDM = 39s
 // for 57k patches); this needs one cudaMalloc group + one H2D + one launch +
-// one D2H for the whole surface.
+// one D2H for the whole surface. All device buffers now come from the
+// process-lifetime pool above, so the remaining per-surface cost is
+// 4 memcpys + 1 launch + 1 blocking D2H (the D2H waits for the kernel).
 void eval_bezier_patches_batched(const float* cps, const PatchInfo* info, int np,
                                  int ru, int rv, float* V_out, int total_verts)
 {
@@ -303,34 +335,34 @@ void eval_bezier_patches_batched(const float* cps, const PatchInfo* info, int np
     size_t outBytes    = (size_t)total_verts * 6 * sizeof(float);
     size_t binomUBytes = (size_t)ru * sizeof(int), binomVBytes = (size_t)rv * sizeof(int);
 
-    float *d_CP=0, *d_V=0; int *d_meta=0, *d_binom_u=0, *d_binom_v=0;
     dim3 block(BLOCK_SIZE, BLOCK_SIZE);   // declared before the gotos (C++ init bypass rule)
     int useTC = (order_u >= 3 && order_v >= 3);
-    cudaError_t e;
-    e=cudaMalloc(&d_CP, cpsBytes);
-    if(e!=cudaSuccess){fprintf(stderr,"  [CUDA] cudaMalloc d_CP failed: %s\n",cudaGetErrorString(e));goto cleanup;}
-    e=cudaMalloc(&d_V, outBytes);
-    if(e!=cudaSuccess){fprintf(stderr,"  [CUDA] cudaMalloc d_V failed: %s\n",cudaGetErrorString(e));goto cleanup;}
-    e=cudaMalloc(&d_meta, metaBytes);
-    if(e!=cudaSuccess){fprintf(stderr,"  [CUDA] cudaMalloc d_meta failed: %s\n",cudaGetErrorString(e));goto cleanup;}
-    e=cudaMalloc(&d_binom_u, binomUBytes);
-    if(e!=cudaSuccess){fprintf(stderr,"  [CUDA] cudaMalloc d_binom_u failed: %s\n",cudaGetErrorString(e));goto cleanup;}
-    e=cudaMalloc(&d_binom_v, binomVBytes);
-    if(e!=cudaSuccess){fprintf(stderr,"  [CUDA] cudaMalloc d_binom_v failed: %s\n",cudaGetErrorString(e));goto cleanup;}
-    e=cudaMemcpy(d_CP, cps, cpsBytes, cudaMemcpyHostToDevice);
-    if(e!=cudaSuccess){fprintf(stderr,"  [CUDA] memcpy H2D cps failed: %s\n",cudaGetErrorString(e));goto cleanup;}
-    e=cudaMemcpy(d_meta, info, metaBytes, cudaMemcpyHostToDevice);
-    if(e!=cudaSuccess){fprintf(stderr,"  [CUDA] memcpy H2D meta failed: %s\n",cudaGetErrorString(e));goto cleanup;}
-    e=cudaMemcpy(d_binom_u, binom_u, binomUBytes, cudaMemcpyHostToDevice);
-    e=cudaMemcpy(d_binom_v, binom_v, binomVBytes, cudaMemcpyHostToDevice);
 
-    eval_patches<<<np, block>>>(d_CP, d_V, d_meta, ru, rv, useTC, d_binom_u, d_binom_v);
+    // One-time (grow-only) allocations from the process-lifetime pool.
+    if (!ensurePool(g_devPool.d_CP,     g_devPool.cpCap,     cpsBytes)
+     || !ensurePool(g_devPool.d_V,      g_devPool.vCap,      outBytes)
+     || !ensurePool(g_devPool.d_meta,   g_devPool.metaCap,   metaBytes)
+     || !ensurePool(g_devPool.d_binomU, g_devPool.binomUCap, binomUBytes)
+     || !ensurePool(g_devPool.d_binomV, g_devPool.binomVCap, binomVBytes)) {
+        free(binom_u); free(binom_v);
+        memset(V_out, 0, outBytes);  // zeros beat garbage on the (OOM-only) failure path
+        return;
+    }
+
+    cudaError_t e;
+    e=cudaMemcpy(g_devPool.d_CP, cps, cpsBytes, cudaMemcpyHostToDevice);
+    if(e!=cudaSuccess){fprintf(stderr,"  [CUDA] memcpy H2D cps failed: %s\n",cudaGetErrorString(e));goto cleanup;}
+    e=cudaMemcpy(g_devPool.d_meta, info, metaBytes, cudaMemcpyHostToDevice);
+    if(e!=cudaSuccess){fprintf(stderr,"  [CUDA] memcpy H2D meta failed: %s\n",cudaGetErrorString(e));goto cleanup;}
+    e=cudaMemcpy(g_devPool.d_binomU, binom_u, binomUBytes, cudaMemcpyHostToDevice);
+    e=cudaMemcpy(g_devPool.d_binomV, binom_v, binomVBytes, cudaMemcpyHostToDevice);
+
+    eval_patches<<<np, block>>>(g_devPool.d_CP, g_devPool.d_V, g_devPool.d_meta,
+                                ru, rv, useTC, g_devPool.d_binomU, g_devPool.d_binomV);
     e=cudaGetLastError();
     if(e!=cudaSuccess) fprintf(stderr,"  [CUDA] kernel failed: %s\n",cudaGetErrorString(e));
-    e=cudaMemcpy(V_out, d_V, outBytes, cudaMemcpyDeviceToHost);
+    e=cudaMemcpy(V_out, g_devPool.d_V, outBytes, cudaMemcpyDeviceToHost);
     if(e!=cudaSuccess){fprintf(stderr,"  [CUDA] memcpy D2H failed: %s\n",cudaGetErrorString(e));memset(V_out,0,outBytes);}
 cleanup:
-    if(d_CP) cudaFree(d_CP); if(d_V) cudaFree(d_V); if(d_meta) cudaFree(d_meta);
-    if(d_binom_u) cudaFree(d_binom_u); if(d_binom_v) cudaFree(d_binom_v);
     free(binom_u); free(binom_v);
 }
