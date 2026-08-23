@@ -10,11 +10,12 @@
 #include <filesystem>
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 #include <backends/imgui_impl_vulkan.h>
 
-#include "nurbs.h"  // nurbs_wireframe()
+#include "nurbs.h"  // nurbs_adaptive_eval / nurbs_adaptive_eval_cached
 #include <nvapp/application.hpp>
 #include <nvapp/elem_profiler.hpp>
 #include <nvapp/elem_logger.hpp>
@@ -70,12 +71,25 @@ struct Mesh {
     float cz() const { return (bbMin[2]+bbMax[2])*0.5f; }
 };
 
-// Cached Bézier decomposition of one .surf file: uncentered CPs + grid dims.
-// Survives across adaptive rebuilds so we don't redo file I/O + NURBS→Bézier
-// knot insertion every time the camera settles (ETER §4 rebuild cache).
-struct BezierCache {
+// Cached Bézier decomposition of one .surf surface: uncentered CPs + grid dims.
+struct BezierSurface {
     std::vector<float> cps;  // nu*nv patches × ru*rv vec4s (xyz+w), uncentered
     int nu = 0, nv = 0, ru = 0, rv = 0;
+};
+// Cached Bézier decomposition of the loaded scene: single file = 1 surface,
+// STP dir = N surfaces. Invariant: surfaces[i] corresponds to the i-th
+// addPatchGrid batch of the initial mesh, same order — SSBO meta offsets
+// depend on it, so rebuilds must replay this order. Only source for rebuilds
+// (dir temp files are deleted after load). Survives across rebuilds so we
+// don't redo file I/O + NURBS→Bézier knot insertion (ETER §4 rebuild cache).
+struct BezierCache {
+    std::vector<BezierSurface> surfaces;
+    bool empty() const { return surfaces.empty(); }
+    size_t cpsFloats() const {
+        size_t n = 0;
+        for (const BezierSurface& s : surfaces) n += s.cps.size();
+        return n;
+    }
 };
 
 // ============================================================
@@ -84,43 +98,42 @@ struct BezierCache {
 class MeshBuilder {
 public:
 
+    // Load a single .surf file: adaptive eval → fill cache → addPatchGrid.
     static Mesh loadFile(const char* path, const CameraParams* cam, BezierCache* cache = nullptr) {
         Mesh m; resetBBox(m);
-        int nu, nv, total, ru = 0, rv = 0;
-        PatchInfo* info;
-        float* bezierCPs = nullptr;
-        float* verts = nurbs_adaptive_eval(path, cam, &nu, &nv, &info, &total, &ru, &rv, &bezierCPs);
-        if (!verts) { fprintf(stderr, "  [SKIP] %s\n", path); return m; }
-        // Save the uncentered Bézier CPs for the rebuild path (adaptive)
-        // before they are freed — reusing them skips file I/O + knot insertion.
-        if (cache && bezierCPs) {
-            int cpFloats = nu * nv * ru * rv * 4;
-            cache->cps.assign(bezierCPs, bezierCPs + cpFloats);
-            cache->nu = nu; cache->nv = nv; cache->ru = ru; cache->rv = rv;
-        }
-        // CUDA gives per-patch {tu, tv, offset} — feed them straight to the
-        // shared grid builder (same routine as the uniform wireframe path).
-        addPatchGrid(m, verts, bezierCPs, info, nu, nv, ru, rv);
-        free(verts); free(bezierCPs); free(info);
-        LOGI("Load %s: %d verts, %d tris, %d patches\n", path, m.verts(), (int)(m.i.size()/3), m.patchCount);
+        int tuMin = 999, tuMax = 0, tvMin = 999, tvMax = 0;
+        if (!appendSurface(m, path, cam, cache, &tuMin, &tuMax, &tvMin, &tvMax))
+            return m;  // [SKIP] already printed inside appendSurface
+        LOGI("Load %s: %d verts, %d tris, %d patches, tu=[%d,%d] tv=[%d,%d]\n",
+             path, m.verts(), (int)(m.i.size()/3), m.patchCount, tuMin, tuMax, tvMin, tvMax);
         return m;
     }
 
-    // Camera-moved rebuild: same adaptive eval, but from cached Bézier CPs —
-    // skips .surf file I/O and NURBS→Bézier knot insertion.
+    // Camera-moved rebuild: replay all cached surfaces through the adaptive
+    // eval (skips .surf file I/O and NURBS→Bézier knot insertion). Same
+    // surface order as the initial load → identical cp/meta layout, so the
+    // existing SSBOs stay valid (uploadMesh skips re-uploading them).
     static Mesh adaptive(const BezierCache& cache, const CameraParams* cam) {
         Mesh m; resetBBox(m);
-        PatchInfo* info; int total;
-        float* verts = nurbs_adaptive_eval_cached(cache.cps.data(), cache.nu, cache.nv,
-                                                  cache.ru, cache.rv, cam, &info, &total);
-        if (!verts) return m;
-        addPatchGrid(m, verts, cache.cps.data(), info, cache.nu, cache.nv, cache.ru, cache.rv);
-        free(verts); free(info);
-        LOGI("Adaptive (cached) %d verts, %d tris, %d patches\n", m.verts(), (int)(m.i.size()/3), m.patchCount);
+        int tuMin = 999, tuMax = 0, tvMin = 999, tvMax = 0;
+        for (const BezierSurface& s : cache.surfaces) {
+            PatchInfo* info; int total;
+            float* verts = nurbs_adaptive_eval_cached(s.cps.data(), s.nu, s.nv,
+                                                      s.ru, s.rv, cam, &info, &total);
+            if (!verts) { fprintf(stderr, "  [SKIP] cached surface (nu=%d nv=%d)\n", s.nu, s.nv); continue; }
+            accumTessRange(info, s.nu * s.nv, &tuMin, &tuMax, &tvMin, &tvMax);
+            addPatchGrid(m, verts, s.cps.data(), info, s.nu, s.nv, s.ru, s.rv);
+            free(verts); free(info);
+        }
+        if (m.patchCount > 0)
+            LOGI("Adaptive (cached) %d verts, %d tris, %d patches, tu=[%d,%d] tv=[%d,%d]\n",
+                 m.verts(), (int)(m.i.size()/3), m.patchCount, tuMin, tuMax, tvMin, tvMax);
         return m;
     }
 
-    static Mesh directory(const char* dirPath, int res = 32) {
+    // Load a directory of .surf files (STEP conversion output): adaptive eval
+    // per surface, filling the cache in the same order patches are appended.
+    static Mesh directory(const char* dirPath, const CameraParams* cam, BezierCache* cache) {
         namespace fs = std::filesystem;
         Mesh m; resetBBox(m);
         std::vector<std::string> files;
@@ -128,23 +141,18 @@ public:
             if (e.is_regular_file() && e.path().extension() == ".surf")
                 files.push_back(e.path().string());
         std::sort(files.begin(), files.end());
-        LOGI("Loading %zu surf files (res=%d)...\n", files.size(), res);
+        LOGI("Loading %zu surf files (adaptive)...\n", files.size());
         if (files.empty()) {
             LOGI("WARNING: no .surf files in %s — STEP conversion may have failed\n", dirPath);
         }
-        int skipped = 0;
+        int skipped = 0, tuMin = 999, tuMax = 0, tvMin = 999, tvMax = 0;
         for (size_t i = 0; i < files.size(); i++) {
             if ((i+1) % 500 == 0) LOGI("  [%zu/%zu] ...\n", i+1, files.size());
-            int nu, nv, ru = 0, rv = 0; float* cp = nullptr;
-            float* verts = nurbs_wireframe(files[i].c_str(), res, &nu, &nv, &ru, &rv, &cp);
-            if (!verts) { skipped++; free(cp); fprintf(stderr, "  [SKIP %d] %s\n", skipped, files[i].c_str()); continue; }
-            // Uniform wireframe: every patch is res×res — synthesize PatchInfo.
-            std::vector<PatchInfo> info(nu * nv);
-            for (int k = 0; k < nu * nv; k++) info[k] = {res, res, k * res * res};
-            addPatchGrid(m, verts, cp, info.data(), nu, nv, ru, rv);
-            free(verts); free(cp);
+            if (!appendSurface(m, files[i].c_str(), cam, cache, &tuMin, &tuMax, &tvMin, &tvMax)) skipped++;
         }
-        LOGI("Done: %d verts, %d tris, %d skipped\n", m.verts(), (int)(m.i.size()/3), skipped);
+        LOGI("Done: %d verts, %d tris, %d patches, tu=[%d,%d] tv=[%d,%d], %d skipped, cache=%.1f MB\n",
+             m.verts(), (int)(m.i.size()/3), m.patchCount, tuMin, tuMax, tvMin, tvMax, skipped,
+             cache ? cache->cpsFloats() * 4.0f / (1024.f * 1024.f) : 0.0);
         return m;
     }
 private:
@@ -154,10 +162,44 @@ private:
         m.bbMax[0]=m.bbMax[1]=m.bbMax[2]=-1e30f;
     }
 
-    // Append one file's patches to m. Both loading paths describe each patch as
-    // {tu, tv, offset} (PatchInfo), so this one routine covers them: adaptive
-    // gets per-patch densities from CUDA, uniform wireframe synthesizes
-    // tu=tv=res with a uniform offset stride.
+    // Load one .surf into the mesh via adaptive eval, and cache its uncentered
+    // Bézier CPs for rebuilds. On failure nothing is appended — mesh and cache
+    // stay in sync (both skip the surface).
+    static bool appendSurface(Mesh& m, const char* path, const CameraParams* cam,
+                              BezierCache* cache,
+                              int* tuMin = nullptr, int* tuMax = nullptr,
+                              int* tvMin = nullptr, int* tvMax = nullptr) {
+        int nu, nv, total, ru = 0, rv = 0;
+        PatchInfo* info;
+        float* bezierCPs = nullptr;
+        float* verts = nurbs_adaptive_eval(path, cam, &nu, &nv, &info, &total, &ru, &rv, &bezierCPs);
+        if (!verts) { fprintf(stderr, "  [SKIP] %s\n", path); return false; }
+        if (cache && bezierCPs) {
+            BezierSurface s;
+            s.cps.assign(bezierCPs, bezierCPs + nu * nv * ru * rv * 4);
+            s.nu = nu; s.nv = nv; s.ru = ru; s.rv = rv;
+            cache->surfaces.push_back(std::move(s));
+        }
+        if (tuMin && tuMax && tvMin && tvMax)
+            accumTessRange(info, nu * nv, tuMin, tuMax, tvMin, tvMax);
+        addPatchGrid(m, verts, bezierCPs, info, nu, nv, ru, rv);
+        free(verts); free(bezierCPs); free(info);
+        return true;
+    }
+
+    // Accumulate per-patch tess factor ranges from one surface's PatchInfo batch.
+    static void accumTessRange(const PatchInfo* info, int n,
+                               int* tuMin, int* tuMax, int* tvMin, int* tvMax) {
+        for (int k = 0; k < n; k++) {
+            if (info[k].tu < *tuMin) *tuMin = info[k].tu;
+            if (info[k].tu > *tuMax) *tuMax = info[k].tu;
+            if (info[k].tv < *tvMin) *tvMin = info[k].tv;
+            if (info[k].tv > *tvMax) *tvMax = info[k].tv;
+        }
+    }
+
+    // Append one file's patches to m. Every patch is described as
+    // {tu, tv, offset} (PatchInfo) coming straight from the adaptive CUDA eval.
     static void addPatchGrid(Mesh& m, const float* verts, const float* cp,
                              const PatchInfo* info, int nu, int nv, int ru, int rv) {
         // Append CPs (pre-centering) for global indexing.
@@ -298,6 +340,7 @@ public:
                 if (lower.ends_with(".stp") || lower.ends_with(".step")) {
                     auto stem = path.stem().string();
                     m_tempDir = (path.parent_path() / (stem + "_parts")).string();
+                    std::filesystem::remove_all(m_tempDir);  // drop stale *_parts from a previous conversion
                     std::filesystem::create_directory(m_tempDir);
                     std::string cmd = "python scripts/step2surf.py --all \"" + sp + "\" \"" + m_tempDir + "/out\"";
                     LOGI("Converting STEP...\n");
@@ -354,7 +397,7 @@ public:
     m_profilerTimeline->frameAdvance();
     // Adaptive re-tessellation (ETER §4): rebuild when camera settles.
     // Idle-counter approach: reset on any camera movement, rebuild after N idle frames.
-    if (!m_lastPath.empty() && m_indexCount > 0) {
+    if (!m_bezierCache.empty() && m_indexCount > 0) {
         glm::dvec3 e = m_camera->getEye();
         float dx=(float)e.x-m_lastEye[0], dy=(float)e.y-m_lastEye[1], dz=(float)e.z-m_lastEye[2];
         float dist = sqrtf(dx*dx+dy*dy+dz*dz);
@@ -367,26 +410,44 @@ public:
             m_idleFrames++;
         }
 
-        if (m_idleFrames == 60) {  // ~1s idle @60fps → rebuild
+        if (m_idleFrames == 60) {  // ~1s idle @60fps → maybe rebuild
             float rdx=(float)e.x-m_rebuildEye[0], rdy=(float)e.y-m_rebuildEye[1], rdz=(float)e.z-m_rebuildEye[2];
             float rdist = sqrtf(rdx*rdx+rdy*rdy+rdz*rdz);
-            if (rdist > m_modelScale * 0.01f) {  // worth rebuilding
+            float mx=(float)e.x-m_center[0], my=(float)e.y-m_center[1], mz=(float)e.z-m_center[2];
+            float distToModel = sqrtf(mx*mx+my*my+mz*mz);
+            // tu ∝ 1/√(patch distance) and is quantized to multiples of 8, so
+            // a tess level change needs the distance to change ~4× (8→16
+            // needs 1/4 the distance). Only rebuild when the zoom ratio since
+            // the last rebuild crossed 2× (either way) or after a large
+            // lateral move — anything smaller changes no patch and just
+            // wastes a rebuild.
+            float dRatio = m_rebuildDist > 0.f ? distToModel / m_rebuildDist : 0.f;
+            bool worthIt = (m_rebuildDist <= 0.f)   // first rebuild after load
+                        || (dRatio < 0.5f || dRatio > 2.0f)
+                        || (rdist > distToModel * 0.5f);
+            if (worthIt) {
                 CameraParams cam;
                 cam.camX = (float)e.x; cam.camY = (float)e.y; cam.camZ = (float)e.z;
                 cam.fovY = 60.f; cam.scrW = m_imgW; cam.scrH = m_imgH;
-                // Rebuild from cached Bézier CPs (no file I/O / knot insertion);
-                // fall back to a fresh load if the cache is missing.
-                Mesh m = m_bezierCache.cps.empty()
-                    ? MeshBuilder::loadFile(m_lastPath.c_str(), &cam)
-                    : MeshBuilder::adaptive(m_bezierCache, &cam);
+                // Rebuild from cached Bézier CPs (no file I/O / knot insertion).
+                // Cache is non-empty here (guard above) — for STP dirs the temp
+                // files are deleted, so the cache is the only source anyway.
+                auto t0 = std::chrono::steady_clock::now();
+                Mesh m = MeshBuilder::adaptive(m_bezierCache, &cam);
+                auto t1 = std::chrono::steady_clock::now();
                 if (!m.empty()) {
                     NVVK_CHECK(vkDeviceWaitIdle(m_app->getDevice()));
                     if (m_indexCount > 0) { m_alloc.destroyBuffer(m_indexBuffer); m_alloc.destroyBuffer(m_vertexBuffer); m_indexCount = 0; }
                     uploadMesh(m, false);  // CP/meta SSBOs unchanged — keep them
+                    auto t2 = std::chrono::steady_clock::now();
+                    LOGI("[Adaptive] timing: eval %.0f ms, upload %.0f ms\n",
+                         1e-3f * std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count(),
+                         1e-3f * std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count());
                     m_modelScale = m.scale();
                     m_center[0]=m.cx(); m_center[1]=m.cy(); m_center[2]=m.cz();
                     m_rebuildEye[0] = (float)e.x; m_rebuildEye[1] = (float)e.y; m_rebuildEye[2] = (float)e.z;
-                    LOGI("[Adaptive] rebuilt, %d verts\n", m.verts());
+                    m_rebuildDist = distToModel;
+                    LOGI("[Adaptive] rebuilt (%s), %d verts\n", m_lastPath.c_str(), m.verts());
                 }
             }
             m_idleFrames = 0;
@@ -661,8 +722,9 @@ private:
   float m_center[3] = {0,0,0};
   float m_lastEye[3] = {0,0,0};
   std::string m_lastPath;
-  BezierCache m_bezierCache;  // Bézier decomposition cache for adaptive rebuilds
+  BezierCache m_bezierCache;  // Bézier decomposition of the loaded scene (rebuild source)
   float m_rebuildEye[3] = {0,0,0};  // eye position at last rebuild
+  float m_rebuildDist = 0.f;        // distance to model center at last rebuild (0 = next rebuild always fires)
   int   m_idleFrames = 0;          // consecutive frames with negligible camera movement
   #pragma endregion
 
@@ -1135,21 +1197,16 @@ private:
         m_alloc.destroyBuffer(m_vertexBuffer);
         m_indexCount = 0;
     }
-    Mesh m;
-    if (isDir) {
-        m_bezierCache = {};  // dirs don't rebuild adaptively → drop any cache
-        m = MeshBuilder::directory(path.c_str(), 16);  // lower res for multi-file STP
-    }
-    else {
-        CameraParams cam;
+    m_bezierCache = {};  // refill from scratch on every load (file and dir alike)
+    CameraParams cam;
+    {
         glm::dvec3 eye = m_camera->getEye();
         if (eye.x > 5.f || eye.x < -5.f) eye = {0.f, 0.f, -2.f};
         cam.camX=(float)eye.x; cam.camY=(float)eye.y; cam.camZ=(float)eye.z;
         cam.fovY=60.f; cam.scrW=m_imgW; cam.scrH=m_imgH;
-        BezierCache cache;
-        m = MeshBuilder::loadFile(path.c_str(), &cam, &cache);
-        m_bezierCache = std::move(cache);  // empty on failure → clears stale cache
     }
+    Mesh m = isDir ? MeshBuilder::directory(path.c_str(), &cam, &m_bezierCache)
+                   : MeshBuilder::loadFile(path.c_str(), &cam, &m_bezierCache);
 
     if (!m.empty()) {
         uploadMesh(m);
@@ -1161,11 +1218,15 @@ private:
         m_camera->setWindowSize({(uint32_t)m_imgW,(uint32_t)m_imgH});
         LOGI("Camera: center=(%.1f,%.1f,%.1f) scale=%.1f dist=%.1f\n",
              m_center[0],m_center[1],m_center[2],m_modelScale,dist);
-      glm::dvec3 e = m_camera->getEye();
-      m_lastEye[0]=(float)e.x; m_lastEye[1]=(float)e.y; m_lastEye[2]=(float)e.z;
-      m_rebuildEye[0]=(float)e.x; m_rebuildEye[1]=(float)e.y; m_rebuildEye[2]=(float)e.z;
-      // Adaptive re-tessellation only for single .surf files (STP dirs = fixed res)
-      m_lastPath = isDir ? "" : path;
+        glm::dvec3 e = m_camera->getEye();
+        m_lastEye[0]=(float)e.x; m_lastEye[1]=(float)e.y; m_lastEye[2]=(float)e.z;
+        // Initial tess was computed at THIS eye (pre-setLookat). Using it as the
+        // rebuild reference makes the camera jump trigger one corrective rebuild.
+        m_rebuildEye[0]=cam.camX; m_rebuildEye[1]=cam.camY; m_rebuildEye[2]=cam.camZ;
+        m_rebuildDist = 0.f;  // first rebuild after load always fires (initial tess used a pre-setLookat eye)
+        m_lastPath = path;  // dirs too — marker + log only (temp files are deleted)
+        LOGI("Cache: %zu surfaces, %.1f MB\n", m_bezierCache.surfaces.size(),
+             m_bezierCache.cpsFloats() * 4.0f / (1024.f * 1024.f));
     }
     if (isDir) std::filesystem::remove_all(path);
   }
@@ -1225,7 +1286,10 @@ private:
     m_stagingUploader.releaseStaging();
     m_indexCount = (uint32_t)m.i.size();
     m_patchCols  = m.patchCols > 0 ? m.patchCols : 1;
-    LOGI("Uploaded: %d verts, %d tris, %d CPs\n", m.verts(), (int)(m.i.size()/3), (int)m.cp.size());
+    if (uploadSSBO)
+        LOGI("Uploaded: %d verts, %d tris, %d CPs\n", m.verts(), (int)(m.i.size()/3), (int)m.cp.size());
+    else
+        LOGI("Uploaded: %d verts, %d tris (SSBO skipped)\n", m.verts(), (int)(m.i.size()/3));
   }
 
   // ============================================================
