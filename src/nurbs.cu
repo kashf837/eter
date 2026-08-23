@@ -92,6 +92,7 @@ static void nurbs_to_beziers(NurbsSurf* s) {
 
 float* nurbs_wireframe(const char* surf_path, int res,
                        int* np_u_out, int* np_v_out,
+                       int* ru_out, int* rv_out,
                        float** cp_out)
 {
     NurbsSurf* s = read_surf(surf_path);
@@ -102,8 +103,9 @@ float* nurbs_wireframe(const char* surf_path, int res,
     int ru = s->p_u + 1, rv = s->p_v + 1;
     int np_u = (s->n_u + 1) / ru, np_v = (s->n_v + 1) / rv;
     *np_u_out = np_u; *np_v_out = np_v;
+    *ru_out = ru; *rv_out = rv;
     int np = np_u * np_v;
-    int cpsPerPatch = ru * rv * 4;  // 64 for bicubic
+    int cpsPerPatch = ru * rv * 4;  // e.g. 64 for bicubic
 
     float* verts = (float*)malloc(np * res * res * 6 * sizeof(float));
     BezierPatch bp = {s->p_u, s->p_v, (float*)malloc(cpsPerPatch * sizeof(float))};
@@ -147,7 +149,7 @@ float* nurbs_wireframe(const char* surf_path, int res,
 
 float* nurbs_adaptive_eval(const char* surf_path, const CameraParams* cam,
                            int* np_u, int* np_v, PatchInfo** info_out, int* total_verts,
-                           float** cp_out)
+                           int* ru_out, int* rv_out, float** cp_out)
 {
     NurbsSurf* s = read_surf(surf_path);
     if (!s) return NULL;
@@ -157,8 +159,9 @@ float* nurbs_adaptive_eval(const char* surf_path, const CameraParams* cam,
     int ru = s->p_u + 1, rv = s->p_v + 1;
     int nu = (s->n_u + 1) / ru, nv = (s->n_v + 1) / rv;
     *np_u = nu; *np_v = nv;
+    *ru_out = ru; *rv_out = rv;
     int np = nu * nv;
-    int cpsPerPatch = ru * rv * 4;  // 64 for bicubic
+    int cpsPerPatch = ru * rv * 4;  // e.g. 64 for bicubic
 
     PatchInfo* info = (PatchInfo*)malloc(np * sizeof(PatchInfo));
     BezierPatch bp = {s->p_u, s->p_v, (float*)malloc(cpsPerPatch * sizeof(float))};

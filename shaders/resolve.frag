@@ -31,6 +31,12 @@ layout(std140, set = 1, binding = 0) uniform Lighting {
 layout(std430, set = 2, binding = 0) buffer BezierData {
     vec4 bezierCP[];
 };
+layout(std430, set = 2, binding = 1) buffer PatchMeta {
+    uvec4 patchMeta[];   // per patch: {cpOffsetInVec4, ru, rv, 0}, ru/rv = orders (p+1)
+};
+
+// Max degree accepted by read_surf (p <= 20), so order (p+1) <= 21.
+const int MAXP1 = 21;
 
 // ============================================================
 // Cubic Bernstein polynomials
@@ -53,7 +59,39 @@ void bernsteinDeriv(float t, out float dB[4])
     dB[3] =  3.0 * t * t;
 }
 
-void evalBezier(uint patchID, vec2 uv, out vec3 pos, out vec3 norm)
+// Generic Bernstein basis of degree n via the triangular scheme:
+//   B_i^n(t) = (1-t) * B_i^{n-1}(t) + t * B_{i-1}^{n-1}(t)
+// Derivative: dB_i = n * (B_{i-1}^{n-1} - B_i^{n-1})  (B_-1 = B_n = 0)
+void bernsteinGeneric(int n, float t, out float B[MAXP1], out float dB[MAXP1])
+{
+    n = max(n, 1);   // degree 0 cannot reach here (read_surf requires p >= 1)
+    float t1 = 1.0 - t;
+
+    // Degree n-1 basis (kept for the derivative formula)
+    float Bp[MAXP1];
+    Bp[0] = 1.0;
+    for (int j = 1; j <= n - 1; j++) Bp[j] = 0.0;
+    for (int d = 1; d < n; d++) {
+        for (int j = d; j > 0; j--)
+            Bp[j] = t1 * Bp[j] + t * Bp[j - 1];
+        Bp[0] *= t1;
+    }
+
+    // Degree n basis: one more triangular level
+    B[0] = 1.0;
+    for (int j = 1; j <= n; j++) B[j] = 0.0;
+    for (int j = n; j > 0; j--)
+        B[j] = t1 * B[j] + t * B[j - 1];
+    B[0] *= t1;
+
+    dB[0] = -float(n) * Bp[0];
+    for (int i = 1; i < n; i++) dB[i] = float(n) * (Bp[i - 1] - Bp[i]);
+    dB[n] = float(n) * Bp[n - 1];
+}
+
+// Cubic fast path (ru == rv == 4): identical to the original specialized
+// code — no large basis arrays, minimal register pressure.
+void evalBezierCubic(uint base, vec2 uv, out vec3 pos, out vec3 norm)
 {
     float u = clamp(uv.x, 0.0, 1.0);
     float v = clamp(uv.y, 0.0, 1.0);
@@ -64,7 +102,6 @@ void evalBezier(uint patchID, vec2 uv, out vec3 pos, out vec3 norm)
     bernsteinDeriv(u, dBu);
     bernsteinDeriv(v, dBv);
 
-    uint base = patchID * 16u;
     vec4 Sw  = vec4(0.0);
     vec4 dSu = vec4(0.0);
     vec4 dSv = vec4(0.0);
@@ -87,6 +124,53 @@ void evalBezier(uint patchID, vec2 uv, out vec3 pos, out vec3 norm)
     vec3 du = (dSu.xyz * Sw.w - Sw.xyz * dSu.w) * invW2;
     vec3 dv = (dSv.xyz * Sw.w - Sw.xyz * dSv.w) * invW2;
     norm = normalize(cross(du, dv));
+}
+
+// Generic path for arbitrary degree (order ru/rv from per-patch meta).
+void evalBezierGeneric(uvec4 meta, vec2 uv, out vec3 pos, out vec3 norm)
+{
+    float u = clamp(uv.x, 0.0, 1.0);
+    float v = clamp(uv.y, 0.0, 1.0);
+    int ru = int(meta.y);
+    int rv = int(meta.z);
+
+    float Bu[MAXP1], Bv[MAXP1], dBu[MAXP1], dBv[MAXP1];
+    bernsteinGeneric(ru - 1, u, Bu, dBu);
+    bernsteinGeneric(rv - 1, v, Bv, dBv);
+
+    uint base = meta.x;
+    vec4 Sw  = vec4(0.0);
+    vec4 dSu = vec4(0.0);
+    vec4 dSv = vec4(0.0);
+
+    for (int i = 0; i < ru; i++) {
+        for (int j = 0; j < rv; j++) {
+            vec4 cp   = bezierCP[base + uint(i * rv + j)];
+            float wb  = Bu[i]  * Bv[j]  * cp.w;
+            float wbu = dBu[i] * Bv[j]  * cp.w;
+            float wbv = Bu[i]  * dBv[j] * cp.w;
+            Sw.xyz  += cp.xyz * wb;   Sw.w  += wb;
+            dSu.xyz += cp.xyz * wbu;  dSu.w += wbu;
+            dSv.xyz += cp.xyz * wbv;  dSv.w += wbv;
+        }
+    }
+
+    pos = Sw.xyz / Sw.w;
+
+    float invW2 = 1.0 / (Sw.w * Sw.w);
+    vec3 du = (dSu.xyz * Sw.w - Sw.xyz * dSu.w) * invW2;
+    vec3 dv = (dSv.xyz * Sw.w - Sw.xyz * dSv.w) * invW2;
+    norm = normalize(cross(du, dv));
+}
+
+// Dispatcher: cubic patches take the fast path, everything else is generic.
+void evalBezier(uint patchID, vec2 uv, out vec3 pos, out vec3 norm)
+{
+    uvec4 meta = patchMeta[patchID];
+    if (meta.y == 4u && meta.z == 4u)
+        evalBezierCubic(meta.x, uv, pos, norm);
+    else
+        evalBezierGeneric(meta, uv, pos, norm);
 }
 
 // ============================================================

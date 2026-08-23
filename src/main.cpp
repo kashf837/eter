@@ -1,7 +1,7 @@
 // ETER — NURBS real-time rendering (ETER §6.1 Visibility Buffer)
 // Architecture: NURBS .surf → knot insertion → Bezier patches → GPU eval
 //   → Vulkan triangle mesh → [Pass 1: G-buffer] → [Pass 2: Resolve] → ImGui display
-// G-buffer stores per-pixel (worldPos, worldNormal, patchID) for deferred lighting.
+// G-buffer stores per-pixel (worldPos, worldNormal, patchID, uv) for deferred lighting.
 #define VMA_IMPLEMENTATION
 
 #pragma region Includes
@@ -54,14 +54,15 @@ static_assert(sizeof(Lighting) == 32, "Lighting must be 32 bytes (2 vec4)");
 // Mesh — host-side triangle mesh data
 // ============================================================
 struct Mesh {
-    std::vector<float>    v;  // interleaved xyz+nxnynz+uv+patchID (9 floats/vertex)
+    std::vector<float>    v;  // interleaved xyz+nxnynz+uv+patchID+gridXY (11 floats/vertex)
     std::vector<uint32_t> i;  // triangle indices
-    std::vector<float>    cp; // Bézier CPs: 64 floats per patch (xyz+w × 16)
+    std::vector<float>    cp;   // Bézier CPs: ru*rv vec4s per patch (xyz+w), layout per meta[]
+    std::vector<uint32_t> meta; // per patch: {cpOffsetInVec4, ru, rv, 0}, same order as patchID
     float bbMin[3], bbMax[3];
     int   patchCount = 0;
     int   patchCols  = 0;  // nv: patches per row, for SSBO index decoding
     bool  empty() const { return i.empty(); }
-    int   verts() const { return (int)(v.size()/9); }
+    int   verts() const { return (int)(v.size()/11); }
     float scale() const { float dx=bbMax[0]-bbMin[0],dy=bbMax[1]-bbMin[1],dz=bbMax[2]-bbMin[2];
                            float s=dx>dy?dx:dy; s=s>dz?s:dz; return s<1.f?1.f:s; }
     float cx() const { return (bbMin[0]+bbMax[0])*0.5f; }
@@ -77,27 +78,31 @@ public:
 
     static Mesh adaptive(const char* path, const CameraParams* cam) {
         Mesh m; resetBBox(m);
-        int nu, nv, total;
+        int nu, nv, total, ru = 0, rv = 0;
         PatchInfo* info;
         float* bezierCPs = nullptr;
-        float* verts = nurbs_adaptive_eval(path, cam, &nu, &nv, &info, &total, &bezierCPs);
+        float* verts = nurbs_adaptive_eval(path, cam, &nu, &nv, &info, &total, &ru, &rv, &bezierCPs);
         if (!verts) { fprintf(stderr, "  [SKIP] %s\n", path); return m; }
         m.patchCount = nu * nv;
         if (bezierCPs) {
-            int cpFloats = m.patchCount * 64;
+            int cpsPerPatch = ru * rv * 4;  // floats per patch (e.g. 64 for bicubic)
+            int cpFloats = m.patchCount * cpsPerPatch;
             m.cp.assign(bezierCPs, bezierCPs + cpFloats);
             free(bezierCPs);
+            // Per-patch metadata for the resolve shader: {cpOffsetInVec4, ru, rv, 0}
+            for (int p = 0; p < m.patchCount; p++)
+                m.meta.insert(m.meta.end(), {(uint32_t)(p * ru * rv), (uint32_t)ru, (uint32_t)rv, 0u});
             // Center each patch's CPs for FP32 precision in SSBO eval.
             // Translating all CPs by the same offset cancels in du/dv
             // (derivative of constant = 0), so normals are unchanged.
             for (int p = 0; p < m.patchCount; p++) {
-                float* cp = m.cp.data() + p * 64;
+                float* cp = m.cp.data() + p * cpsPerPatch;
                 float cx = 0, cy = 0, cz = 0;
-                for (int k = 0; k < 16; k++) {
+                for (int k = 0; k < ru * rv; k++) {
                     cx += cp[k*4+0]; cy += cp[k*4+1]; cz += cp[k*4+2];
                 }
-                cx /= 16.0f; cy /= 16.0f; cz /= 16.0f;
-                for (int k = 0; k < 16; k++) {
+                cx /= (float)(ru * rv); cy /= (float)(ru * rv); cz /= (float)(ru * rv);
+                for (int k = 0; k < ru * rv; k++) {
                     cp[k*4+0] -= cx; cp[k*4+1] -= cy; cp[k*4+2] -= cz;
                 }
             }
@@ -144,10 +149,10 @@ public:
 
     static Mesh single(const char* path, int res = 32) {
         Mesh m; resetBBox(m);
-        int nu, nv; float* cp = nullptr;
-        float* verts = nurbs_wireframe(path, res, &nu, &nv, &cp);
+        int nu, nv, ru = 0, rv = 0; float* cp = nullptr;
+        float* verts = nurbs_wireframe(path, res, &nu, &nv, &ru, &rv, &cp);
         if (!verts) { fprintf(stderr, "  [SKIP] %s\n", path); return m; }
-        addPatchGrid(m, verts, cp, nu, nv, res);
+        addPatchGrid(m, verts, cp, nu, nv, res, ru, rv);
         free(verts); free(cp);
         LOGI("Loaded %s: %d verts, %d tris\n", path, m.verts(), (int)(m.i.size()/3));
         return m;
@@ -168,10 +173,10 @@ public:
         int skipped = 0;
         for (size_t i = 0; i < files.size(); i++) {
             if ((i+1) % 500 == 0) LOGI("  [%zu/%zu] ...\n", i+1, files.size());
-            int nu, nv; float* cp = nullptr;
-            float* verts = nurbs_wireframe(files[i].c_str(), res, &nu, &nv, &cp);
+            int nu, nv, ru = 0, rv = 0; float* cp = nullptr;
+            float* verts = nurbs_wireframe(files[i].c_str(), res, &nu, &nv, &ru, &rv, &cp);
             if (!verts) { skipped++; free(cp); fprintf(stderr, "  [SKIP %d] %s\n", skipped, files[i].c_str()); continue; }
-            addPatchGrid(m, verts, cp, nu, nv, res);
+            addPatchGrid(m, verts, cp, nu, nv, res, ru, rv);
             free(verts); free(cp);
         }
         LOGI("Done: %d verts, %d tris, %d skipped\n", m.verts(), (int)(m.i.size()/3), skipped);
@@ -184,11 +189,17 @@ private:
         m.bbMax[0]=m.bbMax[1]=m.bbMax[2]=-1e30f;
     }
 
-    static void addPatchGrid(Mesh& m, const float* verts, const float* cp, int nu, int nv, int res) {
-        // Append CPs (pre-centering) for global indexing
+    static void addPatchGrid(Mesh& m, const float* verts, const float* cp, int nu, int nv, int res, int ru, int rv) {
+        // Append CPs (pre-centering) for global indexing.
+        // CP stride is degree-dependent (ru*rv vec4s per patch), so the resolve
+        // shader gets each patch's offset/order from m.meta, not a fixed stride.
         int cpBase = m.patchCount;
+        int cpVec4Base = (int)(m.cp.size() / 4);   // CP offset in vec4 units for this file's patches
+        int cpsPerPatch = ru * rv * 4;             // floats per patch (e.g. 64 for bicubic)
         if (cp) {
-            m.cp.insert(m.cp.end(), cp, cp + nu * nv * 64);
+            m.cp.insert(m.cp.end(), cp, cp + nu * nv * cpsPerPatch);
+            for (int k = 0; k < nu * nv; k++)
+                m.meta.insert(m.meta.end(), {(uint32_t)(cpVec4Base + k * ru * rv), (uint32_t)ru, (uint32_t)rv, 0u});
         }
         for (int pi = 0; pi < nu; pi++)
             for (int pj = 0; pj < nv; pj++) {
@@ -225,13 +236,13 @@ private:
         // Center CPs per patch for FP32 precision in SSBO eval
         if (cp) {
             for (int p = cpBase; p < m.patchCount; p++) {
-                float* cpp = m.cp.data() + p * 64;
+                float* cpp = m.cp.data() + (cpVec4Base + (p - cpBase) * ru * rv) * 4;
                 float cx = 0, cy = 0, cz = 0;
-                for (int k = 0; k < 16; k++) {
+                for (int k = 0; k < ru * rv; k++) {
                     cx += cpp[k*4+0]; cy += cpp[k*4+1]; cz += cpp[k*4+2];
                 }
-                cx /= 16.0f; cy /= 16.0f; cz /= 16.0f;
-                for (int k = 0; k < 16; k++) {
+                cx /= (float)(ru * rv); cy /= (float)(ru * rv); cz /= (float)(ru * rv);
+                for (int k = 0; k < ru * rv; k++) {
                     cpp[k*4+0] -= cx; cpp[k*4+1] -= cy; cpp[k*4+2] -= cz;
                 }
             }
@@ -260,51 +271,6 @@ public:
   // ---- Expose camera so ElementCamera can control it ----
   auto getCamera() { return m_camera; }
 
-  // Reload mesh from a single file or directory (STEP temp)
-  void doReload(const std::string& path, bool isDir = false) {
-    // If path is a directory on disk, override isDir regardless of what the
-    // menu handler guessed — prevents trying to fopen a directory as a file.
-    if (!isDir && std::filesystem::is_directory(path)) {
-        LOGI("doReload: path is a directory, forcing isDir=true\n");
-        isDir = true;
-    }
-    LOGI("doReload: %s (dir=%d)\n", path.c_str(), isDir);
-    NVVK_CHECK(vkDeviceWaitIdle(m_app->getDevice()));
-    if (m_indexCount > 0) {
-        m_alloc.destroyBuffer(m_indexBuffer);
-        m_alloc.destroyBuffer(m_vertexBuffer);
-        m_indexCount = 0;
-    }
-    Mesh m;
-    if (isDir) { m = MeshBuilder::directory(path.c_str(), 16); }  // lower res for multi-file STP
-    else {
-        CameraParams cam;
-        glm::dvec3 eye = m_camera->getEye();
-        if (eye.x > 5.f || eye.x < -5.f) eye = {0.f, 0.f, -2.f};
-        cam.camX=(float)eye.x; cam.camY=(float)eye.y; cam.camZ=(float)eye.z;
-        cam.fovY=60.f; cam.scrW=m_imgW; cam.scrH=m_imgH;
-        m = MeshBuilder::adaptive(path.c_str(), &cam);
-    }
-
-    if (!m.empty()) {
-        uploadMesh(m);
-        m_modelScale = m.scale();
-        m_center[0]=m.cx(); m_center[1]=m.cy(); m_center[2]=m.cz();
-        float dist = m_modelScale * 1.5f;
-        m_camera->setLookat({m_center[0],m_center[1],m_center[2]+dist},
-                            {m_center[0],m_center[1],m_center[2]},{0,-1,0});
-        m_camera->setWindowSize({(uint32_t)m_imgW,(uint32_t)m_imgH});
-        LOGI("Camera: center=(%.1f,%.1f,%.1f) scale=%.1f dist=%.1f\n",
-             m_center[0],m_center[1],m_center[2],m_modelScale,dist);
-      glm::dvec3 e = m_camera->getEye();
-      m_lastEye[0]=(float)e.x; m_lastEye[1]=(float)e.y; m_lastEye[2]=(float)e.z;
-      m_rebuildEye[0]=(float)e.x; m_rebuildEye[1]=(float)e.y; m_rebuildEye[2]=(float)e.z;
-      // Adaptive re-tessellation only for single .surf files (STP dirs = fixed res)
-      m_lastPath = isDir ? "" : path;
-    }
-    if (isDir) std::filesystem::remove_all(path);
-  }
-
   // ============================================================
   // onAttach — one-time GPU resource creation
   // ============================================================
@@ -318,7 +284,7 @@ public:
     createViewportImage(dev);   // ImGui shows this texture
     createRenderTarget(dev);    // resolve pass output → blit source
     createDepthBuffer(dev);     // Z-buffer (shared by both passes)
-    createGbuffer(dev);         // G-buffer: pos + normal + patchID
+    createGbuffer(dev);         // G-buffer: pos + normal + patchID + uv (4 attachments)
 
     // 2. Create Vulkan graphics pipelines
     createVisPipeline(dev);     // pass 1: mesh → G-buffer
@@ -334,17 +300,7 @@ public:
     // 5. Register viewport image with ImGui (so onUIRender can display it)
     initViewportForImGui(dev);
 
-    // 6b. Auto-fit camera to loaded model
-    if (m_indexCount > 0) {
-        float dist = m_modelScale * 1.5f;
-        m_camera->setLookat({m_center[0],m_center[1],m_center[2]+dist},
-                            {m_center[0],m_center[1],m_center[2]},{0,-1,0});
-        m_camera->setWindowSize({(uint32_t)m_imgW,(uint32_t)m_imgH});
-        LOGI("Camera: center=(%.1f,%.1f,%.1f) scale=%.1f dist=%.1f\n",
-             m_center[0],m_center[1],m_center[2],m_modelScale,dist);
-    }
-
-    // 7. Profiler
+    // 6. Profiler
     m_profilerTimeline = m_info.profilerManager->createTimeline({"graphics"});
     m_profilerGpuTimer.init(m_profilerTimeline, dev,
         app->getPhysicalDevice(), app->getQueue(0).familyIndex, true);
@@ -366,6 +322,7 @@ public:
     vkDestroyPipelineLayout(dev, m_resolvePipelineLayout, nullptr);
     vkDestroyPipelineLayout(dev, m_visPipelineLayout, nullptr);
     vkDestroyDescriptorSetLayout(dev, m_resolveSsboLayout, nullptr);
+    vkDestroyDescriptorSetLayout(dev, m_resolveUboLayout, nullptr);
     vkDestroyDescriptorSetLayout(dev, m_resolveDsLayout, nullptr);
     vkDestroyDescriptorSetLayout(dev, m_visDsLayout, nullptr);
     vkDestroyDescriptorPool(dev, m_resolveDsPool, nullptr);
@@ -379,6 +336,7 @@ public:
     m_alloc.destroyBuffer(m_indexBuffer);
     m_alloc.destroyBuffer(m_vertexBuffer);
     m_alloc.destroyBuffer(m_bezierSSBO);  // always exists (dummy or real)
+    m_alloc.destroyBuffer(m_bezierMetaSSBO);
     m_alloc.destroyImage(m_gbufUV);
     m_alloc.destroyImage(m_gbufID);
     m_alloc.destroyImage(m_gbufNorm);
@@ -679,7 +637,7 @@ public:
   }
 
 private:
-#pragma region Framework
+  #pragma region Framework
   Info                          m_info;
   std::string                   m_pendingLoad;
   std::string                   m_tempDir;
@@ -693,9 +651,9 @@ private:
   nvvk::StagingUploader         m_stagingUploader{}; // CPU→GPU data transfer helper
   nvutils::ProfilerTimeline*    m_profilerTimeline{};
   nvvk::ProfilerGpuTimer        m_profilerGpuTimer;
-#pragma endregion
+  #pragma endregion
 
-#pragma region Display images
+  #pragma region Display images
   // Rendering pipeline:  mesh → G-buffer (visPass) → resolve → m_renderTarget → blit → m_viewportImage → ImGui
   int            m_imgW = 1024, m_imgH = 1024;
   nvvk::Image    m_viewportImage{};   // R32G32B32A32, ImGui display texture
@@ -705,18 +663,19 @@ private:
   nvvk::Image    m_gbufNorm{};        // R32G32B32A32_SFLOAT: world-space normal (xyz)
   nvvk::Image    m_gbufID{};          // R32_UINT: patch index
   nvvk::Image    m_gbufUV{};          // R32G32_SFLOAT: parametric (u,v) coordinates
-  nvvk::Buffer   m_bezierSSBO{};      // SSBO: Bézier CPs (64 floats/patch, 16×vec4)
+  nvvk::Buffer   m_bezierSSBO{};      // SSBO: Bézier CPs (ru*rv vec4s/patch, xyz+w)
+  nvvk::Buffer   m_bezierMetaSSBO{};  // SSBO: per-patch meta {cpOffsetInVec4, ru, rv, 0}
   bool           m_hasSSBO = false;   // true when SSBO is uploaded (adaptive path)
   int            m_patchCols = 1;     // nv: patches per row, for SSBO index decoding
   VkDescriptorSet m_imguiImage{};
   bool           m_firstFrame = true;
-#pragma endregion
+  #pragma endregion
 
-#pragma region Camera
+  #pragma region Camera
   std::shared_ptr<nvutils::CameraManipulator> m_camera = std::make_shared<nvutils::CameraManipulator>();
-#pragma endregion
+  #pragma endregion
 
-#pragma region Mesh geometry
+  #pragma region Mesh geometry
   nvvk::Buffer m_vertexBuffer{};   // vertex positions (x,y,z per vertex)
   nvvk::Buffer m_indexBuffer{};    // triangle indices (3 x uint32_t per triangle)
   uint32_t     m_indexCount = 0;
@@ -726,9 +685,9 @@ private:
   std::string m_lastPath;
   float m_rebuildEye[3] = {0,0,0};  // eye position at last rebuild
   int   m_idleFrames = 0;          // consecutive frames with negligible camera movement
-#pragma endregion
+  #pragma endregion
 
-#pragma region Graphics pipeline
+  #pragma region Graphics pipeline
   static constexpr int MAX_FIF = 3;  // frames in flight (triple-buffered UBOs)
 
   // Visibility pass pipeline (mesh → G-buffer)
@@ -742,6 +701,7 @@ private:
   VkPipeline            m_pipelineResolve   = VK_NULL_HANDLE;
   VkPipelineLayout      m_resolvePipelineLayout = VK_NULL_HANDLE;
   VkDescriptorSetLayout m_resolveDsLayout   = VK_NULL_HANDLE;     // set=0: G-buffer images
+  VkDescriptorSetLayout m_resolveUboLayout  = VK_NULL_HANDLE;     // set=1: Lighting UBO
   VkDescriptorSetLayout m_resolveSsboLayout = VK_NULL_HANDLE;     // set=2: Bézier CP SSBO
   VkDescriptorPool      m_resolveDsPool     = VK_NULL_HANDLE;
   VkDescriptorSet       m_resolveDs         = VK_NULL_HANDLE;     // set=0: G-buffer (shared)
@@ -749,7 +709,7 @@ private:
   VkDescriptorSet       m_resolveDs2        = VK_NULL_HANDLE;     // set=2: SSBO (shared)
   nvvk::Buffer          m_lightUbo[MAX_FIF]{};   // Lighting UBO, one per frame-in-flight
   int                   m_frameIndex = 0;         // cycles 0..MAX_FIF-1 each frame
-#pragma endregion
+  #pragma endregion
 
   // ============================================================
   // Initialization helpers (called from onAttach)
@@ -806,10 +766,11 @@ private:
     NVVK_CHECK(m_alloc.createImage(m_depthImage, ii, vi));
   }
 
-  // G-buffer: three attachments for the visibility pass (ETER §6.1).
+  // G-buffer: four attachments for the visibility pass (ETER §6.1 + §6.2 gbufUV).
   //   gbufPos  — world-space position (R32G32B32A32_SFLOAT)
   //   gbufNorm — world-space normal   (R32G32B32A32_SFLOAT)
   //   gbufID   — patch index          (R32_UINT)
+  //   gbufUV   — parametric (u,v)     (R32G32_SFLOAT)
   // All must be SAMPLED so the resolve pass can read them as textures.
   void createGbuffer(VkDevice dev) {
     VkImageCreateInfo ii = DEFAULT_VkImageCreateInfo;
@@ -826,16 +787,19 @@ private:
 
     ii.format = VK_FORMAT_R32_UINT;
     NVVK_CHECK(m_alloc.createImage(m_gbufID, ii, vi));
-    NVVK_CHECK(m_samplerPool.acquireSampler(m_gbufID.descriptor.sampler));
+    {   // Integer format: linear filtering is invalid for R32_UINT (VUID-vkCmdDraw-magFilter-04553)
+        VkSamplerCreateInfo si = {.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+                                  .magFilter = VK_FILTER_NEAREST, .minFilter = VK_FILTER_NEAREST};
+        NVVK_CHECK(m_samplerPool.acquireSampler(m_gbufID.descriptor.sampler, si));
+    }
 
-    // gbufUV: parametric (u,v) coordinates (R32G32_SFLOAT)
     ii.format = VK_FORMAT_R32G32_SFLOAT;
     NVVK_CHECK(m_alloc.createImage(m_gbufUV, ii, vi));
     NVVK_CHECK(m_samplerPool.acquireSampler(m_gbufUV.descriptor.sampler));
   }
 
   // Visibility pass pipeline (ETER §6.1 Pass 1): mesh → G-buffer.
-  // Outputs worldPos, worldNormal, and patchID to 3 color attachments.
+  // Outputs worldPos, worldNormal, patchID, and (u,v) to 4 color attachments.
   void createVisPipeline(VkDevice dev) {
 
     // Load compiled SPIR-V binaries
@@ -928,6 +892,7 @@ private:
   // Resolve pass pipeline (ETER §6.1 Pass 2): full-screen triangle → render target.
   // Reads G-buffer textures as combined image samplers, applies lighting.
   void createResolvePipeline(VkDevice dev) {
+    
     auto vCode = readFile("shaders/spv/resolve.vert.spv");
     auto fCode = readFile("shaders/spv/resolve.frag.spv");
     if (vCode.empty() || fCode.empty()) { LOGE("Resolve shader load failed\n"); return; }
@@ -941,7 +906,7 @@ private:
     // Descriptor set layouts:
     //   set=0: 4 combined image samplers (gbufPos, gbufNorm, gbufID, gbufUV)
     //   set=1: 1 UBO (lighting params)
-    //   set=2: 1 SSBO (Bézier CPs)
+    //   set=2: 2 SSBOs (Bézier CPs + per-patch meta)
     VkDescriptorSetLayoutBinding bindings0[4] = {};
     for (int i = 0; i < 4; i++) {
         bindings0[i].binding = (uint32_t)i;
@@ -956,16 +921,21 @@ private:
     VkDescriptorSetLayoutCreateInfo dslCI1 = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     dslCI1.bindingCount = 1; dslCI1.pBindings = &binding1;
 
-    VkDescriptorSetLayoutBinding binding2 = {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT};
+    VkDescriptorSetLayoutBinding bindings2[2] = {
+        {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT},  // Bézier CPs
+        {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT},  // patch meta
+    };
     VkDescriptorSetLayoutCreateInfo dslCI2 = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    dslCI2.bindingCount = 1; dslCI2.pBindings = &binding2;
+    dslCI2.bindingCount = 2; dslCI2.pBindings = bindings2;
 
     VkDescriptorSetLayout layouts[3];
     NVVK_CHECK(vkCreateDescriptorSetLayout(dev, &dslCI0, nullptr, &layouts[0]));
     NVVK_CHECK(vkCreateDescriptorSetLayout(dev, &dslCI1, nullptr, &layouts[1]));
     NVVK_CHECK(vkCreateDescriptorSetLayout(dev, &dslCI2, nullptr, &layouts[2]));
-    m_resolveDsLayout = layouts[0];    // save set=0 for pool creation ref
-    m_resolveSsboLayout = layouts[2];  // save set=2 for pool creation ref
+    // Save all three layouts for descriptor set allocation (createResolveDescriptorSet)
+    m_resolveDsLayout   = layouts[0];
+    m_resolveUboLayout  = layouts[1];
+    m_resolveSsboLayout = layouts[2];
 
     VkPipelineLayoutCreateInfo plCI = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     plCI.setLayoutCount = 3; plCI.pSetLayouts = layouts;
@@ -990,7 +960,7 @@ private:
     VkPipelineColorBlendStateCreateInfo cb = {VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
     cb.attachmentCount = 1; cb.pAttachments = &cba;
 
-    // No depth test for full-screen quad
+    // No depth test for the full-screen triangle (2D pass)
     VkPipelineDepthStencilStateCreateInfo dss = {VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
     dss.depthTestEnable = VK_FALSE;
     dss.depthWriteEnable = VK_FALSE;
@@ -1020,9 +990,6 @@ private:
     vkDestroyShaderModule(dev, vs, nullptr);
     vkDestroyShaderModule(dev, fs, nullptr);
 
-    // Don't need set=1 layout reference after pipeline layout creation; save set=0 for pool
-    // But we need to save set=1 layout reference too for pool creation. Use a local.
-    vkDestroyDescriptorSetLayout(dev, layouts[1], nullptr);
     LOGI("Resolve pipeline created\n");
   }
 
@@ -1039,46 +1006,29 @@ private:
     NVVK_CHECK(vkAllocateDescriptorSets(dev, &dsa, m_visDs));
   }
 
-  // Descriptor set for resolve pass: binds 3 G-buffer textures (set=0) + lighting UBO (set=1).
+  // Descriptor set for resolve pass: 4 G-buffer textures (set=0) + lighting UBO (set=1) + Bézier SSBO (set=2).
   // set=0 is shared across all frames (G-buffer images don't change).
   // set=1 is triple-buffered (one per frame-in-flight) for UBO coherency.
+  // set=2 is shared across all frames (Bézier CPs are static after load).
   void createResolveDescriptorSet(VkDevice dev) {
     int totalSets = 1 + MAX_FIF + 1;  // 1×set0 + MAX_FIF×set1 + 1×set2
     VkDescriptorPoolSize dps[3] = {
         {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 4},          // gbufPos, Norm, ID, UV
         {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, (uint32_t)MAX_FIF},  // lighting UBO
-        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1},                  // Bézier CP SSBO
+        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2},                  // Bézier CP + patch meta SSBOs
     };
     VkDescriptorPoolCreateInfo dpCI = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     dpCI.maxSets = (uint32_t)totalSets; dpCI.poolSizeCount = 3; dpCI.pPoolSizes = dps;
     NVVK_CHECK(vkCreateDescriptorPool(dev, &dpCI, nullptr, &m_resolveDsPool));
 
-    // Re-create temp set layouts for allocation (matching pipeline layout)
-    VkDescriptorSetLayoutBinding bindings0[4] = {};
-    for (int i = 0; i < 4; i++) {
-        bindings0[i].binding = (uint32_t)i;
-        bindings0[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        bindings0[i].descriptorCount = 1;
-        bindings0[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-    }
-    VkDescriptorSetLayoutCreateInfo dslCI0 = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    dslCI0.bindingCount = 4; dslCI0.pBindings = bindings0;
-    VkDescriptorSetLayout set0Layout;
-    NVVK_CHECK(vkCreateDescriptorSetLayout(dev, &dslCI0, nullptr, &set0Layout));
-
-    VkDescriptorSetLayoutBinding binding1 = {0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT};
-    VkDescriptorSetLayoutCreateInfo dslCI1 = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    dslCI1.bindingCount = 1; dslCI1.pBindings = &binding1;
-    VkDescriptorSetLayout set1Layout;
-    NVVK_CHECK(vkCreateDescriptorSetLayout(dev, &dslCI1, nullptr, &set1Layout));
-
+    // Use the layouts saved in createResolvePipeline — no re-creation needed.
     VkDescriptorSetLayout set1Layouts[MAX_FIF];
-    for (int i = 0; i < MAX_FIF; i++) set1Layouts[i] = set1Layout;
+    for (int i = 0; i < MAX_FIF; i++) set1Layouts[i] = m_resolveUboLayout;
 
     VkDescriptorSetAllocateInfo dsa = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
     dsa.descriptorPool = m_resolveDsPool;
     // set=0: G-buffer textures (shared)
-    dsa.descriptorSetCount = 1; dsa.pSetLayouts = &set0Layout;
+    dsa.descriptorSetCount = 1; dsa.pSetLayouts = &m_resolveDsLayout;
     NVVK_CHECK(vkAllocateDescriptorSets(dev, &dsa, &m_resolveDs));
     // set=1: lighting UBO (per-frame)
     dsa.descriptorSetCount = MAX_FIF; dsa.pSetLayouts = set1Layouts;
@@ -1105,8 +1055,6 @@ private:
     }
     vkUpdateDescriptorSets(dev, 4, wds, 0, nullptr);
 
-    vkDestroyDescriptorSetLayout(dev, set0Layout, nullptr);
-    vkDestroyDescriptorSetLayout(dev, set1Layout, nullptr);
     LOGI("Resolve descriptor set created (%d FIF)\n", MAX_FIF);
   }
 
@@ -1151,8 +1099,8 @@ private:
         vkUpdateDescriptorSets(dev, 2, wds, 0, nullptr);
     }
 
-    // Dummy SSBO: 4 bytes, ensures descriptor set=2 is always valid.
-    // Replaced with real Bézier CP data when adaptive mesh is loaded.
+    // Dummy SSBOs (4 bytes each): ensure descriptor set=2 is always valid.
+    // Replaced with real Bézier CP + meta data when a mesh is loaded.
     VkBufferCreateInfo ssboCI = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     ssboCI.size = 4; ssboCI.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
     VmaAllocationCreateInfo ssboACI = {};
@@ -1161,15 +1109,85 @@ private:
     vmaCreateBuffer((VmaAllocator)m_alloc, &ssboCI, &ssboACI,
                     &m_bezierSSBO.buffer, &m_bezierSSBO.allocation, &ssboAI);
     m_bezierSSBO.bufferSize = 4;
+    vmaCreateBuffer((VmaAllocator)m_alloc, &ssboCI, &ssboACI,
+                    &m_bezierMetaSSBO.buffer, &m_bezierMetaSSBO.allocation, &ssboAI);
+    m_bezierMetaSSBO.bufferSize = 4;
     m_hasSSBO = false;
 
-    VkDescriptorBufferInfo dbiSSBO = {m_bezierSSBO.buffer, 0, 4};
-    VkWriteDescriptorSet wdsSSBO = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-    wdsSSBO.dstSet = m_resolveDs2; wdsSSBO.dstBinding = 0; wdsSSBO.descriptorCount = 1;
-    wdsSSBO.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; wdsSSBO.pBufferInfo = &dbiSSBO;
-    vkUpdateDescriptorSets(dev, 1, &wdsSSBO, 0, nullptr);
+    VkDescriptorBufferInfo dbiSSBO[2] = {
+        {m_bezierSSBO.buffer, 0, 4},
+        {m_bezierMetaSSBO.buffer, 0, 4},
+    };
+    VkWriteDescriptorSet wdsSSBO[2] = {};
+    for (int i = 0; i < 2; i++) {
+        wdsSSBO[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        wdsSSBO[i].dstSet = m_resolveDs2; wdsSSBO[i].dstBinding = (uint32_t)i; wdsSSBO[i].descriptorCount = 1;
+        wdsSSBO[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; wdsSSBO[i].pBufferInfo = &dbiSSBO[i];
+    }
+    vkUpdateDescriptorSets(dev, 2, wdsSSBO, 0, nullptr);
   }
 
+  void initViewportForImGui(VkDevice dev) {
+    VkCommandBuffer c = m_app->createTempCmdBuffer();
+    nvvk::cmdImageMemoryBarrier(c, {m_viewportImage.image,
+        VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL});
+    m_app->submitAndWaitTempCmdBuffer(c);
+    m_imguiImage = ImGui_ImplVulkan_AddTexture(
+        m_viewportImage.descriptor.sampler,
+        m_viewportImage.descriptor.imageView,
+        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+  }
+
+  // ============================================================
+  // Mesh (re)loading (called from onRender)
+  // ============================================================
+
+  void doReload(const std::string& path, bool isDir = false) {
+    // If path is a directory on disk, override isDir regardless of what the
+    // menu handler guessed — prevents trying to fopen a directory as a file.
+    if (!isDir && std::filesystem::is_directory(path)) {
+        LOGI("doReload: path is a directory, forcing isDir=true\n");
+        isDir = true;
+    }
+    LOGI("doReload: %s (dir=%d)\n", path.c_str(), isDir);
+    NVVK_CHECK(vkDeviceWaitIdle(m_app->getDevice()));
+    if (m_indexCount > 0) {
+        m_alloc.destroyBuffer(m_indexBuffer);
+        m_alloc.destroyBuffer(m_vertexBuffer);
+        m_indexCount = 0;
+    }
+    Mesh m;
+    if (isDir) { m = MeshBuilder::directory(path.c_str(), 16); }  // lower res for multi-file STP
+    else {
+        CameraParams cam;
+        glm::dvec3 eye = m_camera->getEye();
+        if (eye.x > 5.f || eye.x < -5.f) eye = {0.f, 0.f, -2.f};
+        cam.camX=(float)eye.x; cam.camY=(float)eye.y; cam.camZ=(float)eye.z;
+        cam.fovY=60.f; cam.scrW=m_imgW; cam.scrH=m_imgH;
+        m = MeshBuilder::adaptive(path.c_str(), &cam);
+    }
+
+    if (!m.empty()) {
+        uploadMesh(m);
+        m_modelScale = m.scale();
+        m_center[0]=m.cx(); m_center[1]=m.cy(); m_center[2]=m.cz();
+        float dist = m_modelScale * 1.5f;
+        m_camera->setLookat({m_center[0],m_center[1],m_center[2]+dist},
+                            {m_center[0],m_center[1],m_center[2]},{0,-1,0});
+        m_camera->setWindowSize({(uint32_t)m_imgW,(uint32_t)m_imgH});
+        LOGI("Camera: center=(%.1f,%.1f,%.1f) scale=%.1f dist=%.1f\n",
+             m_center[0],m_center[1],m_center[2],m_modelScale,dist);
+      glm::dvec3 e = m_camera->getEye();
+      m_lastEye[0]=(float)e.x; m_lastEye[1]=(float)e.y; m_lastEye[2]=(float)e.z;
+      m_rebuildEye[0]=(float)e.x; m_rebuildEye[1]=(float)e.y; m_rebuildEye[2]=(float)e.z;
+      // Adaptive re-tessellation only for single .surf files (STP dirs = fixed res)
+      m_lastPath = isDir ? "" : path;
+    }
+    if (isDir) std::filesystem::remove_all(path);
+  }
+
+  // Upload mesh data (vertices + indices + Bézier CPs) to GPU via staging.
+  // Called by doReload and by the adaptive re-tessellation path in onPreRender.
   void uploadMesh(const Mesh& m) {
     VkDevice dev = m_app->getDevice();
     VkDeviceSize vsz = m.v.size() * sizeof(float);
@@ -1179,23 +1197,35 @@ private:
     m_alloc.createBuffer(m_indexBuffer, isz, VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_GPU_ONLY);
     { void* p; NVVK_CHECK(m_stagingUploader.appendBufferMapping(m_indexBuffer, 0, isz, p)); memcpy(p, m.i.data(), isz); }
 
-    // Upload Bézier CP SSBO if available (adaptive path with ETER §6.2)
-    if (!m.cp.empty() && m.patchCount > 0) {
+    // Upload Bézier CP + patch meta SSBOs (resolve pass set=2)
+    if (!m.cp.empty() && m.patchCount > 0 && !m.meta.empty()) {
         VkDeviceSize cpsz = m.cp.size() * sizeof(float);
+        VkDeviceSize msz  = m.meta.size() * sizeof(uint32_t);
         m_alloc.destroyBuffer(m_bezierSSBO);  // always exists (dummy or real)
         m_alloc.createBuffer(m_bezierSSBO, cpsz,
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
             VMA_MEMORY_USAGE_GPU_ONLY);
         { void* p; NVVK_CHECK(m_stagingUploader.appendBufferMapping(m_bezierSSBO, 0, cpsz, p)); memcpy(p, m.cp.data(), cpsz); }
+        m_alloc.destroyBuffer(m_bezierMetaSSBO);
+        m_alloc.createBuffer(m_bezierMetaSSBO, msz,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            VMA_MEMORY_USAGE_GPU_ONLY);
+        { void* p; NVVK_CHECK(m_stagingUploader.appendBufferMapping(m_bezierMetaSSBO, 0, msz, p)); memcpy(p, m.meta.data(), msz); }
         m_hasSSBO = true;
 
-        // Write SSBO descriptor (if descriptor set is already created)
+        // Write SSBO descriptors (if descriptor set is already created)
         if (m_resolveDs2 != VK_NULL_HANDLE) {
-            VkDescriptorBufferInfo dbiSSBO = {m_bezierSSBO.buffer, 0, cpsz};
-            VkWriteDescriptorSet wdsSSBO = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-            wdsSSBO.dstSet = m_resolveDs2; wdsSSBO.dstBinding = 0; wdsSSBO.descriptorCount = 1;
-            wdsSSBO.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; wdsSSBO.pBufferInfo = &dbiSSBO;
-            vkUpdateDescriptorSets(dev, 1, &wdsSSBO, 0, nullptr);
+            VkDescriptorBufferInfo dbiSSBO[2] = {
+                {m_bezierSSBO.buffer, 0, cpsz},
+                {m_bezierMetaSSBO.buffer, 0, msz},
+            };
+            VkWriteDescriptorSet wdsSSBO[2] = {};
+            for (int i = 0; i < 2; i++) {
+                wdsSSBO[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                wdsSSBO[i].dstSet = m_resolveDs2; wdsSSBO[i].dstBinding = (uint32_t)i; wdsSSBO[i].descriptorCount = 1;
+                wdsSSBO[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; wdsSSBO[i].pBufferInfo = &dbiSSBO[i];
+            }
+            vkUpdateDescriptorSets(dev, 2, wdsSSBO, 0, nullptr);
         }
     } else {
         m_hasSSBO = false;
@@ -1208,17 +1238,6 @@ private:
     m_indexCount = (uint32_t)m.i.size();
     m_patchCols  = m.patchCols > 0 ? m.patchCols : 1;
     LOGI("Uploaded: %d verts, %d tris, %d CPs\n", m.verts(), (int)(m.i.size()/3), (int)m.cp.size());
-  }
-
-  void initViewportForImGui(VkDevice dev) {
-    VkCommandBuffer c = m_app->createTempCmdBuffer();
-    nvvk::cmdImageMemoryBarrier(c, {m_viewportImage.image,
-        VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL});
-    m_app->submitAndWaitTempCmdBuffer(c);
-    m_imguiImage = ImGui_ImplVulkan_AddTexture(
-        m_viewportImage.descriptor.sampler,
-        m_viewportImage.descriptor.imageView,
-        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
   }
 
   // ============================================================
