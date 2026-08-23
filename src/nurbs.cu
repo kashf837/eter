@@ -170,8 +170,6 @@ float* nurbs_read_cps(const char* path, int* nu, int* nv, int* ru, int* rv)
     NurbsSurf* s = read_surf(path);
     if (!s) return NULL;
 
-    nurbs_to_beziers(s);
-
     int r_u = s->p_u + 1, r_v = s->p_v + 1;
     int n_u = (s->n_u + 1) / r_u, n_v = (s->n_v + 1) / r_v;
     if (n_u <= 0 || n_v <= 0) { free_surf(s); return NULL; }

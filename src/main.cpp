@@ -159,23 +159,28 @@ public:
         }
         int skipped = 0, tuMin = 999, tuMax = 0, tvMin = 999, tvMax = 0;
 
-        // Phase 1: read + decompose everything first.
+        // Phase 1: read + decompose every file. Files are fully independent,
+        // so they load in parallel (OpenMP, same pattern as pass-1); results
+        // land in per-index slots and the cache fill below stays serial in
+        // scene order — the SSBO layout anchor. (Was 11.4 s serial.)
+        int nFiles = (int)files.size();
+        std::vector<float*> rawCps((size_t)nFiles, nullptr);   // freed after phase 3
+        std::vector<int> cNu((size_t)nFiles), cNv((size_t)nFiles), cRu((size_t)nFiles), cRv((size_t)nFiles);
+        #pragma omp parallel for schedule(dynamic)
+        for (int i = 0; i < nFiles; i++)
+            rawCps[i] = nurbs_read_cps(files[(size_t)i].c_str(), &cNu[i], &cNv[i], &cRu[i], &cRv[i]);
+
         std::vector<SceneSurf> surfs;
-        std::vector<float*> rawCps;   // freed after phase 3 (addPatchGrid copies)
-        surfs.reserve(files.size()); rawCps.reserve(files.size());
-        for (size_t i = 0; i < files.size(); i++) {
-            if ((i+1) % 500 == 0) LOGI("  [%zu/%zu] ...\n", i+1, files.size());
-            int nu, nv, ru, rv;
-            float* cps = nurbs_read_cps(files[i].c_str(), &nu, &nv, &ru, &rv);
-            if (!cps) { fprintf(stderr, "  [SKIP] %s\n", files[i].c_str()); skipped++; continue; }
+        surfs.reserve(files.size());
+        for (int i = 0; i < nFiles; i++) {   // serial: scene order = SSBO anchor
+            if (!rawCps[i]) { fprintf(stderr, "  [SKIP] %s\n", files[(size_t)i].c_str()); skipped++; continue; }
             if (cache) {
                 BezierSurface s;
-                s.cps.assign(cps, cps + (size_t)nu * nv * ru * rv * 4);
-                s.nu = nu; s.nv = nv; s.ru = ru; s.rv = rv;
+                s.cps.assign(rawCps[i], rawCps[i] + (size_t)cNu[i] * cNv[i] * cRu[i] * cRv[i] * 4);
+                s.nu = cNu[i]; s.nv = cNv[i]; s.ru = cRu[i]; s.rv = cRv[i];
                 cache->surfaces.push_back(std::move(s));
             }
-            surfs.push_back({cps, nu, nv, ru, rv});
-            rawCps.push_back(cps);
+            surfs.push_back({rawCps[i], cNu[i], cNv[i], cRu[i], cRv[i]});
         }
 
         // Phase 2: ONE GPU round trip for the whole scene.
