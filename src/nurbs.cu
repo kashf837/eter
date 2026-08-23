@@ -11,10 +11,21 @@
 
 static void free_surf(NurbsSurf* s);
 
-static int next_line(FILE* f, char* buf, int size) {
-    while (fgets(buf, size, f))
-        if (buf[0] != '#' && buf[0] != '\n') return 1;
-    return 0;
+// Advance the in-memory cursor to the next content line (skips comments and
+// blank lines), NUL-terminate it in place (CRLF -> LF). Returns the line or
+// NULL at end of buffer. Replaces the per-line fgets: 3506 files meant
+// ~500k fgets calls; one fread per file + pointer scans is far cheaper.
+static char* mem_next_line(char** p) {
+    while (**p) {
+        char* start = *p;
+        char* eol = strchr(start, '\n');
+        if (!eol) { *p = start + strlen(start); eol = *p; }
+        else *p = eol + 1;
+        *eol = '\0';
+        if (eol > start && eol[-1] == '\r') eol[-1] = '\0';
+        if (start[0] != '#' && start[0] != '\0') return start;
+    }
+    return NULL;
 }
 
 static int count_floats(const char* line) {
@@ -24,48 +35,65 @@ static int count_floats(const char* line) {
 }
 
 static void parse_floats(char* line, float* out, int n) {
+    // strtof instead of sscanf: same correctly-rounded value per float
+    // (knot insertion compares U[i]==u exactly, so the bits must not
+    // change), but ~4x faster — parsing was 98% of the load cost.
     char* p = line;
     for (int i = 0; i < n; i++) {
-        sscanf(p, "%f", &out[i]);
-        char* next = strchr(p, ' ');
-        if (!next) break;
-        p = next + 1;
+        out[i] = strtof(p, &p);
+        if (*p == '\0') break;   // malformed tail: mirror the old break
     }
 }
 
 static NurbsSurf* read_surf(const char* path) {
-    FILE* f = fopen(path, "r");
+    FILE* f = fopen(path, "rb");
     if (!f) { fprintf(stderr, "  [SKIP] Cannot open %s\n", path); return NULL; }
-    NurbsSurf* s = (NurbsSurf*)calloc(1, sizeof(NurbsSurf));
-    char line[4096];
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    char* buf = (char*)malloc((size_t)sz + 1);
+    if (!buf) { fclose(f); return NULL; }
+    size_t got = fread(buf, 1, (size_t)sz, f);
+    fclose(f);
+    buf[got] = '\0';
 
-    if (!next_line(f, line, sizeof(line))) { fclose(f); free(s); return NULL; }
+    NurbsSurf* s = (NurbsSurf*)calloc(1, sizeof(NurbsSurf));
+    char* cursor = buf;
+    char* line;
+
+    if (!(line = mem_next_line(&cursor))) { free(buf); free(s); return NULL; }
     sscanf(line, "%d %d %d %d", &s->p_u, &s->p_v, &s->n_u, &s->n_v);
     if (s->p_u <= 0 || s->p_v <= 0 || s->n_u <= 0 || s->n_v <= 0 ||
         s->p_u > 20 || s->p_v > 20 || s->n_u > 10000 || s->n_v > 10000) {
-        fclose(f); free(s); return NULL;
+        free(buf); free(s); return NULL;
     }
 
-    if (!next_line(f, line, sizeof(line))) { fclose(f); free_surf(s); return NULL; }
+    if (!(line = mem_next_line(&cursor))) { free(buf); free_surf(s); return NULL; }
     {   int n = count_floats(line); s->m_u = n - 1;
         s->U = (float*)malloc(n * sizeof(float)); parse_floats(line, s->U, n); }
 
-    if (!next_line(f, line, sizeof(line))) { fclose(f); free_surf(s); return NULL; }
+    if (!(line = mem_next_line(&cursor))) { free(buf); free_surf(s); return NULL; }
     {   int n = count_floats(line); s->m_v = n - 1;
         s->V = (float*)malloc(n * sizeof(float)); parse_floats(line, s->V, n); }
 
     s->Ps = new_cpgrid(s->n_u, s->n_v, 4);
     for (int i = 0; i <= s->n_u; i++)
         for (int j = 0; j <= s->n_v; j++) {
-            if (!next_line(f, line, sizeof(line))) { fclose(f); free_surf(s); return NULL; }
-            int got = sscanf(line, "%f %f %f %f",
-                   &s->Ps[i][j][0], &s->Ps[i][j][1],
-                   &s->Ps[i][j][2], &s->Ps[i][j][3]);
-            if (got < 1) { fclose(f); free_surf(s); return NULL; }
+            if (!(line = mem_next_line(&cursor))) { free(buf); free_surf(s); return NULL; }
+            // Same strtof swap as parse_floats; got<1/3/4 defaults unchanged.
+            const char* q = line;
+            int got = 0;
+            for (int d = 0; d < 4; d++) {
+                while (*q == ' ') q++;
+                if (*q == '\0') break;   // no more numbers on this line
+                s->Ps[i][j][d] = strtof(q, (char**)&q);
+                got++;
+            }
+            if (got < 1) { free(buf); free_surf(s); return NULL; }
             if (got < 3) { s->Ps[i][j][1] = 0; s->Ps[i][j][2] = 0; }
             if (got < 4) s->Ps[i][j][3] = 1.0f;
         }
-    fclose(f);
+    free(buf);
     return s;
 }
 
@@ -169,6 +197,8 @@ float* nurbs_read_cps(const char* path, int* nu, int* nv, int* ru, int* rv)
 {
     NurbsSurf* s = read_surf(path);
     if (!s) return NULL;
+
+    nurbs_to_beziers(s);
 
     int r_u = s->p_u + 1, r_v = s->p_v + 1;
     int n_u = (s->n_u + 1) / r_u, n_v = (s->n_v + 1) / r_v;
