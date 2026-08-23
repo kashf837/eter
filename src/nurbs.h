@@ -19,3 +19,10 @@ typedef struct { int tu, tv, offset; } PatchInfo;
 float* nurbs_adaptive_eval(const char* surf_path, const CameraParams* cam,
                            int* np_u, int* np_v, PatchInfo** info, int* total_verts,
                            int* ru_out, int* rv_out, float** cp_out);
+
+// Adaptive evaluation from pre-converted Bézier CPs — skips file I/O and
+// NURBS→Bézier knot insertion (ETER §4 rebuild cache). Caller frees verts/info.
+// cps: nu*nv patches × ru*rv vec4s (xyz+w), uncentered, patch-major layout.
+float* nurbs_adaptive_eval_cached(const float* cps, int nu, int nv, int ru, int rv,
+                                  const CameraParams* cam,
+                                  PatchInfo** info_out, int* total_verts);

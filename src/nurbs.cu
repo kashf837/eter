@@ -147,30 +147,20 @@ float* nurbs_wireframe(const char* surf_path, int res,
 // Per-patch adaptive evaluation (ETER §4)
 // ============================================================
 
-float* nurbs_adaptive_eval(const char* surf_path, const CameraParams* cam,
-                           int* np_u, int* np_v, PatchInfo** info_out, int* total_verts,
-                           int* ru_out, int* rv_out, float** cp_out)
+// Core of adaptive evaluation: takes pre-converted Bézier CPs (flat array,
+// patch-major), computes per-patch tess factors and evaluates vertices.
+// Shared by nurbs_adaptive_eval (fresh load) and nurbs_adaptive_eval_cached
+// (camera rebuild — no file I/O, no knot insertion).
+static float* adaptive_eval_core(const float* cps, int nu, int nv, int ru, int rv,
+                                 const CameraParams* cam,
+                                 PatchInfo** info_out, int* total_verts)
 {
-    NurbsSurf* s = read_surf(surf_path);
-    if (!s) return NULL;
-
-    nurbs_to_beziers(s);
-
-    int ru = s->p_u + 1, rv = s->p_v + 1;
-    int nu = (s->n_u + 1) / ru, nv = (s->n_v + 1) / rv;
-    *np_u = nu; *np_v = nv;
-    *ru_out = ru; *rv_out = rv;
     int np = nu * nv;
     int cpsPerPatch = ru * rv * 4;  // e.g. 64 for bicubic
 
     PatchInfo* info = (PatchInfo*)malloc(np * sizeof(PatchInfo));
-    BezierPatch bp = {s->p_u, s->p_v, (float*)malloc(cpsPerPatch * sizeof(float))};
+    BezierPatch bp = {ru - 1, rv - 1, (float*)malloc(cpsPerPatch * sizeof(float))};
     int offset = 0;
-
-    // Allocate CP output if requested (ETER §6.2 SSBO)
-    if (cp_out) {
-        *cp_out = (float*)malloc(np * cpsPerPatch * sizeof(float));
-    }
 
     // First pass: compute tess factors and offsets
     for (int i = 0; i < nu; i++) {
@@ -178,7 +168,7 @@ float* nurbs_adaptive_eval(const char* surf_path, const CameraParams* cam,
             for (int ii = 0; ii < ru; ii++)
                 for (int jj = 0; jj < rv; jj++)
                     memcpy(&bp.CP[(ii*rv+jj)*4],
-                           s->Ps[i*ru+ii][j*rv+jj], 4*sizeof(float));
+                           cps + ((i*nv+j)*ru*rv + ii*rv+jj)*4, 4*sizeof(float));
 
             float eps = compute_epsilon(&bp, cam);
             int tu = 0, tv = 0;
@@ -199,13 +189,7 @@ float* nurbs_adaptive_eval(const char* surf_path, const CameraParams* cam,
             for (int ii = 0; ii < ru; ii++)
                 for (int jj = 0; jj < rv; jj++)
                     memcpy(&bp.CP[(ii*rv+jj)*4],
-                           s->Ps[i*ru+ii][j*rv+jj], 4*sizeof(float));
-
-            // Save original CPs before eval_bezier_patch offsets them
-            if (cp_out) {
-                int cpBase = (i*nv+j) * cpsPerPatch;
-                memcpy(*cp_out + cpBase, bp.CP, cpsPerPatch * sizeof(float));
-            }
+                           cps + ((i*nv+j)*ru*rv + ii*rv+jj)*4, 4*sizeof(float));
 
             int idx = i*nv+j;
             int tu = info[idx].tu, tv = info[idx].tv;
@@ -221,7 +205,6 @@ float* nurbs_adaptive_eval(const char* surf_path, const CameraParams* cam,
     }
 
     free(bp.CP);
-    free_surf(s);
     *info_out = info;
     *total_verts = offset;
 
@@ -230,4 +213,47 @@ float* nurbs_adaptive_eval(const char* surf_path, const CameraParams* cam,
     printf("  [ADAPT] %dx%d patches, tu=[%d,%d] tv=[%d,%d] total=%d verts\n",
            nu, nv, tu_min, tu_max, tv_min, tv_max, offset);
     return verts;
+}
+
+float* nurbs_adaptive_eval(const char* surf_path, const CameraParams* cam,
+                           int* np_u, int* np_v, PatchInfo** info_out, int* total_verts,
+                           int* ru_out, int* rv_out, float** cp_out)
+{
+    NurbsSurf* s = read_surf(surf_path);
+    if (!s) return NULL;
+
+    nurbs_to_beziers(s);
+
+    int ru = s->p_u + 1, rv = s->p_v + 1;
+    int nu = (s->n_u + 1) / ru, nv = (s->n_v + 1) / rv;
+    *np_u = nu; *np_v = nv;
+    *ru_out = ru; *rv_out = rv;
+    int np = nu * nv;
+    int cpsPerPatch = ru * rv * 4;  // e.g. 64 for bicubic
+
+    // Extract all patches' CPs into one flat array (uncentered) up front.
+    // If the caller wants them (cp_out), hand over this allocation; otherwise
+    // free it after the core finishes. The core only reads this array.
+    float* cps;
+    if (cp_out) { *cp_out = (float*)malloc(np * cpsPerPatch * sizeof(float)); cps = *cp_out; }
+    else        { cps = (float*)malloc(np * cpsPerPatch * sizeof(float)); }
+    for (int i = 0; i < nu; i++)
+        for (int j = 0; j < nv; j++)
+            for (int ii = 0; ii < ru; ii++)
+                for (int jj = 0; jj < rv; jj++)
+                    memcpy(&cps[((i*nv+j)*ru*rv + ii*rv+jj)*4],
+                           s->Ps[i*ru+ii][j*rv+jj], 4*sizeof(float));
+    free_surf(s);
+
+    float* verts = adaptive_eval_core(cps, nu, nv, ru, rv, cam, info_out, total_verts);
+    if (!cp_out) free(cps);
+    return verts;
+}
+
+float* nurbs_adaptive_eval_cached(const float* cps, int nu, int nv, int ru, int rv,
+                                  const CameraParams* cam,
+                                  PatchInfo** info_out, int* total_verts)
+{
+    if (!cps || nu <= 0 || nv <= 0 || ru <= 1 || rv <= 1) return NULL;
+    return adaptive_eval_core(cps, nu, nv, ru, rv, cam, info_out, total_verts);
 }

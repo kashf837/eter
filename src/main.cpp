@@ -70,24 +70,53 @@ struct Mesh {
     float cz() const { return (bbMin[2]+bbMax[2])*0.5f; }
 };
 
+// Cached Bézier decomposition of one .surf file: uncentered CPs + grid dims.
+// Survives across adaptive rebuilds so we don't redo file I/O + NURBS→Bézier
+// knot insertion every time the camera settles (ETER §4 rebuild cache).
+struct BezierCache {
+    std::vector<float> cps;  // nu*nv patches × ru*rv vec4s (xyz+w), uncentered
+    int nu = 0, nv = 0, ru = 0, rv = 0;
+};
+
 // ============================================================
 // MeshBuilder — builds Mesh from .surf file(s)
 // ============================================================
 class MeshBuilder {
 public:
 
-    static Mesh adaptive(const char* path, const CameraParams* cam) {
+    static Mesh loadFile(const char* path, const CameraParams* cam, BezierCache* cache = nullptr) {
         Mesh m; resetBBox(m);
         int nu, nv, total, ru = 0, rv = 0;
         PatchInfo* info;
         float* bezierCPs = nullptr;
         float* verts = nurbs_adaptive_eval(path, cam, &nu, &nv, &info, &total, &ru, &rv, &bezierCPs);
         if (!verts) { fprintf(stderr, "  [SKIP] %s\n", path); return m; }
+        // Save the uncentered Bézier CPs for the rebuild path (adaptive)
+        // before they are freed — reusing them skips file I/O + knot insertion.
+        if (cache && bezierCPs) {
+            int cpFloats = nu * nv * ru * rv * 4;
+            cache->cps.assign(bezierCPs, bezierCPs + cpFloats);
+            cache->nu = nu; cache->nv = nv; cache->ru = ru; cache->rv = rv;
+        }
         // CUDA gives per-patch {tu, tv, offset} — feed them straight to the
         // shared grid builder (same routine as the uniform wireframe path).
         addPatchGrid(m, verts, bezierCPs, info, nu, nv, ru, rv);
         free(verts); free(bezierCPs); free(info);
-        LOGI("Adaptive %s: %d verts, %d tris, %d patches\n", path, m.verts(), (int)(m.i.size()/3), m.patchCount);
+        LOGI("Load %s: %d verts, %d tris, %d patches\n", path, m.verts(), (int)(m.i.size()/3), m.patchCount);
+        return m;
+    }
+
+    // Camera-moved rebuild: same adaptive eval, but from cached Bézier CPs —
+    // skips .surf file I/O and NURBS→Bézier knot insertion.
+    static Mesh adaptive(const BezierCache& cache, const CameraParams* cam) {
+        Mesh m; resetBBox(m);
+        PatchInfo* info; int total;
+        float* verts = nurbs_adaptive_eval_cached(cache.cps.data(), cache.nu, cache.nv,
+                                                  cache.ru, cache.rv, cam, &info, &total);
+        if (!verts) return m;
+        addPatchGrid(m, verts, cache.cps.data(), info, cache.nu, cache.nv, cache.ru, cache.rv);
+        free(verts); free(info);
+        LOGI("Adaptive (cached) %d verts, %d tris, %d patches\n", m.verts(), (int)(m.i.size()/3), m.patchCount);
         return m;
     }
 
@@ -345,11 +374,15 @@ public:
                 CameraParams cam;
                 cam.camX = (float)e.x; cam.camY = (float)e.y; cam.camZ = (float)e.z;
                 cam.fovY = 60.f; cam.scrW = m_imgW; cam.scrH = m_imgH;
-                Mesh m = MeshBuilder::adaptive(m_lastPath.c_str(), &cam);
+                // Rebuild from cached Bézier CPs (no file I/O / knot insertion);
+                // fall back to a fresh load if the cache is missing.
+                Mesh m = m_bezierCache.cps.empty()
+                    ? MeshBuilder::loadFile(m_lastPath.c_str(), &cam)
+                    : MeshBuilder::adaptive(m_bezierCache, &cam);
                 if (!m.empty()) {
                     NVVK_CHECK(vkDeviceWaitIdle(m_app->getDevice()));
                     if (m_indexCount > 0) { m_alloc.destroyBuffer(m_indexBuffer); m_alloc.destroyBuffer(m_vertexBuffer); m_indexCount = 0; }
-                    uploadMesh(m);
+                    uploadMesh(m, false);  // CP/meta SSBOs unchanged — keep them
                     m_modelScale = m.scale();
                     m_center[0]=m.cx(); m_center[1]=m.cy(); m_center[2]=m.cz();
                     m_rebuildEye[0] = (float)e.x; m_rebuildEye[1] = (float)e.y; m_rebuildEye[2] = (float)e.z;
@@ -628,6 +661,7 @@ private:
   float m_center[3] = {0,0,0};
   float m_lastEye[3] = {0,0,0};
   std::string m_lastPath;
+  BezierCache m_bezierCache;  // Bézier decomposition cache for adaptive rebuilds
   float m_rebuildEye[3] = {0,0,0};  // eye position at last rebuild
   int   m_idleFrames = 0;          // consecutive frames with negligible camera movement
   #pragma endregion
@@ -1102,14 +1136,19 @@ private:
         m_indexCount = 0;
     }
     Mesh m;
-    if (isDir) { m = MeshBuilder::directory(path.c_str(), 16); }  // lower res for multi-file STP
+    if (isDir) {
+        m_bezierCache = {};  // dirs don't rebuild adaptively → drop any cache
+        m = MeshBuilder::directory(path.c_str(), 16);  // lower res for multi-file STP
+    }
     else {
         CameraParams cam;
         glm::dvec3 eye = m_camera->getEye();
         if (eye.x > 5.f || eye.x < -5.f) eye = {0.f, 0.f, -2.f};
         cam.camX=(float)eye.x; cam.camY=(float)eye.y; cam.camZ=(float)eye.z;
         cam.fovY=60.f; cam.scrW=m_imgW; cam.scrH=m_imgH;
-        m = MeshBuilder::adaptive(path.c_str(), &cam);
+        BezierCache cache;
+        m = MeshBuilder::loadFile(path.c_str(), &cam, &cache);
+        m_bezierCache = std::move(cache);  // empty on failure → clears stale cache
     }
 
     if (!m.empty()) {
@@ -1133,7 +1172,7 @@ private:
 
   // Upload mesh data (vertices + indices + Bézier CPs) to GPU via staging.
   // Called by doReload and by the adaptive re-tessellation path in onPreRender.
-  void uploadMesh(const Mesh& m) {
+  void uploadMesh(const Mesh& m, bool uploadSSBO = true) {
     VkDevice dev = m_app->getDevice();
     VkDeviceSize vsz = m.v.size() * sizeof(float);
     m_alloc.createBuffer(m_vertexBuffer, vsz, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_GPU_ONLY);
@@ -1142,38 +1181,42 @@ private:
     m_alloc.createBuffer(m_indexBuffer, isz, VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_GPU_ONLY);
     { void* p; NVVK_CHECK(m_stagingUploader.appendBufferMapping(m_indexBuffer, 0, isz, p)); memcpy(p, m.i.data(), isz); }
 
-    // Upload Bézier CP + patch meta SSBOs (resolve pass set=2)
-    if (!m.cp.empty() && m.patchCount > 0 && !m.meta.empty()) {
-        VkDeviceSize cpsz = m.cp.size() * sizeof(float);
-        VkDeviceSize msz  = m.meta.size() * sizeof(uint32_t);
-        m_alloc.destroyBuffer(m_bezierSSBO);  // always exists (dummy or real)
-        m_alloc.createBuffer(m_bezierSSBO, cpsz,
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-            VMA_MEMORY_USAGE_GPU_ONLY);
-        { void* p; NVVK_CHECK(m_stagingUploader.appendBufferMapping(m_bezierSSBO, 0, cpsz, p)); memcpy(p, m.cp.data(), cpsz); }
-        m_alloc.destroyBuffer(m_bezierMetaSSBO);
-        m_alloc.createBuffer(m_bezierMetaSSBO, msz,
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-            VMA_MEMORY_USAGE_GPU_ONLY);
-        { void* p; NVVK_CHECK(m_stagingUploader.appendBufferMapping(m_bezierMetaSSBO, 0, msz, p)); memcpy(p, m.meta.data(), msz); }
-        m_hasSSBO = true;
+    // Upload Bézier CP + patch meta SSBOs (resolve pass set=2).
+    // Skipped on adaptive rebuilds (uploadSSBO=false): CPs/meta are
+    // camera-independent, so the existing buffers stay valid.
+    if (uploadSSBO) {
+        if (!m.cp.empty() && m.patchCount > 0 && !m.meta.empty()) {
+            VkDeviceSize cpsz = m.cp.size() * sizeof(float);
+            VkDeviceSize msz  = m.meta.size() * sizeof(uint32_t);
+            m_alloc.destroyBuffer(m_bezierSSBO);  // always exists (dummy or real)
+            m_alloc.createBuffer(m_bezierSSBO, cpsz,
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                VMA_MEMORY_USAGE_GPU_ONLY);
+            { void* p; NVVK_CHECK(m_stagingUploader.appendBufferMapping(m_bezierSSBO, 0, cpsz, p)); memcpy(p, m.cp.data(), cpsz); }
+            m_alloc.destroyBuffer(m_bezierMetaSSBO);
+            m_alloc.createBuffer(m_bezierMetaSSBO, msz,
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                VMA_MEMORY_USAGE_GPU_ONLY);
+            { void* p; NVVK_CHECK(m_stagingUploader.appendBufferMapping(m_bezierMetaSSBO, 0, msz, p)); memcpy(p, m.meta.data(), msz); }
+            m_hasSSBO = true;
 
-        // Write SSBO descriptors (if descriptor set is already created)
-        if (m_resolveDs2 != VK_NULL_HANDLE) {
-            VkDescriptorBufferInfo dbiSSBO[2] = {
-                {m_bezierSSBO.buffer, 0, cpsz},
-                {m_bezierMetaSSBO.buffer, 0, msz},
-            };
-            VkWriteDescriptorSet wdsSSBO[2] = {};
-            for (int i = 0; i < 2; i++) {
-                wdsSSBO[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-                wdsSSBO[i].dstSet = m_resolveDs2; wdsSSBO[i].dstBinding = (uint32_t)i; wdsSSBO[i].descriptorCount = 1;
-                wdsSSBO[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; wdsSSBO[i].pBufferInfo = &dbiSSBO[i];
+            // Write SSBO descriptors (if descriptor set is already created)
+            if (m_resolveDs2 != VK_NULL_HANDLE) {
+                VkDescriptorBufferInfo dbiSSBO[2] = {
+                    {m_bezierSSBO.buffer, 0, cpsz},
+                    {m_bezierMetaSSBO.buffer, 0, msz},
+                };
+                VkWriteDescriptorSet wdsSSBO[2] = {};
+                for (int i = 0; i < 2; i++) {
+                    wdsSSBO[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                    wdsSSBO[i].dstSet = m_resolveDs2; wdsSSBO[i].dstBinding = (uint32_t)i; wdsSSBO[i].descriptorCount = 1;
+                    wdsSSBO[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; wdsSSBO[i].pBufferInfo = &dbiSSBO[i];
+                }
+                vkUpdateDescriptorSets(dev, 2, wdsSSBO, 0, nullptr);
             }
-            vkUpdateDescriptorSets(dev, 2, wdsSSBO, 0, nullptr);
+        } else {
+            m_hasSSBO = false;
         }
-    } else {
-        m_hasSSBO = false;
     }
 
     VkCommandBuffer c = m_app->createTempCmdBuffer();
