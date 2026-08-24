@@ -603,21 +603,22 @@ public:
             m_idleFrames++;
         }
 
-        if (m_idleFrames == 60) {  // ~1s idle @60fps → maybe rebuild
+        if (m_idleFrames == 30) {  // ~0.5s idle @60fps → maybe rebuild
             float rdx=(float)e.x-m_rebuildEye[0], rdy=(float)e.y-m_rebuildEye[1], rdz=(float)e.z-m_rebuildEye[2];
             float rdist = sqrtf(rdx*rdx+rdy*rdy+rdz*rdz);
             float mx=(float)e.x-m_center[0], my=(float)e.y-m_center[1], mz=(float)e.z-m_center[2];
             float distToModel = sqrtf(mx*mx+my*my+mz*mz);
             // tu ∝ 1/√(patch distance) and is quantized to multiples of 8, so
-            // a tess level change needs the distance to change ~4× (8→16
-            // needs 1/4 the distance). Only rebuild when the zoom ratio since
-            // the last rebuild crossed 2× (either way) or after a large
-            // lateral move — anything smaller changes no patch and just
-            // wastes a rebuild.
+            // a full level change needs the distance to change ~4× (8→16
+            // needs 1/4 the distance) — but patches near the top of their
+            // band upgrade on just a √2× zoom (raw factor ×1.19). Rebuild
+            // when the zoom ratio since the last rebuild crossed √2× (either
+            // way) or after a large lateral move; anything smaller changes no
+            // patch and just wastes a rebuild.
             float dRatio = m_rebuildDist > 0.f ? distToModel / m_rebuildDist : 0.f;
             bool worthIt = (m_rebuildDist <= 0.f)   // first rebuild after load
-                        || (dRatio < 0.5f || dRatio > 2.0f)
-                        || (rdist > distToModel * 0.5f);
+                        || (dRatio < 0.71f || dRatio > 1.41f)
+                        || (rdist > distToModel * 0.3f);
             if (worthIt) {
                 CameraParams cam;
                 cam.camX = (float)e.x; cam.camY = (float)e.y; cam.camZ = (float)e.z;
