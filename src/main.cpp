@@ -478,42 +478,6 @@ public:
   // ---- Expose camera so ElementCamera can control it ----
   auto getCamera() { return m_camera; }
 
-  // ============================================================
-  // onAttach — one-time GPU resource creation
-  // ============================================================
-  void onAttach(nvapp::Application* app) override
-  {
-    m_app = app;
-    VkDevice dev = app->getDevice();
-    initAllocator(app);
-
-    // 1. Create images that we render into and display
-    createViewportImage(dev);   // ImGui shows this texture
-    createRenderTarget(dev);    // resolve pass output → blit source
-    createDepthBuffer(dev);     // Z-buffer (shared by both passes)
-    createGbuffer(dev);         // G-buffer: pos + normal + patchID + uv (4 attachments)
-
-    // 2. Create Vulkan graphics pipelines
-    createVisPipeline(dev);     // pass 1: mesh → G-buffer
-    createResolvePipeline(dev); // pass 2: G-buffer → render target
-
-    // 3. Create descriptor sets
-    createVisDescriptorSet(dev);
-    createResolveDescriptorSet(dev);
-
-    // 4. Upload uniform buffers (MVP for vis pass, lighting for resolve pass)
-    createUniformBuffers(dev);
-
-    // 5. Register viewport image with ImGui (so onUIRender can display it)
-    initViewportForImGui(dev);
-
-    // 6. Profiler
-    m_profilerTimeline = m_info.profilerManager->createTimeline({"graphics"});
-    m_profilerGpuTimer.init(m_profilerTimeline, dev,
-        app->getPhysicalDevice(), app->getQueue(0).familyIndex, true);
-
-  }
-
   // Queue a model load for the next frame (File→Open dialog or --load <path>).
   // STEP/STP: convert to a temp *_parts dir via step2surf.py, then load the
   // dir (directory() prefers the packed .surfb). Directories load as-is;
@@ -549,6 +513,42 @@ public:
       } else {
           m_pendingLoad = sp; m_pendingIsDir = false;
       }
+  }
+
+  // ============================================================
+  // onAttach — one-time GPU resource creation
+  // ============================================================
+  void onAttach(nvapp::Application* app) override
+  {
+    m_app = app;
+    VkDevice dev = app->getDevice();
+    initAllocator(app);
+
+    // 1. Create images that we render into and display
+    createViewportImage(dev);   // ImGui shows this texture
+    createRenderTarget(dev);    // resolve pass output → blit source
+    createDepthBuffer(dev);     // Z-buffer (shared by both passes)
+    createGbuffer(dev);         // G-buffer: pos + normal + patchID + uv (4 attachments)
+
+    // 2. Create Vulkan graphics pipelines
+    createVisPipeline(dev);     // pass 1: mesh → G-buffer
+    createResolvePipeline(dev); // pass 2: G-buffer → render target
+
+    // 3. Create descriptor sets
+    createVisDescriptorSet(dev);
+    createResolveDescriptorSet(dev);
+
+    // 4. Upload uniform buffers (MVP for vis pass, lighting for resolve pass)
+    createUniformBuffers(dev);
+
+    // 5. Register viewport image with ImGui (so onUIRender can display it)
+    initViewportForImGui(dev);
+
+    // 6. Profiler
+    m_profilerTimeline = m_info.profilerManager->createTimeline({"graphics"});
+    m_profilerGpuTimer.init(m_profilerTimeline, dev,
+        app->getPhysicalDevice(), app->getQueue(0).familyIndex, true);
+
   }
 
   // ============================================================
@@ -1618,17 +1618,11 @@ int main(int argc, char** argv)
   parameterRegistry.add({"validation"}, &vkSetup.enableValidationLayers);
   parameterRegistry.add({"verbose"},   &vkSetup.verbose);
   parameterRegistry.add({"forcedevice"}, &vkSetup.forceGPU);
+  std::string startupLoad;  // model opened at startup (same path as File→Open)
+  parameterRegistry.add({"load", "Model to open at startup: .step/.stp → step2surf.py conversion; dir → direct; .surf → direct"},
+                        &startupLoad);
   parameterParser.add(parameterRegistry);
-  // Pull --load <path> out of argv before parsing (the parser rejects unknown
-  // parameters). Same path as File→Open: .step/.stp → step2surf.py conversion;
-  // dir → direct; .surf → direct.
-  std::vector<char*> parserArgv = {argv[0]};
-  std::string startupLoad;
-  for (int i = 1; i < argc; i++) {
-      if (std::string(argv[i]) == "--load" && i + 1 < argc) { startupLoad = argv[++i]; continue; }
-      parserArgv.push_back(argv[i]);
-  }
-  parameterParser.parse((int)parserArgv.size(), parserArgv.data());
+  parameterParser.parse(argc, argv);
   if (!startupLoad.empty()) nurbsRenderer->queueLoad(startupLoad);
 
   nvvk::addSurfaceExtensions(vkSetup.instanceExtensions); // platform-specific surface ext
