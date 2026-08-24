@@ -26,6 +26,9 @@ data/
 # 外部依赖
 external/
 
+# 本机工具脚本（含本机绝对路径，不提交）
+build_release.bat
+
 # nvpro_core2 模板构建产物
 _bin/
 _downloaded_resources/
