@@ -613,8 +613,11 @@ public:
             // orbit of >~6°) makes |Δeye| exceed 10% of the viewing distance.
             // Anything smaller changes few patch levels (tu/tv quantized to
             // multiples of 8), so it would just waste a ~0.12s rebuild.
+            // The reference is floored at the model size: deep inside the
+            // model distToModel → 0, which would otherwise make every tiny
+            // nudge rebuild (and most patches are capped at tu=64 there).
             bool worthIt = (m_rebuildDist <= 0.f)   // first rebuild after load
-                        || (rdist > distToModel * 0.1f);
+                        || (rdist > 0.1f * fmaxf(distToModel, m_modelScale));
             if (worthIt) {
                 CameraParams cam;
                 cam.camX = (float)e.x; cam.camY = (float)e.y; cam.camZ = (float)e.z;
