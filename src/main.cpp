@@ -514,6 +514,43 @@ public:
 
   }
 
+  // Queue a model load for the next frame (File→Open dialog or --load <path>).
+  // STEP/STP: convert to a temp *_parts dir via step2surf.py, then load the
+  // dir (directory() prefers the packed .surfb). Directories load as-is;
+  // single files (.surf) load directly.
+  void queueLoad(const std::string& sp) {
+      // Case-insensitive extension check
+      std::string lower = sp;
+      for (auto& c : lower) c = (char)tolower((unsigned char)c);
+      if (lower.ends_with(".stp") || lower.ends_with(".step")) {
+          std::filesystem::path path(sp);
+          auto stem = path.stem().string();
+          m_tempDir = (path.parent_path() / (stem + "_parts")).string();
+          std::filesystem::remove_all(m_tempDir);  // drop stale *_parts from a previous conversion
+          std::filesystem::create_directory(m_tempDir);
+          std::string cmd = "python scripts/step2surf.py --all \"" + sp + "\" \"" + m_tempDir + "/out\"";
+          LOGI("Converting STEP...\n");
+          int ret = system(cmd.c_str());
+          // Verify conversion succeeded and produced a packed file
+          bool hasFiles = false;
+          if (ret == 0) {
+              for (auto& e : std::filesystem::directory_iterator(m_tempDir))
+                  if (e.is_regular_file() &&
+                      (e.path().extension() == ".surfb" || e.path().extension() == ".surf"))
+                      { hasFiles = true; break; }
+          }
+          if (hasFiles) {
+              m_pendingLoad = m_tempDir; m_pendingIsDir = true;
+          } else {
+              LOGI("STEP conversion failed (ret=%d, hasFiles=%d)\n", ret, (int)hasFiles);
+          }
+      } else if (std::filesystem::is_directory(sp)) {
+          m_pendingLoad = sp; m_pendingIsDir = true;
+      } else {
+          m_pendingLoad = sp; m_pendingIsDir = false;
+      }
+  }
+
   // ============================================================
   // onUIMenu — menu bar (File / View)
   // ============================================================
@@ -523,34 +560,7 @@ public:
     if (ImGui::BeginMenu("File")) {
         if (ImGui::MenuItem("Open...")) {
             auto path = nvgui::windowOpenFileDialog(m_app->getWindowHandle(), "Open SURF / STEP", "*.surf;*.stp;*.step");
-            if (!path.empty()) {
-                std::string sp = path.string();
-                // Case-insensitive extension check
-                std::string lower = sp;
-                for (auto& c : lower) c = (char)tolower((unsigned char)c);
-                if (lower.ends_with(".stp") || lower.ends_with(".step")) {
-                    auto stem = path.stem().string();
-                    m_tempDir = (path.parent_path() / (stem + "_parts")).string();
-                    std::filesystem::remove_all(m_tempDir);  // drop stale *_parts from a previous conversion
-                    std::filesystem::create_directory(m_tempDir);
-                    std::string cmd = "python scripts/step2surf.py --all \"" + sp + "\" \"" + m_tempDir + "/out\"";
-                    LOGI("Converting STEP...\n");
-                    int ret = system(cmd.c_str());
-                    // Verify conversion succeeded and produced a packed file
-                    bool hasFiles = false;
-                    if (ret == 0) {
-                        for (auto& e : std::filesystem::directory_iterator(m_tempDir))
-                            if (e.is_regular_file() &&
-                                (e.path().extension() == ".surfb" || e.path().extension() == ".surf"))
-                                { hasFiles = true; break; }
-                    }
-                    if (hasFiles) {
-                        m_pendingLoad = m_tempDir; m_pendingIsDir = true;
-                    } else {
-                        LOGI("STEP conversion failed (ret=%d, hasFiles=%d)\n", ret, (int)hasFiles);
-                    }
-                } else { m_pendingLoad = sp; m_pendingIsDir = false; }
-            }
+            if (!path.empty()) queueLoad(path.string());
         }
         if (ImGui::MenuItem("Exit", "Ctrl+Q")) m_app->close();
         ImGui::EndMenu();
@@ -626,13 +636,17 @@ public:
                 Mesh m = MeshBuilder::adaptive(m_bezierCache, &cam);
                 auto t1 = std::chrono::steady_clock::now();
                 if (!m.empty()) {
+                    auto tw0 = std::chrono::steady_clock::now();
                     NVVK_CHECK(vkDeviceWaitIdle(m_app->getDevice()));
+                    auto tw1 = std::chrono::steady_clock::now();
                     if (m_indexCount > 0) { m_alloc.destroyBuffer(m_indexBuffer); m_alloc.destroyBuffer(m_vertexBuffer); m_indexCount = 0; }
                     uploadMesh(m, false);  // CP/meta SSBOs unchanged — keep them
                     auto t2 = std::chrono::steady_clock::now();
-                    LOGI("[Adaptive] timing: eval %.0f ms, upload %.0f ms\n",
-                         1e-3f * std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count(),
-                         1e-3f * std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count());
+                    fprintf(stderr, "[Adaptive] timing: eval %.0f ms, upload %.0f ms (wait %.2f, rest %.2f)\n",
+                            1e-3f * std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count(),
+                            1e-3f * std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count(),
+                            1e-3f * std::chrono::duration_cast<std::chrono::microseconds>(tw1 - tw0).count(),
+                            1e-3f * std::chrono::duration_cast<std::chrono::microseconds>(t2 - tw1).count());
                     m_modelScale = m.scale();
                     m_center[0]=m.cx(); m_center[1]=m.cy(); m_center[2]=m.cz();
                     m_rebuildEye[0] = (float)e.x; m_rebuildEye[1] = (float)e.y; m_rebuildEye[2] = (float)e.z;
@@ -856,9 +870,9 @@ public:
     m_alloc.destroyImage(m_depthImage);
     m_alloc.destroyImage(m_renderTarget);
     m_alloc.destroyImage(m_viewportImage);
+    if (m_persistStagingSize) m_alloc.destroyBuffer(m_persistStaging);
 
     // Framework
-    m_stagingUploader.deinit();
     m_samplerPool.deinit();
     m_alloc.deinit();
     m_profilerGpuTimer.deinit();
@@ -877,7 +891,8 @@ private:
   nvapp::Application*           m_app{};
   nvvk::ResourceAllocator       m_alloc{};        // GPU memory manager (wraps VMA)
   nvvk::SamplerPool             m_samplerPool{};
-  nvvk::StagingUploader         m_stagingUploader{}; // CPU→GPU data transfer helper
+  nvvk::Buffer                  m_persistStaging{};   // persistent system-RAM staging, reused across uploads
+  VkDeviceSize                  m_persistStagingSize = 0;
   nvutils::ProfilerTimeline*    m_profilerTimeline{};
   nvvk::ProfilerGpuTimer        m_profilerGpuTimer;
   #pragma endregion
@@ -954,7 +969,6 @@ private:
     ai.instance       = app->getInstance();
     NVVK_CHECK(m_alloc.init(ai));
     m_samplerPool.init(app->getDevice());
-    m_stagingUploader.init(&m_alloc, true);
   }
 
   // Viewport image: what ImGui displays. We never write to it directly;
@@ -1425,30 +1439,73 @@ private:
   // Called by doReload and by the adaptive re-tessellation path in onPreRender.
   void uploadMesh(const Mesh& m, bool uploadSSBO = true) {
     VkDevice dev = m_app->getDevice();
+    // Sub-timing: split "upload" into VMA alloc vs staging memcpy.
+    auto ms = [](auto a, auto b) {
+        return 1e-3f * std::chrono::duration_cast<std::chrono::microseconds>(b - a).count();
+    };
+    auto up0 = std::chrono::steady_clock::now();
     VkDeviceSize vsz = m.v.size() * sizeof(float);
     m_alloc.createBuffer(m_vertexBuffer, vsz, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_GPU_ONLY);
-    { void* p; NVVK_CHECK(m_stagingUploader.appendBufferMapping(m_vertexBuffer, 0, vsz, p)); memcpy(p, m.v.data(), vsz); }
+    auto up1 = std::chrono::steady_clock::now();
     VkDeviceSize isz = m.i.size() * sizeof(uint32_t);
     m_alloc.createBuffer(m_indexBuffer, isz, VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_GPU_ONLY);
-    { void* p; NVVK_CHECK(m_stagingUploader.appendBufferMapping(m_indexBuffer, 0, isz, p)); memcpy(p, m.i.data(), isz); }
+    auto up2 = std::chrono::steady_clock::now();
+
+    // --- persistent staging: one system-RAM buffer, reused across uploads ---
+    // Per-upload staging alloc + first-touch page faults made a 154MB memcpy
+    // cost 90-175ms (and PCIe-BAR placement ~0.9GB/s before CPU_ONLY). With
+    // one warm, reused buffer the same copy runs at plain RAM speed; the PCIe
+    // crossing happens once, as a GPU DMA read instead of CPU WC writes.
+    VkDeviceSize cpsz = 0, msz = 0;
+    if (uploadSSBO && !m.cp.empty() && m.patchCount > 0 && !m.meta.empty()) {
+        cpsz = m.cp.size() * sizeof(float);
+        msz  = m.meta.size() * sizeof(uint32_t);
+    }
+    VkDeviceSize need = vsz + isz + cpsz + msz + 64;  // +64: alignment slack
+    if (m_persistStagingSize < need) {
+        VkDeviceSize cap = 64ull << 20;               // grow to next power of two ≥ need
+        while (cap < need) cap <<= 1;
+        if (m_persistStagingSize) m_alloc.destroyBuffer(m_persistStaging);
+        m_alloc.createBuffer(m_persistStaging, cap, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+            VMA_MEMORY_USAGE_CPU_ONLY,
+            VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT);
+        if (!m_persistStaging.mapping) NVVK_CHECK(VK_ERROR_MEMORY_MAP_FAILED);
+        m_persistStagingSize = cap;
+        fprintf(stderr, "[upload] persistent staging grown to %.1f MB\n", cap / 1048576.f);
+    }
+    VkCommandBuffer c = m_app->createTempCmdBuffer();
+    VkDeviceSize soff = 0;  // running offset into persistent staging
+    auto stageCopy = [&](VkBuffer dst, const void* data, VkDeviceSize size) {
+        if (size == 0) return;
+        memcpy((char*)m_persistStaging.mapping + soff, data, size);
+        VkBufferCopy region{soff, 0, size};
+        vkCmdCopyBuffer(c, m_persistStaging.buffer, dst, 1, &region);
+        soff += (size + 15) & ~(VkDeviceSize)15;  // 16B-aligned
+    };
+
+    stageCopy(m_vertexBuffer.buffer, m.v.data(), vsz);
+    auto up3 = std::chrono::steady_clock::now();
+    stageCopy(m_indexBuffer.buffer, m.i.data(), isz);
+    auto up4 = std::chrono::steady_clock::now();
+    fprintf(stderr, "[upload] vert %.1fMB alloc %.2f copy %.2f | idx %.1fMB alloc %.2f copy %.2f ms\n",
+            vsz / 1048576.f, ms(up0, up1), ms(up2, up3),
+            isz / 1048576.f, ms(up1, up2), ms(up3, up4));
 
     // Upload Bézier CP + patch meta SSBOs (resolve pass set=2).
     // Skipped on adaptive rebuilds (uploadSSBO=false): CPs/meta are
     // camera-independent, so the existing buffers stay valid.
     if (uploadSSBO) {
-        if (!m.cp.empty() && m.patchCount > 0 && !m.meta.empty()) {
-            VkDeviceSize cpsz = m.cp.size() * sizeof(float);
-            VkDeviceSize msz  = m.meta.size() * sizeof(uint32_t);
+        if (cpsz) {
             m_alloc.destroyBuffer(m_bezierSSBO);  // always exists (dummy or real)
             m_alloc.createBuffer(m_bezierSSBO, cpsz,
                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                 VMA_MEMORY_USAGE_GPU_ONLY);
-            { void* p; NVVK_CHECK(m_stagingUploader.appendBufferMapping(m_bezierSSBO, 0, cpsz, p)); memcpy(p, m.cp.data(), cpsz); }
+            stageCopy(m_bezierSSBO.buffer, m.cp.data(), cpsz);
             m_alloc.destroyBuffer(m_bezierMetaSSBO);
             m_alloc.createBuffer(m_bezierMetaSSBO, msz,
                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                 VMA_MEMORY_USAGE_GPU_ONLY);
-            { void* p; NVVK_CHECK(m_stagingUploader.appendBufferMapping(m_bezierMetaSSBO, 0, msz, p)); memcpy(p, m.meta.data(), msz); }
+            stageCopy(m_bezierMetaSSBO.buffer, m.meta.data(), msz);
             m_hasSSBO = true;
 
             // Write SSBO descriptors (if descriptor set is already created)
@@ -1470,10 +1527,8 @@ private:
         }
     }
 
-    VkCommandBuffer c = m_app->createTempCmdBuffer();
-    m_stagingUploader.cmdUploadAppended(c);
     m_app->submitAndWaitTempCmdBuffer(c);
-    m_stagingUploader.releaseStaging();
+    // no releaseStaging — the persistent staging stays warm for the next upload
     m_indexCount = (uint32_t)m.i.size();
     m_patchCols  = m.patchCols > 0 ? m.patchCols : 1;
     if (uploadSSBO)
@@ -1564,7 +1619,17 @@ int main(int argc, char** argv)
   parameterRegistry.add({"verbose"},   &vkSetup.verbose);
   parameterRegistry.add({"forcedevice"}, &vkSetup.forceGPU);
   parameterParser.add(parameterRegistry);
-  parameterParser.parse(argc, argv);
+  // Pull --load <path> out of argv before parsing (the parser rejects unknown
+  // parameters). Same path as File→Open: .step/.stp → step2surf.py conversion;
+  // dir → direct; .surf → direct.
+  std::vector<char*> parserArgv = {argv[0]};
+  std::string startupLoad;
+  for (int i = 1; i < argc; i++) {
+      if (std::string(argv[i]) == "--load" && i + 1 < argc) { startupLoad = argv[++i]; continue; }
+      parserArgv.push_back(argv[i]);
+  }
+  parameterParser.parse((int)parserArgv.size(), parserArgv.data());
+  if (!startupLoad.empty()) nurbsRenderer->queueLoad(startupLoad);
 
   nvvk::addSurfaceExtensions(vkSetup.instanceExtensions); // platform-specific surface ext
   nvvk::Context vkContext;
