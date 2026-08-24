@@ -608,17 +608,13 @@ public:
             float rdist = sqrtf(rdx*rdx+rdy*rdy+rdz*rdz);
             float mx=(float)e.x-m_center[0], my=(float)e.y-m_center[1], mz=(float)e.z-m_center[2];
             float distToModel = sqrtf(mx*mx+my*my+mz*mz);
-            // tu ∝ 1/√(patch distance) and is quantized to multiples of 8, so
-            // a full level change needs the distance to change ~4× (8→16
-            // needs 1/4 the distance) — but patches near the top of their
-            // band upgrade on just a √2× zoom (raw factor ×1.19). Rebuild
-            // when the zoom ratio since the last rebuild crossed √2× (either
-            // way) or after a large lateral move; anything smaller changes no
-            // patch and just wastes a rebuild.
-            float dRatio = m_rebuildDist > 0.f ? distToModel / m_rebuildDist : 0.f;
+            // The eye-movement check subsumes the old zoom-ratio check:
+            // zooming moves the eye, so a straight zoom of >~1.1× (or an
+            // orbit of >~6°) makes |Δeye| exceed 10% of the viewing distance.
+            // Anything smaller changes few patch levels (tu/tv quantized to
+            // multiples of 8), so it would just waste a ~0.12s rebuild.
             bool worthIt = (m_rebuildDist <= 0.f)   // first rebuild after load
-                        || (dRatio < 0.71f || dRatio > 1.41f)
-                        || (rdist > distToModel * 0.3f);
+                        || (rdist > distToModel * 0.1f);
             if (worthIt) {
                 CameraParams cam;
                 cam.camX = (float)e.x; cam.camY = (float)e.y; cam.camZ = (float)e.z;
