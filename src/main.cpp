@@ -504,14 +504,12 @@ public:
                       { hasFiles = true; break; }
           }
           if (hasFiles) {
-              m_pendingLoad = m_tempDir; m_pendingIsDir = true;
+              m_pendingLoad = m_tempDir;
           } else {
               LOGI("STEP conversion failed (ret=%d, hasFiles=%d)\n", ret, (int)hasFiles);
           }
-      } else if (std::filesystem::is_directory(sp)) {
-          m_pendingLoad = sp; m_pendingIsDir = true;
       } else {
-          m_pendingLoad = sp; m_pendingIsDir = false;
+          m_pendingLoad = sp;  // dir or .surf — doReload decides via is_directory()
       }
   }
 
@@ -672,9 +670,8 @@ public:
     // don't retry every frame.
     if (!m_pendingLoad.empty()) {
         std::string loadPath = m_pendingLoad;
-        bool        loadDir  = m_pendingIsDir;
         m_pendingLoad.clear();
-        doReload(loadPath, loadDir);
+        doReload(loadPath);
         return;
     }
     updateUniforms();
@@ -882,9 +879,8 @@ public:
 private:
   #pragma region Framework
   Info                          m_info;
-  std::string                   m_pendingLoad;
-  std::string                   m_tempDir;
-  bool                          m_pendingIsDir = false;  // set by menu, processed next frame
+  std::string                   m_pendingLoad;  // set by queueLoad (menu / --load), processed next frame
+  std::string                   m_tempDir;      // conversion output dir; also the "safe to delete" marker in doReload
   float                         m_intensity = 1.0f;
   bool                          m_checkerboard    = false;
   bool                          m_showBoundary    = false;
@@ -1387,13 +1383,10 @@ private:
   // Mesh (re)loading (called from onRender)
   // ============================================================
 
-  void doReload(const std::string& path, bool isDir = false) {
-    // If path is a directory on disk, override isDir regardless of what the
-    // menu handler guessed — prevents trying to fopen a directory as a file.
-    if (!isDir && std::filesystem::is_directory(path)) {
-        LOGI("doReload: path is a directory, forcing isDir=true\n");
-        isDir = true;
-    }
+  void doReload(const std::string& path) {
+    // isDir comes straight from disk — the queued guess was redundant since
+    // the path on disk is the ground truth here anyway.
+    bool isDir = std::filesystem::is_directory(path);
     LOGI("doReload: %s (dir=%d)\n", path.c_str(), isDir);
     NVVK_CHECK(vkDeviceWaitIdle(m_app->getDevice()));
     if (m_indexCount > 0) {
@@ -1432,7 +1425,8 @@ private:
         LOGI("Cache: %zu surfaces, %.1f MB\n", m_bezierCache.surfaces.size(),
              m_bezierCache.cpsFloats() * 4.0f / (1024.f * 1024.f));
     }
-    if (isDir) std::filesystem::remove_all(path);
+    // Delete only our own conversion temp dir — never a user-supplied directory.
+    if (isDir && path == m_tempDir) std::filesystem::remove_all(path);
   }
 
   // Upload mesh data (vertices + indices + Bézier CPs) to GPU via staging.
