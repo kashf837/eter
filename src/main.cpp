@@ -1450,8 +1450,11 @@ private:
     // cost 90-175ms (and PCIe-BAR placement ~0.9GB/s before CPU_ONLY). With
     // one warm, reused buffer the same copy runs at plain RAM speed; the PCIe
     // crossing happens once, as a GPU DMA read instead of CPU WC writes.
+    // Load path with Bézier data → stage CPs + meta and rebuild the SSBOs.
+    // Rebuilds (uploadSSBO=false) skip: CPs/meta are camera-independent.
+    bool hasBezier = uploadSSBO && !m.cp.empty() && m.patchCount > 0 && !m.meta.empty();
     VkDeviceSize cpsz = 0, msz = 0;
-    if (uploadSSBO && !m.cp.empty() && m.patchCount > 0 && !m.meta.empty()) {
+    if (hasBezier) {
         cpsz = m.cp.size() * sizeof(float);
         msz  = m.meta.size() * sizeof(uint32_t);
     }
@@ -1486,35 +1489,33 @@ private:
             isz / 1048576.f, msBetween(up1, up2), msBetween(up3, up4));
 
     // Upload Bézier CP + patch meta SSBOs (resolve pass set=2).
-    // Skipped on adaptive rebuilds (uploadSSBO=false): CPs/meta are
-    // camera-independent, so the existing buffers stay valid.
-    if (uploadSSBO) {
-        if (cpsz) {
-            m_alloc.destroyBuffer(m_bezierSSBO);  // always exists (dummy or real)
-            m_alloc.createBuffer(m_bezierSSBO, cpsz,
-                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                VMA_MEMORY_USAGE_GPU_ONLY);
-            stageCopy(m_bezierSSBO.buffer, m.cp.data(), cpsz);
-            m_alloc.destroyBuffer(m_bezierMetaSSBO);
-            m_alloc.createBuffer(m_bezierMetaSSBO, msz,
-                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                VMA_MEMORY_USAGE_GPU_ONLY);
-            stageCopy(m_bezierMetaSSBO.buffer, m.meta.data(), msz);
+    // hasBezier (computed above): load path with Bézier data. No data → keep
+    // the 4-byte dummies (VkBuffer size must be > 0) and skip the copies.
+    if (hasBezier) {
+        m_alloc.destroyBuffer(m_bezierSSBO);  // always exists (dummy or real)
+        m_alloc.createBuffer(m_bezierSSBO, cpsz,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            VMA_MEMORY_USAGE_GPU_ONLY);
+        stageCopy(m_bezierSSBO.buffer, m.cp.data(), cpsz);
+        m_alloc.destroyBuffer(m_bezierMetaSSBO);
+        m_alloc.createBuffer(m_bezierMetaSSBO, msz,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            VMA_MEMORY_USAGE_GPU_ONLY);
+        stageCopy(m_bezierMetaSSBO.buffer, m.meta.data(), msz);
 
-            // Write SSBO descriptors (if descriptor set is already created)
-            if (m_resolveDs2 != VK_NULL_HANDLE) {
-                VkDescriptorBufferInfo dbiSSBO[2] = {
-                    {m_bezierSSBO.buffer, 0, cpsz},
-                    {m_bezierMetaSSBO.buffer, 0, msz},
-                };
-                VkWriteDescriptorSet wdsSSBO[2] = {};
-                for (int i = 0; i < 2; i++) {
-                    wdsSSBO[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-                    wdsSSBO[i].dstSet = m_resolveDs2; wdsSSBO[i].dstBinding = (uint32_t)i; wdsSSBO[i].descriptorCount = 1;
-                    wdsSSBO[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; wdsSSBO[i].pBufferInfo = &dbiSSBO[i];
-                }
-                vkUpdateDescriptorSets(dev, 2, wdsSSBO, 0, nullptr);
+        // Write SSBO descriptors (if descriptor set is already created)
+        if (m_resolveDs2 != VK_NULL_HANDLE) {
+            VkDescriptorBufferInfo dbiSSBO[2] = {
+                {m_bezierSSBO.buffer, 0, cpsz},
+                {m_bezierMetaSSBO.buffer, 0, msz},
+            };
+            VkWriteDescriptorSet wdsSSBO[2] = {};
+            for (int i = 0; i < 2; i++) {
+                wdsSSBO[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                wdsSSBO[i].dstSet = m_resolveDs2; wdsSSBO[i].dstBinding = (uint32_t)i; wdsSSBO[i].descriptorCount = 1;
+                wdsSSBO[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; wdsSSBO[i].pBufferInfo = &dbiSSBO[i];
             }
+            vkUpdateDescriptorSets(dev, 2, wdsSSBO, 0, nullptr);
         }
     }
 
