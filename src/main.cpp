@@ -910,7 +910,6 @@ private:
   nvvk::Image    m_gbufUV{};          // R32G32_SFLOAT: parametric (u,v) coordinates
   nvvk::Buffer   m_bezierSSBO{};      // SSBO: Bézier CPs (ru*rv vec4s/patch, xyz+w)
   nvvk::Buffer   m_bezierMetaSSBO{};  // SSBO: per-patch meta {cpOffsetInVec4, ru, rv, 0}
-  bool           m_hasSSBO = false;   // true when SSBO is uploaded (adaptive path)
   int            m_patchCols = 1;     // nv: patches per row, for SSBO index decoding
   VkDescriptorSet m_imguiImage{};
   bool           m_firstFrame = true;
@@ -1358,7 +1357,6 @@ private:
     vmaCreateBuffer((VmaAllocator)m_alloc, &ssboCI, &ssboACI,
                     &m_bezierMetaSSBO.buffer, &m_bezierMetaSSBO.allocation, &ssboAI);
     m_bezierMetaSSBO.bufferSize = 4;
-    m_hasSSBO = false;
 
     VkDescriptorBufferInfo dbiSSBO[2] = {
         {m_bezierSSBO.buffer, 0, 4},
@@ -1502,7 +1500,6 @@ private:
                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                 VMA_MEMORY_USAGE_GPU_ONLY);
             stageCopy(m_bezierMetaSSBO.buffer, m.meta.data(), msz);
-            m_hasSSBO = true;
 
             // Write SSBO descriptors (if descriptor set is already created)
             if (m_resolveDs2 != VK_NULL_HANDLE) {
@@ -1518,8 +1515,6 @@ private:
                 }
                 vkUpdateDescriptorSets(dev, 2, wdsSSBO, 0, nullptr);
             }
-        } else {
-            m_hasSSBO = false;
         }
     }
 
