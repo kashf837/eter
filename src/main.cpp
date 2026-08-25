@@ -45,6 +45,14 @@ static std::vector<char> readFile(const std::string& fn) {
     return buf;
 }
 
+// Milliseconds between two steady-clock time points. Shared by the load /
+// eval / upload instrumentation; those deliberately print via fprintf(stderr)
+// so the numbers land on the console, not in the GUI logger panel.
+static inline float msBetween(std::chrono::steady_clock::time_point a,
+                              std::chrono::steady_clock::time_point b) {
+    return 1e-3f * std::chrono::duration_cast<std::chrono::microseconds>(b - a).count();
+}
+
 // MVP matrices for visibility pass (set=0, binding=0 in visibility.vert)
 struct MVP { glm::mat4 model, view, proj; };
 // Lighting params for resolve pass (set=1, binding=0 in resolve.frag)
@@ -204,8 +212,7 @@ public:
                                                    &cNv[(size_t)i], &cRu[(size_t)i], &cRv[(size_t)i]);
         }
         auto tL1 = std::chrono::steady_clock::now();
-        fprintf(stderr, "  [scene] load: %d files, %.1f ms\n", nFiles,
-                1e-3f * std::chrono::duration_cast<std::chrono::microseconds>(tL1 - tL0).count());
+        fprintf(stderr, "  [scene] load: %d files, %.1f ms\n", nFiles, msBetween(tL0, tL1));
 
         std::vector<SceneSurf> surfs;
         surfs.reserve((size_t)nFiles);
@@ -641,10 +648,8 @@ public:
                     uploadMesh(m, false);  // CP/meta SSBOs unchanged — keep them
                     auto t2 = std::chrono::steady_clock::now();
                     fprintf(stderr, "[Adaptive] timing: eval %.0f ms, upload %.0f ms (wait %.2f, rest %.2f)\n",
-                            1e-3f * std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count(),
-                            1e-3f * std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count(),
-                            1e-3f * std::chrono::duration_cast<std::chrono::microseconds>(tw1 - tw0).count(),
-                            1e-3f * std::chrono::duration_cast<std::chrono::microseconds>(t2 - tw1).count());
+                            msBetween(t0, t1), msBetween(t1, t2),
+                            msBetween(tw0, tw1), msBetween(tw1, t2));
                     m_modelScale = m.scale();
                     m_center[0]=m.cx(); m_center[1]=m.cy(); m_center[2]=m.cz();
                     m_rebuildEye[0] = (float)e.x; m_rebuildEye[1] = (float)e.y; m_rebuildEye[2] = (float)e.z;
@@ -1434,9 +1439,6 @@ private:
   void uploadMesh(const Mesh& m, bool uploadSSBO = true) {
     VkDevice dev = m_app->getDevice();
     // Sub-timing: split "upload" into VMA alloc vs staging memcpy.
-    auto ms = [](auto a, auto b) {
-        return 1e-3f * std::chrono::duration_cast<std::chrono::microseconds>(b - a).count();
-    };
     auto up0 = std::chrono::steady_clock::now();
     VkDeviceSize vsz = m.v.size() * sizeof(float);
     m_alloc.createBuffer(m_vertexBuffer, vsz, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_GPU_ONLY);
@@ -1482,8 +1484,8 @@ private:
     stageCopy(m_indexBuffer.buffer, m.i.data(), isz);
     auto up4 = std::chrono::steady_clock::now();
     fprintf(stderr, "[upload] vert %.1fMB alloc %.2f copy %.2f | idx %.1fMB alloc %.2f copy %.2f ms\n",
-            vsz / 1048576.f, ms(up0, up1), ms(up2, up3),
-            isz / 1048576.f, ms(up1, up2), ms(up3, up4));
+            vsz / 1048576.f, msBetween(up0, up1), msBetween(up2, up3),
+            isz / 1048576.f, msBetween(up1, up2), msBetween(up3, up4));
 
     // Upload Bézier CP + patch meta SSBOs (resolve pass set=2).
     // Skipped on adaptive rebuilds (uploadSSBO=false): CPs/meta are
