@@ -5,10 +5,16 @@ if(NOT NvproCore2_FOUND)
 endif()
 
 
-# Try to find local installation first
+# Try to find local installation first.
+# Search order matters: ${CMAKE_SOURCE_DIR}/external is where the README tells
+# users to put the PATCHED nvpro_core2 (patches/ applied on commit 0097241).
+# It must come before ${CMAKE_BINARY_DIR}/_deps - otherwise a stale
+# auto-downloaded unpatched copy would win and the build would silently lose
+# the camera fixes (90-degree roll, inverted vertical drag).
 find_path(NvproCore2_ROOT
     NAMES nvpro_core2/cmake/Setup.cmake
     PATHS
+    ${CMAKE_SOURCE_DIR}/external
     ${CMAKE_BINARY_DIR}/_deps
     ${CMAKE_SOURCE_DIR}
     ${CMAKE_SOURCE_DIR}/..
@@ -24,8 +30,16 @@ else()
     if(NVPROCORE2_DOWNLOAD)
         include(FetchContent)
 
-        # Set default git tag/branch
-        set(NVPRO_GIT_TAG "main" CACHE STRING "Git tag/branch for nvpro_core2")
+        # Last resort only: a downloaded copy has NO patches/ fixes, so the
+        # camera bugs persist. Prefer the README flow (clone into
+        # external/nvpro_core2, checkout 0097241, git apply patches/*.patch).
+        message(WARNING "nvpro_core2 not found locally - downloading WITHOUT the patches/ fixes. "
+                        "Camera bugs (90-degree roll, inverted vertical drag) will be present. "
+                        "Prefer the README flow: clone into external/nvpro_core2 and apply patches/*.patch.")
+
+        # Set default git tag/branch. Must stay at 0097241: the patches in
+        # patches/ are written against that commit (README build step 1).
+        set(NVPRO_GIT_TAG "0097241" CACHE STRING "Git tag/branch for nvpro_core2")
 
         # Try to determine nvpro_core location from git remote
         execute_process(
@@ -90,6 +104,7 @@ else()
         find_path(NvproCore2_ROOT
             NAMES nvpro_core2/cmake/Setup.cmake
             PATHS
+            ${CMAKE_SOURCE_DIR}/external
             ${CMAKE_BINARY_DIR}/_deps
             ${CMAKE_SOURCE_DIR}
             ${CMAKE_SOURCE_DIR}/..
