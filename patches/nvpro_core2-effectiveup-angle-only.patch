@@ -13,9 +13,9 @@ that workaround was later removed (the view is now taken straight from
 getViewMatrix()), so this patch is the single fix covering BOTH the render
 and the pan paths — re-apply it before the first build.
 
-external/ is gitignored; re-apply this patch after replacing the vendored
-nvpro_core2 tree:
-    git apply patches/nvpro_core2-effectiveup-angle-only.patch
+external/ is gitignored; re-apply after replacing the vendored nvpro_core2
+tree, together with patches/nvpro_core2-elemcamera-inverted-y.patch:
+    git apply patches/nvpro_core2-effectiveup-angle-only.patch patches/nvpro_core2-elemcamera-inverted-y.patch
 
 --- a/external/nvpro_core2/nvutils/camera_manipulator.cpp
 +++ b/external/nvpro_core2/nvutils/camera_manipulator.cpp

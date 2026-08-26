@@ -1,0 +1,25 @@
+Fix inverted vertical drag in ElementCamera's drag-anchor block.
+
+ImGui's MouseDelta is top-down (down = +y), while CameraManipulator
+interprets +dy as screen-up: pan() moves the eye along +frame.up and
+orbit() feeds +dy straight into pitch. This app drives the manipulator
+straight from ImGui with no Y flip in the input path, so the anchor
+block must negate delta.y - otherwise vertical drag is inverted (MMB
+pan direction and LMB orbit pitch). Verified by A/B test against the
+stock sign on 2026-08-26.
+
+external/ is gitignored; re-apply after replacing the vendored nvpro_core2
+tree, together with patches/nvpro_core2-effectiveup-angle-only.patch:
+    git apply patches/nvpro_core2-effectiveup-angle-only.patch patches/nvpro_core2-elemcamera-inverted-y.patch
+
+--- a/external/nvpro_core2/nvapp/elem_camera.cpp
++++ b/external/nvpro_core2/nvapp/elem_camera.cpp
+@@ -101,7 +101,7 @@ void nvapp::ElementCamera::updateCamera(std::shared_ptr<nvutils::CameraManipulat
+     // window: on such a press frame the viewport may not be seen as hovered, so a click-based
+     // anchor reset would be skipped and the first motion would be computed against a stale anchor.
+     const ImVec2 delta = ImGui::GetIO().MouseDelta;
+-    m_cameraManip->setMousePosition({mousePos.x - delta.x, mousePos.y - delta.y});
++    m_cameraManip->setMousePosition({mousePos.x - delta.x, mousePos.y + delta.y});  // ImGui Y is top-down, manipulator assumes bottom-up
+     m_cameraManip->mouseMove({mousePos.x, mousePos.y}, inputs);
+   }
+ 
