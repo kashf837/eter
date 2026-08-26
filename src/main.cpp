@@ -21,6 +21,7 @@
 #include <nvapp/elem_logger.hpp>
 #include <nvapp/elem_camera.hpp>
 #include <nvgui/file_dialog.hpp>
+#include <nvgui/window.hpp>
 #include <nvutils/logger.hpp>
 #include <nvvk/check_error.hpp>
 #include <nvvk/context.hpp>
@@ -1584,6 +1585,38 @@ private:
 };
 
 // ============================================================
+// Wheel-batch fix element (must be registered BEFORE ElementCamera)
+//
+// ElementCamera feeds io.MouseWheel — ImGui's per-frame batch of ALL wheel
+// events since the last frame — into CameraManipulator::wheel(), which moves
+// the eye by (value * |value|) / windowWidth of the eye-center distance: a
+// QUADRATIC in value. N notches spread over N frames move N× the single-notch
+// amount, but N notches landing in ONE frame (fast scrolling, or scrolling
+// during a rebuild hitch) move N²× — a sudden lunge toward/away from the
+// model (3 notches ≈ half the viewing distance in one frame). Feeding
+// sqrt(|batch|) makes the quadratic come out linear: N notches in one frame
+// now move exactly N× a single notch, and one notch is unchanged (1 = √1).
+// Only the dolly path is quadratic; shift+wheel (FOV) is linear and left
+// alone. The viewport-hover gate matches ElementCamera so that ImGui windows
+// (Log, Profiler) keep their normal scrolling.
+// ============================================================
+struct WheelBatchFix : public nvapp::IAppElement
+{
+  void onUIRender() override
+  {
+    ImGuiIO& io = ImGui::GetIO();
+    if(io.MouseWheel == 0.0f)
+      return;
+    if(ImGui::IsKeyDown(ImGuiKey_LeftShift) || ImGui::IsKeyDown(ImGuiKey_RightShift))
+      return;  // shift+wheel = FOV path (linear) — leave it alone
+    ImGuiWindow* vp = ImGui::FindWindowByName("Viewport");
+    if(!vp || !nvgui::isWindowHovered(vp))
+      return;  // wheel belongs to other ImGui windows' scrolling
+    io.MouseWheel = (io.MouseWheel > 0.0f ? 1.0f : -1.0f) * sqrtf(fabsf(io.MouseWheel));
+  }
+};
+
+// ============================================================
 // main() — application entry point
 // ============================================================
 int main(int argc, char** argv)
@@ -1642,6 +1675,10 @@ int main(int argc, char** argv)
 
   nvapp::Application app;
   app.init(appInfo);
+
+  // Wheel-batch fix must precede ElementCamera: it rewrites io.MouseWheel
+  // before the camera element consumes it (elements run in registration order).
+  app.addElement(std::make_shared<WheelBatchFix>());
 
   // Camera: must be added BEFORE nurbsRenderer so its matrices update before onRender
   app.addElement(std::make_shared<nvapp::ElementCamera>(nurbsRenderer->getCamera()));
