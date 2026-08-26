@@ -1540,23 +1540,12 @@ private:
     // MVP for visibility pass
     MVP mvp;
     mvp.model = glm::mat4(1.f);
-    // View matrix built here instead of m_camera->getViewMatrix():
-    // nvpro_core2's effectiveUp() swaps in a fallback up vector when
-    // |cross(ctr-eye, up)|^2 <= 1e-6. That test mixes length and angle, so it
-    // fires not only when the view is truly parallel to up, but also whenever
-    // the eye is within ~1e-3 of the center (extreme zoom) or near an orbit
-    // pole while zoomed in — and the fallback up ({1,0,0} for our {0,-1,0})
-    // rolls the image 90°. Using the normalized view direction makes the test
-    // angle-only; orbit() clamps the view >= 1e-3 rad from the poles, so the
-    // fallback practically never fires (90-degree rotation bug fix).
-    glm::dvec3 camEye, camCtr, camUp;
-    m_camera->getLookat(camEye, camCtr, camUp);
-    glm::dvec3 fwd   = glm::normalize(camCtr - camEye);
-    glm::dvec3 right = glm::cross(fwd, camUp);
-    if (glm::dot(right, right) < 1e-8)
-        right = glm::cross(fwd, glm::dvec3(0, 0, 1));
-    right = glm::normalize(right);
-    mvp.view = glm::lookAt(camEye, camCtr, glm::cross(right, fwd));
+    // View straight from the camera manipulator. The 90°-roll / broken-pan bug
+    // family in nvpro_core2's effectiveUp() (its parallel test mixed
+    // length × angle) is fixed by patches/
+    // nvpro_core2-effectiveup-angle-only.patch — the angle-only guard makes
+    // the fallback unreachable during orbit interaction.
+    mvp.view = m_camera->getViewMatrix();
     auto vsz  = m_app->getViewportSize();
     float asp = vsz.width / (float)vsz.height;
     float nearP = m_modelScale * 0.001f;

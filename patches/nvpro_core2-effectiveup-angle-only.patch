@@ -1,0 +1,34 @@
+Fix nvpro_core2 CameraManipulator::effectiveUp mixed-units parallel test.
+
+|cross(ctr-eye, up)| = |ctr-eye|·sinθ. The original guard compared the raw
+squared length against a fixed epsilon (1e-6), so it trips when
+distance·sinθ ≤ 1e-3 — i.e. not only when the view is genuinely parallel to
+'up', but also at ANY angle once the eye is within ~1e-3/sinθ of the center.
+The fallback axis ((1,0,0) for up={0,-1,0}) is perpendicular to the true up,
+rotating computeCameraFrame's right/up basis 90° around the view axis:
+MMB pan then moves the camera in the wrong direction (drag down → camera
+moves right) when zoomed close to the model. Same bug family as the 90°
+view-roll, previously worked around app-side in updateUniforms (90e390f);
+that workaround was later removed (the view is now taken straight from
+getViewMatrix()), so this patch is the single fix covering BOTH the render
+and the pan paths — re-apply it before the first build.
+
+external/ is gitignored; re-apply this patch after replacing the vendored
+nvpro_core2 tree:
+    git apply patches/nvpro_core2-effectiveup-angle-only.patch
+
+--- a/external/nvpro_core2/nvutils/camera_manipulator.cpp
++++ b/external/nvpro_core2/nvutils/camera_manipulator.cpp
+@@ -46,6 +46,11 @@ glm::dvec3 effectiveUp(const glm::dvec3& eye, const glm::dvec3& ctr, const glm::dvec3& up)
+ {
+   const glm::dvec3 right = glm::cross(ctr - eye, up);
+-  if(glm::dot(right, right) > CameraConstants::EPSILON)
++  // Angle-only parallel test: |cross| = |ctr-eye|·sinθ. Comparing the raw
++  // squared length against a fixed epsilon mixes distance with angle — an eye
++  // close to the center (<1e-3/sinθ) tripped the "view parallel to up" branch
++  // at ANY angle, swapping in a perpendicular fallback axis and rotating the
++  // camera frame 90° (broken pan directions when zoomed close to the model).
++  if(glm::length(right) > CameraConstants::EPSILON * glm::length(ctr - eye))
+     return up;
+   return std::abs(up.y) < 0.9 ? glm::dvec3(0, 1, 0) : glm::dvec3(1, 0, 0);
+ }
